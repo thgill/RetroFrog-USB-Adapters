@@ -6,6 +6,7 @@
 // Based on Handheld Legend's SInput HID specification.
 
 #include "tusb.h"
+#include <stdio.h>
 #include "../usbd_mode.h"
 #include "../usbd.h"
 #include "descriptors/sinput_descriptors.h"
@@ -290,6 +291,42 @@ static bool sinput_mode_is_ready(void)
     return tud_hid_n_ready(ITF_NUM_HID_GAMEPAD);
 }
 
+// Emit keyboard + consumer-control reports on the SInput keyboard interface.
+// Both report IDs share one HID IN endpoint, so we send at most one report per
+// call (whichever changed, keyboard first) and rely on repeated task ticks to
+// flush the other. No-op on ESP32 (composite keyboard iface not present).
+static uint8_t  sinput_last_kb[8] = {0};
+static uint16_t sinput_last_consumer = 0;
+
+static void sinput_send_kbd_consumer(const input_event_t* event)
+{
+#ifndef PLATFORM_ESP32
+    if (!tud_hid_n_ready(ITF_NUM_HID_KEYBOARD)) return;
+
+    // Keyboard (report ID 1): [modifier][reserved][k0..k5]
+    uint8_t kb[8] = {0};
+    kb[0] = event->kb_modifier;
+    for (int i = 0; i < 6; i++) kb[2 + i] = event->kb_keys[i];
+    if (memcmp(kb, sinput_last_kb, sizeof(kb)) != 0) {
+        if (tud_hid_n_report(ITF_NUM_HID_KEYBOARD, SINPUT_KB_REPORT_ID_KEYBOARD, kb, sizeof(kb))) {
+            memcpy(sinput_last_kb, kb, sizeof(kb));
+        }
+        return;  // one report per call (shared endpoint)
+    }
+
+    // Consumer control (report ID 2): 16-bit usage selector
+    if (event->consumer_usage != sinput_last_consumer) {
+        uint8_t cons[2] = { (uint8_t)(event->consumer_usage & 0xFF),
+                            (uint8_t)((event->consumer_usage >> 8) & 0xFF) };
+        if (tud_hid_n_report(ITF_NUM_HID_KEYBOARD, SINPUT_KB_REPORT_ID_CONSUMER, cons, sizeof(cons))) {
+            sinput_last_consumer = event->consumer_usage;
+        }
+    }
+#else
+    (void)event;
+#endif
+}
+
 static bool sinput_mode_send_report(uint8_t player_index,
                                      const input_event_t* event,
                                      const profile_output_t* profile_out,
@@ -301,16 +338,41 @@ static bool sinput_mode_send_report(uint8_t player_index,
     // mouse interface, not the gamepad report.
     if (event->type == INPUT_TYPE_MOUSE) {
 #ifdef PLATFORM_ESP32
-        return false;  // ESP32 SInput has no mouse interface (FIFO limit)
+        // ESP32 SInput has no mouse interface (FIFO limit). A plain mouse stops
+        // here; a MouthPad-style device still presents as a gamepad (fall through).
+        if (!event->as_gamepad) return false;
 #else
-        if (!tud_hid_n_ready(ITF_NUM_HID_MOUSE)) return false;
-        uint8_t mb = 0;
-        if (event->buttons & JP_BUTTON_B1) mb |= MOUSE_BUTTON_LEFT;
-        if (event->buttons & JP_BUTTON_B2) mb |= MOUSE_BUTTON_RIGHT;
-        if (event->buttons & JP_BUTTON_B3) mb |= MOUSE_BUTTON_MIDDLE;
-        return tud_hid_n_mouse_report(ITF_NUM_HID_MOUSE, 0, mb,
-                                      event->delta_x, event->delta_y,
-                                      event->delta_wheel, 0);
+        // Mouse report is best-effort: emit it only if the mouse endpoint is
+        // ready. For an as_gamepad device (MouthPad), a busy mouse endpoint must
+        // NOT block the gamepad report below — that was causing zero gamepad
+        // output, since the MouthPad streams fast enough that the mouse endpoint
+        // is frequently busy. A plain mouse (no gamepad) still bails if not ready.
+        if (tud_hid_n_ready(ITF_NUM_HID_MOUSE)) {
+            // 16-bit mouse report (see sinput_mouse_report_t / descriptor) so the
+            // full int16 delta range is preserved — the fixed-8-bit
+            // tud_hid_n_mouse_report() helper would clip high-resolution pointers.
+            uint8_t mb = 0;
+            if (event->buttons & JP_BUTTON_B1) mb |= MOUSE_BUTTON_LEFT;
+            if (event->buttons & JP_BUTTON_B2) mb |= MOUSE_BUTTON_RIGHT;
+            if (event->buttons & JP_BUTTON_B3) mb |= MOUSE_BUTTON_MIDDLE;
+            sinput_mouse_report_t mr = {
+                .buttons = mb,
+                .x       = event->delta_x,
+                .y       = event->delta_y,
+                .wheel   = event->delta_wheel,
+                .pan     = 0,
+            };
+            tud_hid_n_report(ITF_NUM_HID_MOUSE, 0, (const uint8_t*)&mr, sizeof(mr));
+            // A mouse-type device (e.g. MouthPad) may also carry keyboard/consumer
+            // reports — emit those on the keyboard interface too.
+            sinput_send_kbd_consumer(event);
+        } else if (!event->as_gamepad) {
+            return false;   // plain mouse, endpoint busy — nothing else to do
+        }
+        // A MouthPad-style device also presents as a gamepad: pointing → cursor
+        // (above), touch sectors → left stick, gestures → buttons (below). Fall
+        // through to the gamepad build. Plain mice (as_gamepad == false) stop here.
+        if (!event->as_gamepad) return true;
 #endif
     }
 

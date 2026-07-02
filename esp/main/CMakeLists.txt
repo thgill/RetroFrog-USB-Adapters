@@ -230,6 +230,7 @@ set(SRCS
     "${SHARED_SRC}/core/services/leds/player_leds_gpio.c"
     "${SHARED_SRC}/core/services/storage/storage.c"
     "${SHARED_SRC}/core/services/codes/codes.c"
+    "${SHARED_SRC}/core/services/keymap/keymap.c"
     "${SHARED_SRC}/core/services/hotkeys/hotkeys.c"
     "${SHARED_SRC}/core/services/players/manager.c"
     "${SHARED_SRC}/core/services/players/feedback.c"
@@ -303,6 +304,8 @@ if(APP_NEEDS_BTSTACK)
         "${BTSTACK_PATH}/src/ble/sm.c"
         "${BTSTACK_PATH}/src/ble/att_dispatch.c"
         "${BTSTACK_PATH}/src/ble/att_db.c"
+        "${BTSTACK_PATH}/src/ble/att_db_util.c"
+        "${BTSTACK_PATH}/src/ble/att_server.c"
         "${BTSTACK_PATH}/src/ble/le_device_db_memory.c"
         "${BTSTACK_PATH}/src/ble/le_device_db_tlv.c"
 
@@ -365,8 +368,7 @@ if(APP_NEEDS_BTSTACK)
     # --- Peripheral mode (controller_btusb): GATT server + HID device ---
     if(APP_BTSTACK_MODE STREQUAL "peripheral")
         list(APPEND SRCS
-            # BTstack GATT server
-            "${BTSTACK_PATH}/src/ble/att_server.c"
+            # BTstack GATT server (att_server.c is in the BLE common block)
             "${BTSTACK_PATH}/src/ble/gatt-service/hids_device.c"
             "${BTSTACK_PATH}/src/ble/gatt-service/battery_service_server.c"
             "${BTSTACK_PATH}/src/ble/gatt-service/device_information_service_server.c"
@@ -559,6 +561,19 @@ else()
     set(JOYPAD_VERSION "0.0.0")
 endif()
 
+# Derive USB bcdDevice (0xMMmp) from JOYPAD_VERSION so the SInput "dongle version"
+# reflects firmware version (matches src/CMakeLists.txt).
+string(REPLACE "." ";" _JP_VER_PARTS "${JOYPAD_VERSION}")
+list(LENGTH _JP_VER_PARTS _JP_VER_LEN)
+if(_JP_VER_LEN GREATER_EQUAL 3)
+    list(GET _JP_VER_PARTS 0 _JP_VER_MAJOR)
+    list(GET _JP_VER_PARTS 1 _JP_VER_MINOR)
+    list(GET _JP_VER_PARTS 2 _JP_VER_PATCH)
+    math(EXPR JOYPAD_BCD_DEVICE "(${_JP_VER_MAJOR} << 8) | ((${_JP_VER_MINOR} & 15) << 4) | (${_JP_VER_PATCH} & 15)")
+else()
+    set(JOYPAD_BCD_DEVICE 256)
+endif()
+
 # Get git commit hash
 execute_process(
     COMMAND git rev-parse --short HEAD
@@ -575,6 +590,7 @@ string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     JOYPAD_VERSION="${JOYPAD_VERSION}"
+    SINPUT_BCD_DEVICE=${JOYPAD_BCD_DEVICE}
     GIT_COMMIT="${GIT_COMMIT}"
     BUILD_TIME="${BUILD_TIME}"
     BOARD_NAME="esp32s3"

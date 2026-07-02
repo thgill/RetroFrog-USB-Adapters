@@ -255,6 +255,54 @@ static void cmd_info(const char* json)
     send_json(response_buf);
 }
 
+// MouthPad NUS relay loss stats. Weak default so non-relay builds link; the
+// strong version lives in mp_bridge.c (BLE+CDC builds). drops==0 over a session
+// proves zero firmware-side data loss (USB bulk is lossless; ring overflow is
+// the only drop point). high_water shows peak ring use vs ring_size.
+__attribute__((weak)) void mp_bridge_get_stats(uint32_t* f, uint32_t* d,
+                                               uint32_t* e, uint32_t* h, uint32_t* r) {
+    if (f) *f = 0; if (d) *d = 0; if (e) *e = 0; if (h) *h = 0; if (r) *r = 0;
+}
+
+static void cmd_mp_stats(const char* json)
+{
+    (void)json;
+    uint32_t frames = 0, drops = 0, efails = 0, high = 0, ring = 0;
+    mp_bridge_get_stats(&frames, &drops, &efails, &high, &ring);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"relay\":{\"frames\":%lu,\"drops\":%lu,\"encode_fails\":%lu,"
+             "\"high_water\":%lu,\"ring_size\":%lu}}",
+             (unsigned long)frames, (unsigned long)drops, (unsigned long)efails,
+             (unsigned long)high, (unsigned long)ring);
+    send_json(response_buf);
+}
+
+// MouthPad translation mode: 0=passthrough (mouse/kbd), 1=right stick, 2=left
+// stick. Weak default is a no-op for non-MouthPad builds; the MouthPad driver
+// provides the strong implementation.
+__attribute__((weak)) void mouthpad_set_translation_mode(int mode) { (void)mode; }
+__attribute__((weak)) int  mouthpad_get_translation_mode(void) { return -1; }
+
+static void cmd_mp_mode(const char* json)
+{
+    int mode = 1;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_json("{\"error\":\"missing mode (0=passthrough,1=right,2=left)\"}");
+        return;
+    }
+    if (mode < 0 || mode > 2) {
+        send_json("{\"error\":\"mode out of range (0-2)\"}");
+        return;
+    }
+    mouthpad_set_translation_mode(mode);
+    int actual = mouthpad_get_translation_mode();   // read back the DRIVER's real state
+    const char* name = (actual == 0) ? "passthrough" : (actual == 2) ? "left_stick" :
+                       (actual == 1) ? "right_stick" : "no_mouthpad_driver";
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"requested\":%d,\"mp_mode\":%d,\"name\":\"%s\"}", mode, actual, name);
+    send_json(response_buf);
+}
+
 static void cmd_ping(const char* json)
 {
     (void)json;
@@ -2734,6 +2782,8 @@ typedef struct {
 
 static const cmd_entry_t commands[] = {
     {"INFO", cmd_info},
+    {"MP.STATS", cmd_mp_stats},
+    {"MP.MODE", cmd_mp_mode},
     {"PING", cmd_ping},
     {"REBOOT", cmd_reboot},
     {"BOOTSEL", cmd_bootsel},

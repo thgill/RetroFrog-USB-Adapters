@@ -376,11 +376,8 @@ static void transform_mouse_to_analog(input_event_t* event, output_target_t outp
 
     // Accumulate X-axis if enabled
     if (accum->target_x != MOUSE_AXIS_DISABLED) {
-        // Handle signed 8-bit deltas
-        if (event->delta_x >= 128)
-            accum->accum_x -= (256 - event->delta_x);
-        else
-            accum->accum_x += event->delta_x;
+        // delta_x is already signed (int16); accumulate directly.
+        accum->accum_x += event->delta_x;
 
         // Clamp to [-127, 127]
         if (accum->accum_x > 127) accum->accum_x = 127;
@@ -401,11 +398,8 @@ static void transform_mouse_to_analog(input_event_t* event, output_target_t outp
 
     // Accumulate Y-axis if enabled
     if (accum->target_y != MOUSE_AXIS_DISABLED) {
-        // Handle signed 8-bit deltas
-        if (event->delta_y >= 128)
-            accum->accum_y -= (256 - event->delta_y);
-        else
-            accum->accum_y += event->delta_y;
+        // delta_y is already signed (int16); accumulate directly.
+        accum->accum_y += event->delta_y;
 
         // Clamp to [-127, 127]
         if (accum->accum_y > 127) accum->accum_y = 127;
@@ -725,6 +719,12 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
 
                     // Keys: OR together (active-high)
                     x_current_state.keys |= dev->keys;
+
+                    // Present-as-gamepad flag (e.g. MouthPad): if ANY blended
+                    // device wants gamepad output, the merged event does too.
+                    // Without this, blend mode drops the flag and sinput never
+                    // emits the gamepad report.
+                    x_current_state.as_gamepad |= dev->as_gamepad;
 
                     // Analog: use furthest from center for sticks, max for triggers
                     // New format: [0]=LX, [1]=LY, [2]=RX, [3]=RY, [4]=L2, [5]=R2

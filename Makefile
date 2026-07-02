@@ -101,6 +101,7 @@ CONSOLE_usb_feather_rp2040_usb_host_max3421 := joypad_usb_feather_rp2040_usb_hos
 CONSOLE_usb_rp2040zero := joypad_usb_rp2040zero
 CONSOLE_usb_rp2350usba := joypad_usb_rp2350usba
 CONSOLE_bt2usb := joypad_bt2usb
+CONSOLE_mouthpad := joypad_mouthpad
 CONSOLE_bt2loopy := joypad_bt2loopy
 CONSOLE_bt2nuon := joypad_bt2nuon
 CONSOLE_bt2n64 := joypad_bt2n64
@@ -111,6 +112,7 @@ CONSOLE_wifi2usb := joypad_wifi2usb
 CONSOLE_snes2usb := joypad_snes2usb
 CONSOLE_psx2usb := joypad_psx2usb
 CONSOLE_nes2usb := joypad_nes2usb
+CONSOLE_pce2usb := joypad_pce2usb
 CONSOLE_n642usb := joypad_n642usb
 CONSOLE_nuon2usb := joypad_nuon2usb
 CONSOLE_gc2usb := joypad_gc2usb
@@ -166,6 +168,9 @@ APP_n642dc_pico2_w := pico2_w n642dc_pico2_w n642dc_pico2_w N64 Dreamcast
 APP_gc2dc_kb2040 := kb2040 gc2dc gc2dc_kb2040 GameCube Dreamcast
 APP_nes2usb_kb2040 := kb2040 nes2usb nes2usb_kb2040 NES USB
 APP_nes2usb_pico_w := pico_w nes2usb nes2usb_pico_w NES USB
+APP_pce2usb_kb2040 := kb2040 pce2usb pce2usb_kb2040 PCEngine USB
+APP_pce2usb_pico := pico pce2usb pce2usb_pico PCEngine USB
+APP_pce2usb_pico_w := pico_w pce2usb pce2usb_pico_w PCEngine USB
 APP_n642nuon_pico := pico n642nuon n642nuon_pico N64 Nuon
 APP_n642nuon_aries64 := pico n642nuon_aries64 n642nuon_aries64 N64 Nuon
 APP_usb23do_rp2040zero := rp2040zero 3do usb23do_rp2040zero USB/BT 3DO
@@ -188,6 +193,8 @@ APP_usb2usb_remapper_v7 := pico usb2usb_remapper_v7 usb2usb_remapper_v7 USB USB
 APP_usb2usb_rp2350usba := rp2350usba usb_rp2350usba usb2usb_rp2350usba USB/BT USB
 APP_bt2usb_pico_w := pico_w bt2usb bt2usb_pico_w Bluetooth USB
 APP_bt2usb_pico2_w := pico2_w bt2usb bt2usb_pico2_w Bluetooth USB
+APP_mouthpad_pico_w := pico_w mouthpad mouthpad_pico_w MouthPad-BLE USB+NUS
+APP_mouthpad_pico2_w := pico2_w mouthpad mouthpad_pico2_w MouthPad-BLE USB+NUS
 APP_bt2usb_waveshare_rp2350b_plus_w := waveshare_rp2350b_plus_w bt2usb bt2usb_waveshare_rp2350b_plus_w Bluetooth USB
 APP_bt2loopy_pico_w := pico_w bt2loopy bt2loopy_pico_w Bluetooth Loopy
 APP_bt2nuon_pico_w := pico_w bt2nuon bt2nuon_pico_w Bluetooth Nuon
@@ -243,7 +250,7 @@ APP_controller_btusb_feather_rp2040_usb_host := feather_usbhost controller_btusb
 
 # All apps (note: controller_macropad not included - build explicitly with 'make controller_macropad')
 # Note: usb2loopy_kb2040, snes23do_rp2040zero excluded until more mature
-APPS := usb2pce_kb2040 usb2gc_kb2040 usb2gc_rp2040zero usb2nuon_kb2040 usb2n64_kb2040 usb2dc_kb2040 usb2dc_rp2040zero usb2neogeo_kb2040 usb2neogeo_pico usb2neogeo_rp2040zero usb2neogeo_retrofrog n642dc_kb2040 n642dc_pico2_w n642nuon_pico usb23do_rp2040zero usb2uart_kb2040 usb2usb_pico usb2usb_pico_w usb2usb_pico2_w usb2usb_feather_rp2040 usb2usb_feather_rp2040_usb_host usb2usb_feather_rp2040_max3421 usb2usb_feather_rp2040_usb_host_max3421 usb2usb_rp2040zero usb2usb_rp2350usba bt2usb_pico_w bt2usb_pico2_w btusb2usb_pico_w btusb2usb_pico2_w usb2ble_pico_w usb2ble_pico2_w bt2nuon_pico_w bt2nuon_pico2_w bt2n64_pico_w bt2n64_pico2_w snes2usb_kb2040 n642usb_kb2040 gc2usb_kb2040 gc2usb_rp2040zero gc2usb_feather_usbhost gc2eth_rp2040_eth gc2eth_feather_usbhost nes2usb_kb2040 nes2usb_pico_w controller_fisherprice_v1_kb2040 controller_fisherprice_v2_kb2040 controller_alpakka_pico usb2ami_rp2040zero usb2ami_xiao usb2ami_retrofrog usb2ami_beetle_rp2350 usb2jag_rp2040zero
+APPS := usb2pce_kb2040 usb2gc_kb2040 usb2gc_rp2040zero usb2nuon_kb2040 usb2n64_kb2040 usb2dc_kb2040 usb2dc_rp2040zero usb2neogeo_kb2040 usb2neogeo_pico usb2neogeo_rp2040zero usb2neogeo_retrofrog n642dc_kb2040 n642dc_pico2_w n642nuon_pico usb23do_rp2040zero usb2uart_kb2040 usb2usb_pico usb2usb_pico_w usb2usb_pico2_w usb2usb_feather_rp2040 usb2usb_feather_rp2040_usb_host usb2usb_feather_rp2040_max3421 usb2usb_feather_rp2040_usb_host_max3421 usb2usb_rp2040zero usb2usb_rp2350usba bt2usb_pico_w bt2usb_pico2_w btusb2usb_pico_w btusb2usb_pico2_w usb2ble_pico_w usb2ble_pico2_w bt2nuon_pico_w bt2nuon_pico2_w bt2n64_pico_w bt2n64_pico2_w snes2usb_kb2040 n642usb_kb2040 gc2usb_kb2040 gc2usb_rp2040zero gc2usb_feather_usbhost gc2eth_rp2040_eth gc2eth_feather_usbhost nes2usb_kb2040 nes2usb_pico_w pce2usb_kb2040 pce2usb_pico pce2usb_pico_w controller_fisherprice_v1_kb2040 controller_fisherprice_v2_kb2040 controller_alpakka_pico usb2ami_rp2040zero usb2ami_xiao usb2ami_retrofrog usb2ami_beetle_rp2350 usb2jag_rp2040zero
 
 # Stable apps for release
 # Note: usb2loopy_kb2040, snes23do_rp2040zero excluded until more mature
@@ -352,6 +359,9 @@ help:
 
 	@echo "  make nes2usb_kb2040     - NES -> USB HID (KB2040)"
 	@echo "  make nes2usb_pico_w     - NES -> USB HID (Pico W)"
+	@echo "  make pce2usb_kb2040     - PCEngine -> USB HID (KB2040)"
+	@echo "  make pce2usb_pico       - PCEngine -> USB HID (Pico)"
+	@echo "  make pce2usb_pico_w     - PCEngine -> USB HID (Pico W)"
 	@echo "  make lodgenet2usb_pico   - LodgeNet -> USB HID (Pico)"
 	@echo "  make lodgenet2usb_pico2  - LodgeNet -> USB HID (Pico 2)"
 	@echo "  make lodgenet2n64_pico   - LodgeNet -> N64 (Pico)"
@@ -659,6 +669,14 @@ bt2usb_pico_w:
 bt2usb_pico2_w:
 	$(call build_app,bt2usb_pico2_w)
 
+.PHONY: mouthpad_pico_w
+mouthpad_pico_w:
+	$(call build_app,mouthpad_pico_w)
+
+.PHONY: mouthpad_pico2_w
+mouthpad_pico2_w:
+	$(call build_app,mouthpad_pico2_w)
+
 .PHONY: bt2usb_waveshare_rp2350b_plus_w
 bt2usb_waveshare_rp2350b_plus_w:
 	$(call build_app,bt2usb_waveshare_rp2350b_plus_w)
@@ -913,6 +931,47 @@ flash-bt2usb_feather_nrf52840: bt2usb_feather_nrf52840
 monitor-bt2usb_feather_nrf52840:
 	@cd nrf && $(MAKE) monitor
 
+# --- April Brother nRF52840 Dongle bt2usb (requires nRF Connect SDK) ---
+# The dongle shipped to MouthPad users. bt2usb already supports the MouthPad
+# via the mouthpad_ble driver; a dedicated mouthpad app (SInput default +
+# NUS relay) will build with APP_TYPE=mouthpad once that app lands.
+.PHONY: bt2usb_aprbrother_nrf52840
+bt2usb_aprbrother_nrf52840:
+	@echo "$(YELLOW)Building bt2usb for April Brother nRF52840 Dongle...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=aprbrother_nrf52840
+	@mkdir -p $(RELEASE_DIR)
+	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
+	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2
+	@echo "$(GREEN)✓ bt2usb_aprbrother_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2"
+	@echo ""
+
+.PHONY: flash-bt2usb_aprbrother_nrf52840
+flash-bt2usb_aprbrother_nrf52840: bt2usb_aprbrother_nrf52840
+	@cd nrf && $(MAKE) flash-uf2
+	@echo ""
+
+.PHONY: monitor-bt2usb_aprbrother_nrf52840
+monitor-bt2usb_aprbrother_nrf52840:
+	@cd nrf && $(MAKE) monitor
+
+# --- April Brother nRF52840 Dongle MouthPad app (HID + NUS relay) ---
+.PHONY: mouthpad_aprbrother_nrf52840
+mouthpad_aprbrother_nrf52840:
+	@echo "$(YELLOW)Building mouthpad for April Brother nRF52840 Dongle...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=aprbrother_nrf52840 APP_TYPE=mouthpad
+	@mkdir -p $(RELEASE_DIR)
+	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
+	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2
+	@echo "$(GREEN)✓ mouthpad_aprbrother_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2"
+	@echo ""
+
+.PHONY: flash-mouthpad_aprbrother_nrf52840
+flash-mouthpad_aprbrother_nrf52840: mouthpad_aprbrother_nrf52840
+	@cd nrf && $(MAKE) flash-uf2
+	@echo ""
+
 # --- Adafruit Feather nRF52840 usb2usb (MAX3421E FeatherWing, requires nRF Connect SDK) ---
 .PHONY: usb2usb_feather_nrf52840
 usb2usb_feather_nrf52840:
@@ -1115,6 +1174,18 @@ nes2usb_kb2040:
 .PHONY: nes2usb_pico_w
 nes2usb_pico_w:
 	$(call build_app,nes2usb_pico_w)
+
+.PHONY: pce2usb_kb2040
+pce2usb_kb2040:
+	$(call build_app,pce2usb_kb2040)
+
+.PHONY: pce2usb_pico
+pce2usb_pico:
+	$(call build_app,pce2usb_pico)
+
+.PHONY: pce2usb_pico_w
+pce2usb_pico_w:
+	$(call build_app,pce2usb_pico_w)
 
 .PHONY: lodgenet2usb_pico
 lodgenet2usb_pico:
@@ -1545,6 +1616,18 @@ flash-nes2usb_kb2040:
 .PHONY: flash-nes2usb_pico_w
 flash-nes2usb_pico_w:
 	@$(MAKE) --no-print-directory _flash_app APP_NAME=nes2usb_pico_w
+
+.PHONY: flash-pce2usb_kb2040
+flash-pce2usb_kb2040:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=pce2usb_kb2040
+
+.PHONY: flash-pce2usb_pico
+flash-pce2usb_pico:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=pce2usb_pico
+
+.PHONY: flash-pce2usb_pico_w
+flash-pce2usb_pico_w:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=pce2usb_pico_w
 
 .PHONY: flash-lodgenet2usb_pico
 flash-lodgenet2usb_pico:

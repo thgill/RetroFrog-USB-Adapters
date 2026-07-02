@@ -45,6 +45,20 @@ endif()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" JOYPAD_VERSION)
 string(STRIP "${JOYPAD_VERSION}" JOYPAD_VERSION)
 
+# Derive USB bcdDevice (0xMMmp) from JOYPAD_VERSION so the SInput descriptor — and
+# thus the "dongle version" the MouthPad utility reads from bcdDevice — reflects
+# the actual firmware version instead of a hardcoded default.
+string(REPLACE "." ";" _JP_VER_PARTS "${JOYPAD_VERSION}")
+list(LENGTH _JP_VER_PARTS _JP_VER_LEN)
+if(_JP_VER_LEN GREATER_EQUAL 3)
+    list(GET _JP_VER_PARTS 0 _JP_VER_MAJOR)
+    list(GET _JP_VER_PARTS 1 _JP_VER_MINOR)
+    list(GET _JP_VER_PARTS 2 _JP_VER_PATCH)
+    math(EXPR JOYPAD_BCD_DEVICE "(${_JP_VER_MAJOR} << 8) | ((${_JP_VER_MINOR} & 15) << 4) | (${_JP_VER_PATCH} & 15)")
+else()
+    set(JOYPAD_BCD_DEVICE 256)  # 0x0100 fallback
+endif()
+
 # Get git commit hash
 execute_process(
     COMMAND git rev-parse --short HEAD
@@ -110,6 +124,7 @@ set(CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/flash.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/button/button.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/codes/codes.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/services/keymap/keymap.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/hotkeys/hotkeys.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/players/manager.c
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/players/feedback.c
@@ -132,6 +147,7 @@ set(USB_HOST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_bta.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/nintendo/gamecube_adapter.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/nintendo/switch_pro.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/nintendo/switch2_pro.c
@@ -168,6 +184,12 @@ set(BTHID_DEVICE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/microsoft/xbox_bt.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/microsoft/xbox_ble.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/google/stadia_bt.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c
+    # MouthPad NUS<->CDC relay (ambient: self-attaches to CDC when linked + a
+    # MouthPad is connected; inert otherwise). Companion to the mouthpad_ble HID
+    # driver so every BLE app gains MouthPad support without a dedicated app.
+    ${CMAKE_CURRENT_SOURCE_DIR}/bt/mouthpad/mp_relay.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bt/mouthpad/mp_bridge.c
 )
 
 # Bluetooth sources for USB dongle transport (requires BTstack)
@@ -203,6 +225,8 @@ set(BTSTACK_SOURCES
     ${PICO_BTSTACK_PATH}/src/ble/sm.c
     ${PICO_BTSTACK_PATH}/src/ble/att_dispatch.c
     ${PICO_BTSTACK_PATH}/src/ble/att_db.c
+    ${PICO_BTSTACK_PATH}/src/ble/att_db_util.c
+    ${PICO_BTSTACK_PATH}/src/ble/att_server.c
     ${PICO_BTSTACK_PATH}/src/ble/gatt_client.c
     ${PICO_BTSTACK_PATH}/src/ble/gatt_service_client.c
     ${PICO_BTSTACK_PATH}/src/ble/le_device_db_memory.c
@@ -268,6 +292,11 @@ set(USB_DEVICE_SOURCES
 # NES host sources
 set(NES_HOST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/native/host/nes/nes_host.c
+)
+
+# PCEngine host sources
+set(PCE_HOST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/host/pcengine/pce_host.c
 )
 
 # SNES host sources
@@ -407,6 +436,7 @@ function(joypad_target_common TARGET)
         JOYPAD_VERSION="${JOYPAD_VERSION}"
         GIT_COMMIT="${GIT_COMMIT}"
         BUILD_TIME="${BUILD_TIME}"
+        SINPUT_BCD_DEVICE=${JOYPAD_BCD_DEVICE}
     )
     # Set BOARD_NAME only if not already defined by the target
     get_target_property(_defs ${TARGET} COMPILE_DEFINITIONS)
@@ -475,6 +505,9 @@ message(STATUS "Board ${PICO_BOARD}: BUTTON_USER_GPIO=${BOARD_BUTTON_GPIO}")
 # --- PCEngine ---
 add_executable(joypad_pce)
 target_compile_definitions(joypad_pce PRIVATE CONFIG_PCE=1)
+# usb2pce drives the PCE multitap (5 players) reached through cascaded hubs (the
+# PCE Mini 5-port hub is 2 hub chips + an optional chained hub). The global
+# defaults (hub depth 4, device cap 10) cover that, so no per-app override.
 if (PICO_BOARD STREQUAL "pico")
     target_compile_definitions(joypad_pce PRIVATE RPI_PICO_BUILD=1)
 endif()
@@ -628,14 +661,15 @@ pico_generate_pio_header(joypad_loopy ${CMAKE_CURRENT_LIST_DIR}/native/device/lo
 add_executable(joypad_dc)
 # WORKAROUND: KB2040 + Core-1 TX hits an enumeration-dropoff bug we haven't
 # root-caused (works fine on RP2040 Zero where gill validated the PR).
-# Mirror n642dc's Core-0 TX config until the underlying issue is diagnosed.
-# VMU is enabled (RAM-only — no CONFIG_SD): the 128KB vmu_ram fits the same
-# as the RP2040-Zero build (identical RP2040, identical BTstack linkage,
-# ~247KB BSS / ~16KB headroom). Persistence backend (USB MSC flash drive or
-# an onboard QSPI partition) is a follow-up; vmu_sd.c compiles to a no-op
-# without CONFIG_SD so a fresh card just reverts to the preformat default
-# (with ICONDATA) each boot.
-target_compile_definitions(joypad_dc PRIVATE CONFIG_DC=1 CONFIG_USB_HOST=1 CONFIG_NO_NEOPIXEL=1 CONFIG_VMU=1 CONFIG_VMU_QSPI=1)
+# usb2dc ARCHITECTURE lives in apps/usb2dc/usb2dc_config.h and is force-included
+# into every translation unit of these targets, so the shared Dreamcast device
+# code sees it too (not just app.c). Board targets below carry ONLY GPIO /
+# peripherals — never architecture flags — so they can't drift (a kb2040 drift
+# off CONFIG_DC_CORE1_TX was the root cause of the Maple-drops-on-VMU-save bug).
+set(USB2DC_FORCE_CONFIG "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2dc/usb2dc_config.h")
+# kb2040: default Maple pins (GP2/GP3), no NeoPixel.
+target_compile_definitions(joypad_dc PRIVATE CONFIG_NO_NEOPIXEL=1)
+target_compile_options(joypad_dc PRIVATE ${USB2DC_FORCE_CONFIG})
 target_sources(joypad_dc PUBLIC ${COMMON_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/dreamcast_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/maple_state_machine.c
@@ -657,27 +691,14 @@ pico_generate_pio_header(joypad_dc ${CMAKE_CURRENT_LIST_DIR}/native/device/dream
 # USB4Maple-compatible pinout: GPIO 14/15 for Maple Bus
 add_executable(joypad_dc_rp2040zero)
 target_compile_definitions(joypad_dc_rp2040zero PRIVATE
-    CONFIG_DC=1 CONFIG_USB_HOST=1 CONFIG_DC_CORE1_TX=1 CONFIG_VMU=1 CONFIG_VMU_QSPI=1 CONFIG_NO_FLASH_LOCKOUT=1
-    PICO_STACK_SIZE=2048
-    PICO_CORE1_STACK_SIZE=4096
-    PICO_HEAP_SIZE=512
-    MAPLE_PIN1=14
-    MAPLE_PIN5=15
-    WS2812_PIN=16
+    # board GPIO / peripherals only — architecture is force-included below
+    MAPLE_PIN1=14 MAPLE_PIN5=15   # USB4Maple-compatible Maple Bus pins
+    WS2812_PIN=16                 # onboard NeoPixel (kb2040 has none)
     USE_BOOTSEL_BUTTON=1
     # SD card on SPI1: SCK=GP10, MOSI=GP11, MISO=GP12, CS=GP13
-    CONFIG_SD=1
-    SD_SPI_INST=1
-    SD_SCK_PIN=10
-    SD_MOSI_PIN=11
-    SD_MISO_PIN=12
-    SD_CS_PIN=13
-    # OLED display on I2C1: SDA=GP26, SCL=GP27
-    OLED_I2C_INST=1
-    OLED_I2C_SDA_PIN=26
-    OLED_I2C_SCL_PIN=27
-    OLED_I2C_ADDR=0x3C
+    CONFIG_SD=1 SD_SPI_INST=1 SD_SCK_PIN=10 SD_MOSI_PIN=11 SD_MISO_PIN=12 SD_CS_PIN=13
 )
+target_compile_options(joypad_dc_rp2040zero PRIVATE ${USB2DC_FORCE_CONFIG})
 target_sources(joypad_dc_rp2040zero PUBLIC ${COMMON_SOURCES} ${SD_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/dreamcast_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/maple_state_machine.c
@@ -1421,6 +1442,51 @@ if (PICO_BOARD STREQUAL "pico_w" OR
     joypad_target_common(joypad_bt2usb)
     pico_enable_stdio_usb(joypad_bt2usb 0)
     pico_enable_stdio_uart(joypad_bt2usb 1)
+
+    # --- MouthPad bridge (Pico W / Pico 2 W) : BLE in (HID + NUS) -> USB out ---
+    add_executable(joypad_mouthpad)
+    target_compile_definitions(joypad_mouthpad PRIVATE
+        CONFIG_MOUTHPAD=1
+        CONFIG_USB=1
+        DISABLE_USB_HOST=1
+        USE_BOOTSEL_BUTTON=1
+        CYW43_LWIP=0
+        BTSTACK_USE_CYW43=1
+        ENABLE_BTSTACK=1
+    )
+    target_sources(joypad_mouthpad PUBLIC
+        ${CORE_SOURCES}
+        ${USB_DEVICE_SOURCES}
+        ${BTHID_DEVICE_SOURCES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/generic/hid_parser.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/btstack/btstack_host.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/btstack/bt_device_db.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/transport/bt_transport.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/transport/bt_transport_cyw43.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/apps/mouthpad/app.c
+    )
+    target_include_directories(joypad_mouthpad PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/apps/mouthpad
+        ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbd
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/btstack
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid
+        ${BTSTACK_INCLUDES}
+    )
+    target_link_libraries(joypad_mouthpad PRIVATE
+        pico_stdlib
+        pico_multicore
+        pico_rand
+        pico_cyw43_arch_poll
+        pico_btstack_ble
+        pico_btstack_classic
+        pico_btstack_cyw43
+        tinyusb_device
+        tinyusb_board
+    )
+    joypad_target_common(joypad_mouthpad)
+    pico_enable_stdio_usb(joypad_mouthpad 0)
+    pico_enable_stdio_uart(joypad_mouthpad 1)
 
     # --- BT to Nuon (Pico W / Pico 2 W built-in Bluetooth -> Nuon) ---
     add_executable(joypad_bt2nuon)
@@ -2506,6 +2572,31 @@ target_include_directories(joypad_nes2usb PUBLIC
 target_link_libraries(joypad_nes2usb PRIVATE pico_stdlib pico_multicore hardware_pio pico_rand tinyusb_device tinyusb_board)
 joypad_target_common(joypad_nes2usb)
 pico_generate_pio_header(joypad_nes2usb ${CMAKE_CURRENT_LIST_DIR}/native/host/nes/nes_host.pio)
+
+
+# --- PCE2USB (PCEngine -> USB HID) ---
+add_executable(joypad_pce2usb)
+target_compile_definitions(joypad_pce2usb PRIVATE CONFIG_PCE2USB=1 CONFIG_USB=1 DISABLE_USB_HOST=1)
+target_sources(joypad_pce2usb PUBLIC ${CORE_SOURCES} ${USB_DEVICE_SOURCES}
+    ${PCE_HOST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/pce2usb/app.c
+)
+target_include_directories(joypad_pce2usb PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/pce2usb
+    ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbd
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/host/pcengine
+)
+target_link_libraries(joypad_pce2usb PRIVATE pico_stdlib pico_multicore hardware_pio pico_rand tinyusb_device tinyusb_board)
+# Status LED: Pico W / Pico 2 W's onboard LED is behind the CYW43 chip
+# (WL_GPIO0), so bring up cyw43_arch (no wireless) just to drive it. A plain
+# Pico's LED is a normal GPIO (GP25).
+if (PICO_BOARD STREQUAL "pico_w" OR PICO_BOARD STREQUAL "pico2_w")
+    target_compile_definitions(joypad_pce2usb PRIVATE BOARD_LED_CYW43=1)
+    target_link_libraries(joypad_pce2usb PRIVATE pico_cyw43_arch_none)
+elseif (PICO_BOARD STREQUAL "pico")
+    target_compile_definitions(joypad_pce2usb PRIVATE BOARD_LED_PIN=25)
+endif()
+joypad_target_common(joypad_pce2usb)
 
 
 # --- LODGENET2USB (LodgeNet -> USB HID) ---

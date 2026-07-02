@@ -29,7 +29,14 @@
  *  Extended: A2=Touchpad/Capture  A3=Mute  L4/R4=Paddles
  */
 
-#define MAX_DEVICES 6
+// Array floor: must cover the highest USB dev_addr the host can assign, which
+// is CFG_TUH_DEVICE_MAX + CFG_TUH_HUB + 1 (devices AND hubs both take addresses,
+// and these arrays are indexed by dev_addr — undersize it and you OOB). With
+// the defaults (device cap 10, hub depth 4) that's 15. Overridable per-app:
+// RAM-constrained single-output targets (usb2dc) lower it with a smaller cap.
+#ifndef MAX_DEVICES
+#define MAX_DEVICES 15
+#endif
 
 // W3C Gamepad API standard button order
 // Bit position = W3C button index (trivial conversion: 1 << index)

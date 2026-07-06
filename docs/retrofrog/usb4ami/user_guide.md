@@ -27,8 +27,10 @@ USB4AMI supports three modes, selected via the BOOTSEL button. The table below s
 
 ## Unsupported Platforms
 
-Atari 7800 console - This is due to hardware differences and how the 7800 reads its controllers. 
+Atari 7800 console - This is due to hardware differences and how the 7800 reads its controllers.
+ 
 ZX Spectrum Next - The Next follows a SEGA style pinout and 5v power is on a different pin. A separate adapter will be designed for it.
+
 Japanese Computers (MSX/X68000/FM Towns) - They also have a different pinout and there will be a separate adapter produced for them.
 
 

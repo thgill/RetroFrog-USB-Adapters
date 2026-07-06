@@ -2,8 +2,8 @@
 
 
 <p align="center">
-  <img src="docs/retrofrog/images/usb4ami_front.png" alt="USB4AMI front" width="45%">
-  <img src="docs/retrofrog/images/usb4ami_back.png" alt="USB4AMI back" width="45%">
+  <img src="../images/usb4ami_front.png" alt="USB4AMI front" width="45%">
+  <img src="../images/usb4ami_back.png" alt="USB4AMI back" width="45%">
 </p>
 
 

@@ -1,5 +1,12 @@
 # USB4AMI User Guide
 
+
+<p align="center">
+  <img src="docs/retrofrog/images/usb4ami_front.png" alt="USB4AMI front" width="45%">
+  <img src="docs/retrofrog/images/usb4ami_back.png" alt="USB4AMI back" width="45%">
+</p>
+
+
 ## What is USB4AMI?
 
 USB4AMI is a small adapter that lets you use modern USB controllers and mice with classic computers including the Commodore Amiga, Commodore 64, and Atari computers. It plugs directly into your computer's joystick/mouse port and translates input from any compatible USB device into the signals your retro computer understands.
@@ -138,7 +145,7 @@ The LED returns to your platform color and your new setting is saved automatical
 
 ## Updating Firmware
 
-1. Download the latest `.uf2` for USB4AMI from [Releases](https://github.com/thgill/joypad-os/releases)
+1. Download the latest `.uf2` for USB4AMI from [Releases](https://github.com/thgill/RetroFrog-USB-Adapters/releases)
 2. **Disconnect USB4AMI from your retro computer first**
 3. Hold the BOOTSEL button and connect the USB-A cable to your computer
 4. Drag the `.uf2` file onto the `RP2350` drive that appears

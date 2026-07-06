@@ -25,6 +25,14 @@ USB4AMI supports three modes, selected via the BOOTSEL button. The table below s
 
 ---
 
+## Unupported Platforms
+
+Due to hardware differences, USB4AMI doesn't support the Atari 7800 console. 
+
+
+
+---
+
 ## What's in the Box
 
 - USB4AMI adapter
@@ -61,13 +69,13 @@ USB4AMI needs to know which computer it's connected to. You select your platform
 
 **How to do it:**
 1. Power on your computer with USB4AMI connected.
-2. Tap the BOOTSEL button to cycle through modes:
+2. Tap the BOOTSEL button (during the first 8 seconds) to cycle through modes:
    - First tap → C64 (blue)
    - Second tap → Atari (green)
    - Third tap → back to Amiga (amber)
 3. Stop tapping when your platform's color appears.
 
-Your choice is automatically saved and remembered next time you power on.
+Your choice is automatically saved and remembered next time you power on. The BOOTSEL window is only open during the first 8 seconds of power on. After that it stays locked to that platform until you power cycle the device. 
 
 > **Tip:** If you don't tap the button at power on, USB4AMI stays on your last saved platform.
 
@@ -159,6 +167,9 @@ The LED returns to your platform color and your new setting is saved automatical
 
 ## Troubleshooting
 
+**Pressing the button doesn't change the LED color**
+As soon as the adapter receives power, an 8 second timer starts counting down and during that 8 seconds you can push the BOOTSEL button to freely change platforms. After that 8 seconds is up, it locks it to that platform setting. This is to prevent accidentally changing it (bumping the button) and also having the BOOTSEL running all the time causes issues with CD32 controls and C64 1351 mouse emulation. To change the platform setting it again you need to power cycle the system (off and back on). 
+
 **The adapter doesn't seem to be doing anything.**
 Check the LED color to confirm which platform is active. If needed, tap BOOTSEL to cycle to your desired platform.
 
@@ -177,8 +188,7 @@ Enter DPI adjustment mode (hold MMB 2 seconds), adjust until the speed feels rig
 **A CD32 game isn't recognizing all buttons after switching control profiles.**
 Exit the game and relaunch it. CD32 games detect the controller type at startup — relaunching allows USB4AMI to respond correctly to the CD32 detection handshake.
 
-**Why can't I change platforms with the BOOTSEL button after playing a CD32 game title on the Amiga?**
-This is by design as the BOOTSEL feature is disabled after starting a CD32 controls aware game. This is because having the BOOTSEL code running during CD32 controls may cause spurious button presses. Although there would be no need to do so, you would need to power cycle the adapter/computer to re-enable the BOOTSEL change function. 
+
 
 ---
 

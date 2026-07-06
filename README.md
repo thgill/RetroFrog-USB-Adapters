@@ -74,12 +74,13 @@ Use any modern USB HID gamepad or joystick with your Neo Geo AES, MVS, CD consol
 
 ## Flashing Firmware
 
-1. Download the latest `.uf2` for your adapter from [Releases](https://github.com/thgill/joypad-os/releases)
-2. Hold the button and connect the USB-A cable to your computer
-3. Drag the `.uf2` file onto the `RP2350` drive that appears
-4. Done — the drive ejects and your adapter is running the new firmware
+1. Download the latest `.uf2` from [Releases](https://github.com/thgill/RetroFrog-USB-Adapters/releases)
+2. **Disconnect the adapter from your retro computer/console first**
+3. Hold the BOOTSEL button and connect the USB-A cable to your computer
+4. Drag the `.uf2` file onto the `RP2350` drive that appears
+5. Done — the drive ejects and your adapter is running the new firmware
 
-> **Note:** Always disconnect the adapter from your console or vintage computer before updating firmware.
+> **Note:** You MUST use a USB-A male to male cable to plug into the Retro Frog USB Adapter for firmware updates. A USB-A to USB-C will NOT work. This isn't because of any fault of the adapter design, it's due to the fact that USB-A to C cables lack the 5.1k CC resistors on the USB-C side that would tell your computer that it's attached to a device and need to send 5 volts to it. If you need to update the firmware and all you have on your modern computer is USB-C ports (hello Apple!), you can use a female USB-A to male USB-C adapter as they have the correct resistors and are designed for this exact purpose. 
 
 ---
 

@@ -153,7 +153,7 @@ The LED returns to your platform color and your new setting is saved automatical
 
 > **Note 1:** USB4AMI automatically resets its settings to safe defaults after a firmware update. Your platform selection and DPI settings will need to be reconfigured.
 
-> **Note 2:** You MUST use a USB-A male to male cable to plug in USB4AMI for firmware updates. A USB-A to USB-C will NOT work. This isn't because of any fault of the USB4AMI design, it's due to the fact that USB-A to C cables lack the 5.1k CC resistors on the USB-C side that would tell your computer that it's attached to a device and need to send 5 volts to it. If you need to update the firmware an all you have on your modern computer is USB-C ports (hello Apple!), you can use a female USB-A to male USB-C adapter as they have the correct resistors and are designed for this exact purpose. 
+> **Note 2:** You MUST use a USB-A male to male cable to plug in USB4AMI for firmware updates. A USB-A to USB-C will NOT work. This isn't because of any fault of the USB4AMI design, it's due to the fact that USB-A to C cables lack the 5.1k CC resistors on the USB-C side that would tell your computer that it's attached to a device and need to send 5 volts to it. If you need to update the firmware and all you have on your modern computer is USB-C ports (hello Apple!), you can use a female USB-A to male USB-C adapter as they have the correct resistors and are designed for this exact purpose. 
 
 ---
 

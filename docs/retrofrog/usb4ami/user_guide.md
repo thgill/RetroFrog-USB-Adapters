@@ -201,7 +201,7 @@ Exit the game and relaunch it. CD32 games detect the controller type at startup 
 We are actively working on the following features for a future firmware update:
 
 - **Scroll wheel support** — Amiga and C64 scroll wheel support is under investigation. This requires coordination with Amiga and C64 driver software and is a non-trivial implementation. We will announce when this is available.
-- **Atari 7800 support** — The Atari 7800 uses a unique controller port protocol. We are investigating compatibility.
+
 
 ---
 

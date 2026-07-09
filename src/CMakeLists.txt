@@ -3042,6 +3042,46 @@ joypad_target_common(joypad_jag_rp2040zero)
 joypad_add_btstack(joypad_jag_rp2040zero)
 
 # ============================================================================
+# USB4JAG — Retro Frog custom RP2354A PCB
+# GPIO: J0=GP1, J1=GP3, J2=GP5, J3=GP9 (strobes), B0=GP10, B1=GP0
+#        J8=GP2, J9=GP4, J10=GP8, J11=GP11
+# LED: WS2812B GP12
+# RP2354A: 5V-tolerant GPIO, native USB host, built-in flash, no level shifters
+# ============================================================================
+add_executable(joypad_jag_rp2354a)
+target_compile_definitions(joypad_jag_rp2354a PRIVATE
+    CONFIG_JAGUAR=1
+    CONFIG_USB_HOST=1
+    WS2812_PIN=12
+    USE_BOOTSEL_BUTTON=1
+    REQUIRE_FLASH_SETTINGS=1
+    DISABLE_BUTTON_SERVICE=1
+    JAG_PIN_J0=1
+    JAG_PIN_J1=3
+    JAG_PIN_J2=5
+    JAG_PIN_J3=9
+    JAG_PIN_B0=10
+    JAG_PIN_B1=0
+    JAG_PIN_J8=2
+    JAG_PIN_J9=4
+    JAG_PIN_J10=8
+    JAG_PIN_J11=11
+)
+target_sources(joypad_jag_rp2354a PUBLIC ${COMMON_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/jaguar/jaguar_device.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2jag/app.c
+)
+target_include_directories(joypad_jag_rp2354a PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2jag
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/jaguar
+)
+target_link_libraries(joypad_jag_rp2354a PRIVATE ${COMMON_LIBRARIES} pico_multicore)
+joypad_target_common(joypad_jag_rp2354a)
+joypad_add_btstack(joypad_jag_rp2354a)
+pico_enable_stdio_uart(joypad_jag_rp2354a 0)
+pico_enable_stdio_usb(joypad_jag_rp2354a 0)
+
+# ============================================================================
 # DEBUG BUILD CONFIGURATION
 # ============================================================================
 

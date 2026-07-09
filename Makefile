@@ -76,6 +76,7 @@ CONSOLE_ami_xiao := joypad_ami_xiao
 CONSOLE_ami_retrofrog := joypad_ami_retrofrog
 CONSOLE_ami_beetle_rp2350 := joypad_ami_beetle_rp2350
 CONSOLE_jag_rp2040zero := joypad_jag_rp2040zero
+CONSOLE_jag_rp2354a := joypad_jag_rp2354a
 CONSOLE_usb_pico := joypad_usb_pico
 CONSOLE_usb_ogxm_pico := joypad_usb_ogxm_pico
 CONSOLE_usb_pico_w := joypad_usb_pico_w
@@ -159,6 +160,7 @@ APP_usb2ami_xiao := seeed_xiao_rp2040 ami_xiao usb2ami_xiao USB/BT Amiga/Atari
 APP_usb2ami_retrofrog := pico2 ami_retrofrog usb2ami_retrofrog USB/BT Amiga/Atari (Retro Frog PCB)
 APP_usb2ami_beetle_rp2350 := pico2 ami_beetle_rp2350 usb2ami_beetle_rp2350 USB/BT Amiga/Atari (Beetle RP2350)
 APP_usb2jag_rp2040zero := rp2040zero jag_rp2040zero usb2jag_rp2040zero USB/BT Jaguar
+APP_usb4jag_rp2354a := pico2 jag_rp2354a usb4jag_rp2354a USB/BT Jaguar (Retro Frog USB4JAG PCB)
 APP_usb2neogeo_kb2040 := kb2040 neogeo usb2neogeo_kb2040 USB/BT NEOGEO
 APP_usb2neogeo_pico := pico neogeo_pico usb2neogeo_pico USB/BT NEOGEO
 APP_usb2neogeo_rp2040zero := rp2040zero neogeo_rp2040zero usb2neogeo_rp2040zero USB/BT NEOGEO
@@ -558,6 +560,10 @@ usb2ami_beetle_rp2350:
 .PHONY: usb2jag_rp2040zero
 usb2jag_rp2040zero:
 	$(call build_app,usb2jag_rp2040zero)
+
+.PHONY: usb4jag_rp2354a
+usb4jag_rp2354a:
+	$(call build_app,usb4jag_rp2354a)
 
 .PHONY: usb2neogeo_kb2040
 usb2neogeo_kb2040:
@@ -1649,7 +1655,7 @@ flash-lodgenet2gc_pico:
 .PHONY: _flash_app
 _flash_app:
 	@# Determine correct volume based on app name (RP2350/Pico2 boards use different volume)
-	@if echo "$(APP_NAME)" | grep -qE "rp2350|pico2"; then \
+	@if echo "$(APP_NAME)" | grep -qE "rp2350|pico2|rp2354"; then \
 		VOLUME="/Volumes/RP2350"; \
 	else \
 		VOLUME="/Volumes/RPI-RP2"; \

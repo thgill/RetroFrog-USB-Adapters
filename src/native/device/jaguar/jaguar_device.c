@@ -579,11 +579,16 @@ void __not_in_flash_func(jaguar_core1_task)(void) {
 
         if (mode == JAG_MODE_GAMEPAD) {
             // ---- GAMEPAD HOT LOOP — zero phase overhead ----
+            // Uses individual strobe pin checks — works with non-contiguous GPIO pins
             while (jag_input_mode == JAG_MODE_GAMEPAD) {
                 uint32_t gpio_in = sio_hw->gpio_in;
-                uint8_t  idx     = (gpio_in >> STROBE_SHIFT) & 0xF;
-                uint32_t set     = jag_strobe_table[idx];
-                uint32_t clr     = GPIO_MASK_ALL_OUT & ~set;
+                uint32_t set;
+                if      (!(gpio_in & GPIO_MASK_J0)) set = jag_row_gpio[0];
+                else if (!(gpio_in & GPIO_MASK_J1)) set = jag_row_gpio[1];
+                else if (!(gpio_in & GPIO_MASK_J2)) set = jag_row_gpio[2];
+                else if (!(gpio_in & GPIO_MASK_J3)) set = jag_row_gpio[3];
+                else                                 set = GPIO_MASK_ALL_OUT;
+                uint32_t clr = GPIO_MASK_ALL_OUT & ~set;
                 sio_hw->gpio_set = set;
                 if (clr) sio_hw->gpio_clr = clr;
             }
@@ -613,9 +618,14 @@ void __not_in_flash_func(jaguar_core1_task)(void) {
                 if (phase_clr) sio_hw->gpio_clr = phase_clr;
 
                 uint32_t gpio_in = sio_hw->gpio_in;
-                uint8_t  idx     = (gpio_in >> STROBE_SHIFT) & 0xF;
-                uint32_t set     = jag_strobe_table[idx];
-                uint32_t clr     = GPIO_MASK_ALL_OUT & ~set;
+                uint32_t set;
+                if      (!(gpio_in & GPIO_MASK_J0)) set = jag_row_gpio[0];
+                else if (!(gpio_in & GPIO_MASK_J1)) set = jag_row_gpio[1];
+                else if (!(gpio_in & GPIO_MASK_J2)) set = jag_row_gpio[2];
+                else if (!(gpio_in & GPIO_MASK_J3)) set = jag_row_gpio[3];
+                else                                 set = GPIO_MASK_ALL_OUT & ~(GPIO_MASK_J10 | GPIO_MASK_J11);
+                set &= ~(GPIO_MASK_J10 | GPIO_MASK_J11);
+                uint32_t clr = GPIO_MASK_ALL_OUT & ~set & ~(GPIO_MASK_J10 | GPIO_MASK_J11);
                 sio_hw->gpio_set = set;
                 if (clr) sio_hw->gpio_clr = clr;
             }
@@ -671,9 +681,14 @@ void __not_in_flash_func(jaguar_core1_task)(void) {
 
                 // Strobe response
                 uint32_t gpio_in = sio_hw->gpio_in;
-                uint8_t  idx     = (gpio_in >> STROBE_SHIFT) & 0xF;
-                uint32_t set     = jag_strobe_table[idx] & ~pm;
-                uint32_t clr     = GPIO_MASK_ALL_OUT & ~set & ~pm;
+                uint32_t set;
+                if      (!(gpio_in & GPIO_MASK_J0)) set = jag_row_gpio[0];
+                else if (!(gpio_in & GPIO_MASK_J1)) set = jag_row_gpio[1];
+                else if (!(gpio_in & GPIO_MASK_J2)) set = jag_row_gpio[2];
+                else if (!(gpio_in & GPIO_MASK_J3)) set = jag_row_gpio[3];
+                else                                 set = GPIO_MASK_ALL_OUT & ~pm;
+                set &= ~pm;
+                uint32_t clr = GPIO_MASK_ALL_OUT & ~set & ~pm;
                 sio_hw->gpio_set = set;
                 if (clr) sio_hw->gpio_clr = clr;
             }

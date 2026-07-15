@@ -1,7 +1,7 @@
 # USB4NEO User Guide
 
 <p align="center">
-  <img src="../images/usb4neo_front.png" alt="USB4NEO front" width="25%">
+  <img src="../images/usb4neo_front.png" alt="USB4NEO front" width="30%">
   <img src="../images/usb4neo_back.png" alt="USB4NEO back" width="45%">
 </p>
 

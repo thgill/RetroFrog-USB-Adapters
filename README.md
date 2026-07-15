@@ -36,6 +36,8 @@ Use any modern USB gamepad or mouse with your Commodore Amiga, Commodore 64, Ata
 | **C64** | Commodore 64 (including Ultimate64), Commodore 128, MEGA65 |
 | **Atari** | Atari ST (all), Atari Falcon, Atari 8-bit computers (all) |
 
+> **Note:** The ZX Spectrum with Kempston joystick interface is also supported. You can use any of the 3 modes for it as the ZX supports just a single joystick button.
+
 **Supported input:**
 - USB gamepads — Xbox, PlayStation, Nintendo Switch, 8BitDo, and most generic HID controllers
 - USB mice — any standard USB mouse or trackball

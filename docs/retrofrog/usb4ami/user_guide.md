@@ -23,6 +23,9 @@ USB4AMI supports three modes, selected via the BOOTSEL button. The table below s
 | **C64** | Blue | Commodore 64 (including Ultimate64), Commodore 128, MEGA65 |
 | **Atari** | Green | Atari ST (all), Atari Falcon, Atari 8-bit computers (all) |
 
+
+> **Note:** The ZX Spectrum with Kempston joystick interface is also supported. You can use any of the 3 modes for it as the ZX supports just a single joystick button.
+
 ---
 
 ## Unsupported Platforms

@@ -1,9 +1,10 @@
 // jaguar_device.h - Atari Jaguar HD15 output driver for JoypadOS
 //
-// Supports two input modes routed to a single HD15 output:
+// Supports these input modes routed to a single HD15 output:
 //   USB Gamepad  — standard joypad matrix scan response
 //   USB Mouse    — digital spinner (quadrature phase) + ROTARY type ID
 //                  for Tempest 2000 and compatible titles
+//   USB Keyboard — ASCII keyboard protocol (JagNote2-compatible)
 //
 // Input mode is detected automatically from the connected USB device type.
 //
@@ -88,10 +89,47 @@
 // ============================================================================
 
 typedef enum {
-    JAG_MODE_GAMEPAD = 0,   // USB gamepad → standard joypad matrix
-    JAG_MODE_SPINNER = 1,   // USB mouse   → digital spinner + ROTARY type ID
-    JAG_MODE_MOUSE   = 2,   // USB mouse   → ST/Amiga quadrature mouse protocol
+    JAG_MODE_GAMEPAD  = 0,  // USB gamepad  → standard joypad matrix
+    JAG_MODE_SPINNER  = 1,  // USB mouse    → digital spinner + ROTARY type ID
+    JAG_MODE_MOUSE    = 2,  // USB mouse    → ST/Amiga quadrature mouse protocol
+    JAG_MODE_KEYBOARD = 3,  // USB keyboard → JagNote2-compatible ASCII keyboard protocol
 } jag_input_mode_t;
+
+// ============================================================================
+// KEYBOARD PROTOCOL (JagNote2-compatible, port 1)
+//
+// Reverse-engineered from JAGNOTE2.J64 — see project doc
+// usb4jag-keyboard-protocol.md. The Jaguar writes a 4-bit row code to
+// J3..J0 (raw levels, J0 = bit 0) and reads B0/B1/J8-J11 back:
+//
+//   0100  STATUS   B0 LOW = a key is waiting, B0 HIGH = no key
+//   0101  DATA_LO  key bits 0-5 on B0, B1, J11, J10, J9, J8 (LOW = 1)
+//   0110  DATA_HI  key bits 6-7 on B0, B1                  (LOW = 1)
+//   1000  ACK      key consumed — adapter pops its FIFO
+//
+// Key bytes are ASCII (US layout translated on the adapter), plus
+// JagNote2 control codes: $08 BS, $0D Enter, $0E/$0F/$10/$11 cursor
+// up/down/left/right.
+//
+// Standard pad rows (1110/1101/1011/0111) answer "nothing pressed" in
+// keyboard mode, so the port still identifies as a standard pad.
+// ============================================================================
+
+#define JAG_KB_CODE_STATUS   0x4
+#define JAG_KB_CODE_DATA_LO  0x5
+#define JAG_KB_CODE_DATA_HI  0x6
+#define JAG_KB_CODE_ACK      0x8
+
+// Single-producer / single-consumer key FIFO.
+// Core 0 (producer) owns jag_kb_head; Core 1 (consumer) owns jag_kb_tail.
+#define JAG_KB_FIFO_SIZE     32     // must be a power of two
+extern volatile uint8_t jag_kb_fifo[JAG_KB_FIFO_SIZE];
+extern volatile uint8_t jag_kb_head;
+extern volatile uint8_t jag_kb_tail;
+
+// Typematic repeat (USB keyboards do not repeat on their own)
+#define JAG_KB_REPEAT_DELAY_MS  500
+#define JAG_KB_REPEAT_RATE_MS    80
 
 // ============================================================================
 // PHASE TABLE

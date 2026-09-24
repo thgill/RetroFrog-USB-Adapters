@@ -143,6 +143,62 @@ volatile uint32_t         jag_step_interval_us = 4000;
 volatile uint32_t         jag_phase_pin_mask = 0;
 
 // ============================================================================
+// KEYBOARD FIFO / PROTOCOL HELPERS
+// ============================================================================
+
+// Key FIFO — Core 0 pushes at head, Core 1 pops at tail (see jaguar_device.h)
+volatile uint8_t jag_kb_fifo[JAG_KB_FIFO_SIZE];
+volatile uint8_t jag_kb_head = 0;
+volatile uint8_t jag_kb_tail = 0;
+
+#define JAG_KB_FIFO_MASK  (JAG_KB_FIFO_SIZE - 1)
+
+// Gather the four strobe levels into a 4-bit row code (J0 = bit 0).
+// Works with non-contiguous strobe pins (RP2354A: GP1/GP3/GP5/GP9).
+// Unlike the gamepad loop's priority check, this decodes all 16 codes —
+// required because keyboard codes (0100, 0101, 0110, 1000) have several
+// strobes LOW at once.
+#define JAG_STROBE_CODE(in) \
+    (  (((in) >> JAG_PIN_J0) & 1u)        | \
+      ((((in) >> JAG_PIN_J1) & 1u) << 1)  | \
+      ((((in) >> JAG_PIN_J2) & 1u) << 2)  | \
+      ((((in) >> JAG_PIN_J3) & 1u) << 3) )
+
+// GPIO SET mask for code 0101 — key bits 0-5, LOW = 1.
+// Bit order matches JagNote2's reader: B0, B1, J11, J10, J9, J8.
+// always_inline: called from the RAM-resident Core 1 loop, must not
+// become an out-of-line call into flash.
+static inline __attribute__((always_inline)) uint32_t kb_mask_lo(uint8_t k) {
+    uint32_t m = GPIO_MASK_ALL_OUT;
+    if (k & 0x01) m &= ~GPIO_MASK_B0;
+    if (k & 0x02) m &= ~GPIO_MASK_B1;
+    if (k & 0x04) m &= ~GPIO_MASK_J11;
+    if (k & 0x08) m &= ~GPIO_MASK_J10;
+    if (k & 0x10) m &= ~GPIO_MASK_J9;
+    if (k & 0x20) m &= ~GPIO_MASK_J8;
+    return m;
+}
+
+// GPIO SET mask for code 0110 — key bits 6-7 on B0, B1, LOW = 1.
+static inline __attribute__((always_inline)) uint32_t kb_mask_hi(uint8_t k) {
+    uint32_t m = GPIO_MASK_ALL_OUT;
+    if (k & 0x40) m &= ~GPIO_MASK_B0;
+    if (k & 0x80) m &= ~GPIO_MASK_B1;
+    return m;
+}
+
+// HID usage → US ASCII for usages 0x1E-0x38 (digits, punctuation).
+// { unshifted, shifted }. Letters (0x04-0x1D) are handled arithmetically.
+static const uint8_t kb_ascii_us[0x38 - 0x1E + 1][2] = {
+    {'1','!'}, {'2','@'}, {'3','#'}, {'4','$'}, {'5','%'},    // 1E-22
+    {'6','^'}, {'7','&'}, {'8','*'}, {'9','('}, {'0',')'},    // 23-27
+    {0x0D,0x0D}, {0x1B,0x1B}, {0x08,0x08}, {0x09,0x09},       // 28-2B Enter Esc BS Tab
+    {' ',' '}, {'-','_'}, {'=','+'}, {'[','{'}, {']','}'},    // 2C-30
+    {'\\','|'}, {'#','~'}, {';',':'}, {'\'','"'}, {'`','~'},  // 31-35 (32 = ISO #~)
+    {',','<'}, {'.','>'}, {'/','?'},                          // 36-38
+};
+
+// ============================================================================
 // INTERNAL STATE (Core 0 only)
 // ============================================================================
 
@@ -160,6 +216,13 @@ static uint32_t last_gamepad_buttons = 0;
 static bool     lr_held_state    = false;
 static uint32_t lr_hold_start_ms = 0;
 static bool     lr_toggled_state = false;
+
+// Keyboard state (Core 0 only)
+static uint8_t  kb_prev_keys[6]    = {0};
+static bool     kb_caps_lock       = false;
+static uint8_t  kb_repeat_usage    = 0;     // 0 = no key repeating
+static uint8_t  kb_repeat_char     = 0;
+static uint32_t kb_repeat_next_ms  = 0;
 
 // ============================================================================
 // FLASH HELPERS
@@ -197,6 +260,7 @@ static void update_led(void) {
         case JAG_MODE_GAMEPAD: leds_set_color(80,  0,  0); break;  // red
         case JAG_MODE_SPINNER: leds_set_color(0,   0, 80); break;  // blue
         case JAG_MODE_MOUSE:   leds_set_color(0,  80,  0); break;  // green
+        case JAG_MODE_KEYBOARD: leds_set_color(0, 60, 60); break;  // cyan
         default:               leds_set_color(80,  0,  0); break;  // red
     }
 }
@@ -341,6 +405,117 @@ static void build_spinner_rows(uint32_t buttons) {
 }
 
 // ============================================================================
+// KEYBOARD (Core 0) — HID usage → ASCII, FIFO producer, typematic repeat
+// ============================================================================
+
+// Push one key byte. Drops the key if the FIFO is full (Jaguar not reading).
+static bool kb_push(uint8_t c) {
+    uint8_t head = jag_kb_head;
+    uint8_t next = (head + 1) & JAG_KB_FIFO_MASK;
+    if (next == jag_kb_tail) return false;   // full
+    jag_kb_fifo[head] = c;
+    __dmb();                                 // data visible before head moves
+    jag_kb_head = next;
+    return true;
+}
+
+static inline bool kb_fifo_empty(void) {
+    return jag_kb_head == jag_kb_tail;
+}
+
+// Translate one HID usage (page 0x07) to a JagNote2 key byte, US layout.
+// Returns 0 for keys that produce nothing.
+static uint8_t kb_translate(uint8_t usage, uint8_t modifier) {
+    bool shift = (modifier & 0x22) != 0;         // LShift 0x02 | RShift 0x20
+    bool chord = (modifier & 0xDD) != 0;         // any Ctrl / Alt / GUI held
+
+    // Letters — Caps Lock inverts Shift
+    if (usage >= 0x04 && usage <= 0x1D) {
+        if (chord) return 0;                     // no Ctrl/Alt/GUI letter codes yet
+        return (uint8_t)(((shift != kb_caps_lock) ? 'A' : 'a') + (usage - 0x04));
+    }
+
+    // Digits, Enter/Esc/BS/Tab/Space, punctuation
+    if (usage >= 0x1E && usage <= 0x38) {
+        uint8_t c = kb_ascii_us[usage - 0x1E][shift ? 1 : 0];
+        if (chord && c >= 0x20) return 0;        // control keys pass, printables don't
+        return c;
+    }
+
+    switch (usage) {
+        // Navigation — JagNote2 control codes
+        case 0x52: return 0x0E;                  // Up
+        case 0x51: return 0x0F;                  // Down
+        case 0x50: return 0x10;                  // Left
+        case 0x4F: return 0x11;                  // Right
+        case 0x4C: return 0x7F;                  // Delete (ignored by JagNote2)
+
+        // Numeric keypad (Num Lock treated as always on)
+        case 0x54: return '/';
+        case 0x55: return '*';
+        case 0x56: return '-';
+        case 0x57: return '+';
+        case 0x58: return 0x0D;                  // Keypad Enter
+        case 0x62: return '0';
+        case 0x63: return '.';
+        default:
+            if (usage >= 0x59 && usage <= 0x61)  // Keypad 1-9
+                return (uint8_t)('1' + (usage - 0x59));
+            return 0;
+    }
+}
+
+static bool kb_key_in(const uint8_t keys[6], uint8_t usage) {
+    for (int i = 0; i < 6; i++) if (keys[i] == usage) return true;
+    return false;
+}
+
+// Process one keyboard report: emit a byte for each newly pressed key.
+static void kb_process_report(uint8_t modifier, const uint8_t keys[6]) {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    // Phantom report (more keys down than the keyboard can report: every
+    // slot = 0x01 ErrorRollOver). Ignore it entirely — if it reached
+    // kb_prev_keys, every still-held key would look newly pressed next report.
+    for (int i = 0; i < 6; i++) {
+        if (keys[i] >= 0x01 && keys[i] <= 0x03) return;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        uint8_t u = keys[i];
+        if (u == 0) continue;                    // empty slot
+        if (kb_key_in(kb_prev_keys, u)) continue; // still held — not a new press
+
+        kb_repeat_usage = 0;                     // any new press stops the old repeat
+
+        if (u == 0x39) {                         // Caps Lock toggles, emits nothing
+            kb_caps_lock = !kb_caps_lock;
+            continue;
+        }
+
+        uint8_t c = kb_translate(u, modifier);
+        if (c) {
+            kb_push(c);
+            kb_repeat_usage   = u;               // newest key takes over repeat
+            kb_repeat_char    = c;
+            kb_repeat_next_ms = now + JAG_KB_REPEAT_DELAY_MS;
+        }
+    }
+
+    // Repeating key released → stop repeat
+    if (kb_repeat_usage && !kb_key_in(keys, kb_repeat_usage))
+        kb_repeat_usage = 0;
+
+    for (int i = 0; i < 6; i++) kb_prev_keys[i] = keys[i];
+}
+
+static void kb_reset_state(void) {
+    for (int i = 0; i < 6; i++) kb_prev_keys[i] = 0;
+    kb_repeat_usage = 0;
+    kb_caps_lock    = false;
+}
+
+// ============================================================================
 // INPUT EVENT TAP (Core 0)
 // ============================================================================
 
@@ -368,7 +543,29 @@ static void __not_in_flash_func(jaguar_tap_callback)(
         jag_step_interval_us = 0;
         phase_accum   = 0;
         phase_y_accum = 0;
+        kb_reset_state();
         leds_set_color(0, 0, 0);
+        return;
+    }
+
+    if (event->type == INPUT_TYPE_KEYBOARD) {
+        // Keyboard mode: raw kb_keys[] → ASCII FIFO. The lossy gamepad
+        // mapping in event->buttons (from hid_keyboard.c) is ignored.
+        if (!device_connected || jag_input_mode != JAG_MODE_KEYBOARD) {
+            device_connected     = true;
+            dpi_adjust_mode      = false;
+            last_gamepad_buttons = 0;
+            // Standard pad rows answer "nothing pressed" (C2/C3 HIGH = STDPAD)
+            jag_row_gpio[0] = GPIO_MASK_ALL_OUT;
+            jag_row_gpio[1] = GPIO_MASK_ALL_OUT;
+            jag_row_gpio[2] = GPIO_MASK_ALL_OUT;
+            jag_row_gpio[3] = GPIO_MASK_ALL_OUT;
+            jag_input_mode  = JAG_MODE_KEYBOARD;
+            build_strobe_table(); __dmb();
+            update_led();
+            printf("[jaguar] Keyboard mode\n");
+        }
+        kb_process_report(event->kb_modifier, event->kb_keys);
         return;
     }
 
@@ -547,7 +744,7 @@ static void __not_in_flash_func(jaguar_tap_callback)(
 }
 
 // ============================================================================
-// CORE 1 TASK — tight loop, no flash, no interrupts
+// CORE 1 TASK — tight loop, no flash calls (flash lockout IRQ can still pause it)
 //
 // Two responsibilities:
 //
@@ -692,6 +889,64 @@ void __not_in_flash_func(jaguar_core1_task)(void) {
                 sio_hw->gpio_set = set;
                 if (clr) sio_hw->gpio_clr = clr;
             }
+
+        } else if (mode == JAG_MODE_KEYBOARD) {
+            // ---- KEYBOARD HOT LOOP ----
+            // Full 16-code decode. Only the three keyboard codes carry data;
+            // every other code (incl. standard pad rows) = all released.
+            // Core 1 owns the FIFO tail and the per-key masks, so the next
+            // key is presented the instant the Jaguar acks — no Core 0 round trip.
+            uint32_t kb_tbl[16];
+            for (int i = 0; i < 16; i++) kb_tbl[i] = GPIO_MASK_ALL_OUT;
+
+            uint8_t  tail      = jag_kb_tail;
+            bool     loaded    = false;   // head key is in kb_tbl
+            bool     acked     = false;   // ack already taken for this 1000 period
+            uint32_t prev_code = 0xF;
+
+            while (jag_input_mode == JAG_MODE_KEYBOARD) {
+                // Present the next key. STATUS is written last so the Jaguar
+                // can never see "key waiting" before the data masks are ready.
+                if (!loaded && jag_kb_head != tail) {
+                    __dmb();
+                    uint8_t k = jag_kb_fifo[tail];
+                    kb_tbl[JAG_KB_CODE_DATA_LO] = kb_mask_lo(k);
+                    kb_tbl[JAG_KB_CODE_DATA_HI] = kb_mask_hi(k);
+                    kb_tbl[JAG_KB_CODE_STATUS]  = GPIO_MASK_ALL_OUT & ~GPIO_MASK_B0;
+                    loaded = true;
+                }
+
+                uint32_t in   = sio_hw->gpio_in;    // one sample — macro uses it 4x
+                uint32_t code = JAG_STROBE_CODE(in);
+                uint32_t set  = kb_tbl[code];
+                uint32_t clr  = GPIO_MASK_ALL_OUT & ~set;
+                sio_hw->gpio_set = set;
+                if (clr) sio_hw->gpio_clr = clr;
+
+                // ACK: code 1000 seen on two consecutive samples (rejects
+                // skew glitches while J3..J0 change), taken once per period.
+                if (code == JAG_KB_CODE_ACK) {
+                    if (prev_code == JAG_KB_CODE_ACK && !acked) {
+                        acked = true;
+                        if (loaded) {
+                            kb_tbl[JAG_KB_CODE_STATUS]  = GPIO_MASK_ALL_OUT;
+                            kb_tbl[JAG_KB_CODE_DATA_LO] = GPIO_MASK_ALL_OUT;
+                            kb_tbl[JAG_KB_CODE_DATA_HI] = GPIO_MASK_ALL_OUT;
+                            tail = (tail + 1) & JAG_KB_FIFO_MASK;
+                            jag_kb_tail = tail;
+                            loaded = false;
+                        }
+                    }
+                } else {
+                    acked = false;
+                }
+                prev_code = code;
+            }
+
+            // Leaving keyboard mode (disconnect / other device): discard
+            // anything still queued so it isn't replayed on the next keyboard.
+            // Core 1 owns the tail, so this is the safe place to flush.
+            jag_kb_tail = jag_kb_head;
         }
     }
 }
@@ -756,6 +1011,14 @@ void jaguar_device_task(void) {
         } else {
             update_led();               // back to current mode color
         }
+    }
+
+    // Keyboard typematic repeat. Only queue a repeat once the Jaguar has
+    // drained the FIFO, so a program that stops polling can't build a backlog.
+    if (jag_input_mode == JAG_MODE_KEYBOARD && kb_repeat_usage &&
+        (int32_t)(now - kb_repeat_next_ms) >= 0) {
+        if (kb_fifo_empty()) kb_push(kb_repeat_char);
+        kb_repeat_next_ms = now + JAG_KB_REPEAT_RATE_MS;
     }
 
     // Left+Right click hold 2s — toggle spinner/mouse mode

@@ -131,6 +131,7 @@ SRC_C += $(JOYPAD)/apps/usb2usb/app.c
 # --- USB Host layer ---
 SRC_C += \
 	$(JOYPAD)/usb/usbh/usbh.c \
+	$(JOYPAD)/usb/usbh/intel/intel_wireless_series.c \
 	$(JOYPAD)/usb/usbh/hid/hid.c \
 	$(JOYPAD)/usb/usbh/hid/hid_registry.c \
 	$(JOYPAD)/usb/usbh/hid/hid_utils.c \
@@ -148,6 +149,7 @@ SRC_C += \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c \
+	$(JOYPAD)/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/google/google_stadia.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/hori/hori_horipad.c \
@@ -164,9 +166,13 @@ SRC_C += \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/sony_ds3.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/sony_ds4.c \
+	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/ds5_auth.c \
+	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/p5general_host.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/sony_ds5.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/sony/sony_psc.c \
 	$(JOYPAD)/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c \
+	$(JOYPAD)/usb/usbh/hid/devices/vendors/valve/steam_controller.c \
+	$(JOYPAD)/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c \
 
 # --- XInput host driver (tusb_xinput library) ---
 SRC_C += $(JOYPAD)/lib/tusb_xinput/xinput_host.c
@@ -182,6 +188,8 @@ SRC_C += \
 	$(JOYPAD)/usb/usbd/modes/psclassic_mode.c \
 	$(JOYPAD)/usb/usbd/modes/pcemini_mode.c \
 	$(JOYPAD)/usb/usbd/modes/ps4_mode.c \
+	$(JOYPAD)/usb/usbd/modes/dualsense_mode.c \
+	$(JOYPAD)/usb/usbd/modes/p5general_mode.c \
 	$(JOYPAD)/usb/usbd/modes/xid_mode.c \
 	$(JOYPAD)/usb/usbd/modes/xbone_mode.c \
 	$(JOYPAD)/usb/usbd/modes/xac_mode.c \

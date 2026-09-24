@@ -26,11 +26,11 @@ These legacy devices can be flashed with the latest joypad-os firmware using the
 
 1. Go to [GitHub Releases](https://github.com/joypad-ai/joypad-os/releases)
 2. Download the latest `.uf2` file for your product:
-   - `joypad_<commit>_usb2pce_kb2040.uf2` - PCEngine adapter
-   - `joypad_<commit>_usb2gc_kb2040.uf2` - GameCube adapter
-   - `joypad_<commit>_usb2nuon_kb2040.uf2` - Nuon adapter
-   - `joypad_<commit>_usb23do_rp2040zero.uf2` - 3DO adapter
-   - `joypad_<commit>_usb2loopy_kb2040.uf2` - Casio Loopy adapter (experimental)
+   - `joypad_os_<commit>_usb2pce_kb2040.uf2` - PCEngine adapter
+   - `joypad_os_<commit>_usb2gc_kb2040.uf2` - GameCube adapter
+   - `joypad_os_<commit>_usb2nuon_kb2040.uf2` - Nuon adapter
+   - `joypad_os_<commit>_usb23do_rp2040zero.uf2` - 3DO adapter
+   - `joypad_os_<commit>_usb2loopy_kb2040.uf2` - Casio Loopy adapter (experimental)
 
 ## Flashing Instructions
 
@@ -142,14 +142,14 @@ The GC USB adapter automatically enters bootloader mode when powered on without 
 Several adapters support switchable button mapping profiles:
 
 ### GameCube (USB2GC)
-- Hold **Select** for 2 seconds
-- Then press **D-Pad Up/Down** to cycle profiles
+- Hold **Select + D-Pad Up** (previous) or **Select + D-Pad Down** (next) together for ~0.7 s
+- Stops at the first/last profile — it does not wrap
 - Profiles: Default, SNES, SSBM, MKWii, Fighting
 - See [GameCube app docs](../apps/usb2gc.md) for details
 
 ### 3DO (USB23DO)
-- Hold **Select** for 2 seconds
-- Then press **D-Pad Up/Down** to cycle profiles
+- Hold **Select + D-Pad Up** (previous) or **Select + D-Pad Down** (next) together for ~0.7 s
+- Stops at the first/last profile — it does not wrap
 - Profiles: Default, Fighting, Shooter
 - See [3DO app docs](../apps/usb23do.md) for details
 

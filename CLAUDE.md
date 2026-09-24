@@ -45,15 +45,17 @@ make n642usb_kb2040    # N64 → USB HID
 make gc2usb_kb2040     # GameCube → USB HID
 make lodgenet2usb_pico # LodgeNet → USB HID (Pico)
 make lodgenet2usb_pico2 # LodgeNet → USB HID (Pico 2)
+make 24g2usb_rp2350zero # 8BitDo SF30 2.4G → USB HID (RP2350-Zero, needs nRF24L01+)
 make n642dc_kb2040     # N64 → Dreamcast
 make bt2usb_pico_w     # BT-only → USB HID (Pico W)
 make bt2usb_xiao_esp32s3    # BLE-only → USB HID (ESP32-S3, requires ESP-IDF)
 make bt2usb_seeed_xiao_nrf52840   # BLE-only → USB HID (Seeed XIAO nRF52840, requires NCS)
+make bt2usb_makerdiary_nrf52840   # BLE-only → USB HID (Makerdiary MDK USB Dongle, requires NCS)
 make mouthpad_aprbrother_nrf52840 # Augmental MouthPad BLE → USB HID + NUS relay (April Brother dongle, NCS)
 make mouthpad_pico_w              # Augmental MouthPad BLE → USB HID + NUS relay (Pico W)
 make wifi2usb_pico_w   # WiFi → USB HID (Pico W)
-make controller_btusb_pico_w        # GPIO+JoyWing → BLE+USB HID (Pico W)
-make controller_btusb_rp2040_abb    # GPIO+USB Host → USB HID (ABB Passthrough)
+make universal_pico_w        # GPIO+JoyWing → BLE+USB HID (Pico W)
+make universal_rp2040_abb    # GPIO+USB Host → USB HID (ABB Passthrough)
 
 # Build all (RP2040 targets only)
 make all
@@ -67,7 +69,19 @@ make flash-usb2pce_kb2040  # Flash specific app
 make flash-bt2usb_xiao_esp32s3  # Flash via esptool
 ```
 
-Output: `releases/joypad_<commit>_<app>_<board>.uf2`
+Output: `releases/joypad_os_<commit>_<app>_<board>.uf2`
+
+### App Build Matrix
+
+# Flash (macOS - looks for /Volumes/RPI-RP2)
+make flash              # Flash most recent build
+make flash-usb2pce_kb2040  # Flash specific app
+
+# ESP32-S3 (requires ESP-IDF, see .dev/docs/esp32-port.md)
+make flash-bt2usb_xiao_esp32s3  # Flash via esptool
+```
+
+Output: `releases/joypad_os_<commit>_<app>_<board>.uf2`
 
 ### App Build Matrix
 
@@ -80,19 +94,20 @@ Output: `releases/joypad_<commit>_<app>_<board>.uf2`
 | `usb23do` | RP2040-Zero | USB/BT | 3DO |
 | `usb2loopy` | KB2040 | USB/BT | Loopy |
 | `usb2usb` | Feather/RP2040-Zero | USB/BT | USB HID |
-| `bt2usb` | Pico W/Pico 2 W/ESP32-S3/XIAO nRF52840 | BT/BLE | USB HID |
+| `bt2usb` | Pico W/Pico 2 W/ESP32-S3/XIAO nRF52840/Makerdiary MDK | BT/BLE | USB HID |
 | `mouthpad` | April Brother nRF52840/Pico W/Pico 2 W | BLE (Augmental MouthPad) | USB HID (SInput) + NUS relay (CDC) |
 | `wifi2usb` | Pico W/Pico 2 W | WiFi (JOCP) | USB HID |
 | `snes2usb` | KB2040 | SNES | USB HID |
 | `n642usb` | KB2040 | N64 | USB HID |
 | `gc2usb` | KB2040/RP2040-Zero/Pico | GameCube | USB HID |
 | `lodgenet2usb` | Pico/Pico 2 | LodgeNet (N64/GC/SNES) | USB HID |
+| `24g2usb` | Pico/Pico W/Pico 2/Pico 2 W/RP2350-Zero | 8BitDo SF30 2.4G (nRF24L01+) | USB HID |
 | `n642dc` | KB2040 | N64 | Dreamcast |
 | `snes23do` | RP2040-Zero | SNES | 3DO |
 | `usb2uart` | KB2040 | USB | UART/ESP32 |
 | `controller_*` | Various | GPIO | USB HID |
-| `controller_btusb` | Pico W/Pico 2 W/ESP32-S3/nRF52840 | GPIO | BLE + USB HID |
-| `controller_btusb_rp2040_abb` | RP2040 ABB (Passthrough) | GPIO + USB Host | USB HID |
+| `universal` | Pico W/Pico 2 W/ESP32-S3/nRF52840 | GPIO | BLE + USB HID |
+| `universal_rp2040_abb` | RP2040 ABB (Passthrough) | GPIO + USB Host | USB HID |
 
 ## Architecture
 
@@ -198,7 +213,21 @@ nrf/                                # nRF Connect SDK build directory (nRF52840)
     ├── ws2812_nrf.c                # NeoPixel stub
     ├── btstack_config.h            # BLE-only BTstack config wrapper
     └── tusb_config_nrf.h           # nRF5x TinyUSB config
+hardware/                           # KiCad PCB designs (adapter carrier boards)
+├── generate.py                     # Emits each board from a net/component table
+├── doc_images.py                   # Assembly + schematic figures into docs/images/
+├── lib/joypad.pretty/              # Shared custom footprints (modules, sockets)
+└── <app>_<board>/                  # One directory per board variant
+    ├── Makefile                    # KiCad 9 via Docker: generate/drc/gerbers/zip
+    ├── <name>.kicad_pcb            # Generated -- edit generate.py, not this
+    └── fab/                        # Orderable gerber zip, BOM, 1:1 fit-check PDF
 ```
+
+Boards are generated, never hand-drawn: `generate.py` asserts the netlist against the app's
+wiring table before writing, so a board cannot silently disagree with the firmware's pin
+assignments. Regenerable output (loose gerbers, DRC report, SVGs, 3D renders) is gitignored;
+the gerber zip, BOM, placement file and fit-check print are committed so a board can be
+ordered without installing KiCad.
 
 ### Data Flow
 
@@ -347,7 +376,13 @@ Console protocols use RP2040 PIO for precise timing:
 4. Key functions:
    - `<protocol>_host_init()` - Initialize PIO/GPIO
    - `<protocol>_host_task()` - Poll controller, submit to router
-   - Use `router_submit_input()` with dev_addr 0xD0+ range
+   - Use `router_submit_input()` with a dev_addr in the 0xB0+ range. The
+     0xD0-0xFF space is already fully carved into 16-wide sub-ranges by
+     existing drivers (0xD0 GC/UART, 0xE0 N64/3DO/PSX/Jaguar, 0xF0
+     NES/SNES/LodgeNet/PCE/arcade/JVS), and 0xC0 (Wii) and 0xB0 (24G) are
+     also claimed — grep `_DEV_ADDR` and `0x[A-F]0` in
+     `src/native/host/*/*.h` and `*.c` for the current assignments before
+     picking a new one
 
 5. Remember to invert Y-axis if protocol uses non-HID convention
 
@@ -382,7 +417,7 @@ See `docs/ESP32.md` for full setup, architecture, and board details.
 
 ## nRF52840 Development
 
-The `bt2usb` app also runs on Seeed XIAO nRF52840 (xiao_ble), using BLE (no Classic BT) for controller input and USB for HID output. Uses nRF Connect SDK (Zephyr) with BTstack + TinyUSB (not Zephyr native stacks) to maximize shared code.
+The `bt2usb` app also runs on Seeed XIAO nRF52840 (xiao_ble) and the Makerdiary nRF52840 MDK USB Dongle (makerdiary_nrf52840), using BLE (no Classic BT) for controller input and USB for HID output. Uses nRF Connect SDK (Zephyr) with BTstack + TinyUSB (not Zephyr native stacks) to maximize shared code.
 
 ```bash
 # Prerequisites: nRF Connect SDK v3.1.0+ (installed via make init-nrf)

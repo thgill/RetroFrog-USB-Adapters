@@ -53,10 +53,10 @@
   #else
     #define CFG_TUH_RPI_PIO_USB       1  // Enable PIO USB host driver
   #endif
-#elif defined(CONFIG_NGC)
-  // GameCube: runtime host OR device on RHPORT0
-  // Play mode (GC 3.3V detected): USB host for controllers
-  // Config mode (no 3.3V): USB device with CDC for web configuration
+#elif defined(CONFIG_NGC) || defined(CONFIG_PCE)
+  // GameCube / PCEngine: runtime host OR device on RHPORT0 (native USB)
+  // Play mode (console detected): USB host for controllers
+  // Config mode (no console): USB device with CDC for web configuration
   #define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_HOST | OPT_MODE_DEVICE)
 #else
   // Host-only mode for existing console implementations
@@ -100,6 +100,19 @@
 
 // Size of buffer to hold descriptors and other data used for enumeration
 #define CFG_TUH_ENUMERATION_BUFSIZE 1280
+
+// PIO-USB (RP2040 software USB host) enumeration hardening. These override
+// upstream TinyUSB defaults from the app side — the library keeps stock
+// behavior for anyone who leaves them undefined. Needed for slow / marginal
+// full-speed devices such as the Intel Wireless Series 8086:C013 receiver:
+//  - Longer SET_ADDRESS recovery so the device answers the following
+//    device-descriptor read (upstream default is the 2 ms spec minimum).
+//  - Skip string-descriptor fetching during enumeration: strings are purely
+//    informational, but a failed string control-IN aborts the whole enum
+//    before any interface driver binds. Apps fetch strings lazily on demand
+//    (see tuh_descriptor_get_product_string_sync in hid.c).
+#define CFG_TUH_ENUM_SET_ADDRESS_RECOVERY_MS 100
+#define CFG_TUH_ENUM_SKIP_STRINGS            1
 
 #ifndef CFG_TUH_MEM_SECTION
 #define CFG_TUH_MEM_SECTION
@@ -163,7 +176,7 @@
 // USB DEVICE CONFIGURATION (CONFIG_USB or DISABLE_USB_HOST builds)
 //--------------------------------------------------------------------
 
-#if defined(CONFIG_USB) || defined(DISABLE_USB_HOST) || defined(CONFIG_NGC) || defined(CONFIG_BT2WIIEXT)
+#if defined(CONFIG_USB) || defined(DISABLE_USB_HOST) || defined(CONFIG_NGC) || defined(CONFIG_BT2WIIEXT) || defined(CONFIG_PCE)
   // Device configuration
   #define CFG_TUD_ENDPOINT0_SIZE    64
 
@@ -174,7 +187,7 @@
   #define CFG_TUD_MSC               0
   #define CFG_TUD_MIDI              0
   #define CFG_TUD_VENDOR            0
-  #define CFG_TUD_CDC_RX_BUFSIZE    256
+  #define CFG_TUD_CDC_RX_BUFSIZE    4096  // large: audio-command streaming (VOICE.SPEAK) must survive slow main-loop passes during BT audio
   #define CFG_TUD_CDC_TX_BUFSIZE    2048
   #define CFG_TUD_CDC_EP_BUFSIZE    64
 #else
@@ -218,7 +231,7 @@
   #define CFG_TUD_HID_EP_BUFSIZE    64
 
   // CDC buffer sizes (TX enlarged for high-rate MouthPad NUS->CDC telemetry relay)
-  #define CFG_TUD_CDC_RX_BUFSIZE    256
+  #define CFG_TUD_CDC_RX_BUFSIZE    4096  // large: audio-command streaming (VOICE.SPEAK) must survive slow main-loop passes during BT audio
   #define CFG_TUD_CDC_TX_BUFSIZE    4096
   #define CFG_TUD_CDC_EP_BUFSIZE    64
 #endif

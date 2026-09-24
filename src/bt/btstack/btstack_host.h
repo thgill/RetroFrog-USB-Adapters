@@ -51,6 +51,7 @@ void btstack_host_start_timed_scan(uint32_t timeout_ms);
 // Suppress/unsuppress automatic scan restart (e.g. when USB device connected).
 // Explicit start_timed_scan clears suppression.
 void btstack_host_suppress_scan(bool suppress);
+void btstack_host_ble_drop_all(uint32_t holdoff_ms);
 
 // Connect to a BLE device
 void btstack_host_connect_ble(bd_addr_t addr, bd_addr_type_t addr_type);
@@ -98,8 +99,18 @@ typedef struct {
 bool btstack_classic_get_connection(uint8_t conn_index, btstack_classic_conn_info_t* info);
 uint8_t btstack_classic_get_connection_count(void);
 
-// Get last-connected bonded device (returns false if none stored)
+// Get last-connected bonded device (returns false if none stored).
+// NOTE: this slot only ever holds a BLE device — it is written from Security
+// Manager events, which Classic BT does not generate. Use
+// btstack_host_list_classic_bonds() for the Classic side.
 bool btstack_host_get_last_connected(uint8_t bd_addr_out[6], char name_out[48]);
+
+// Enumerate persisted Classic BT link keys — the bonds a Classic controller
+// (DS4/DS5, Switch Pro, Wiimote) reconnects with. Writes up to max_count
+// addresses and returns how many were written. No name is stored alongside a
+// link key, so callers get the BD_ADDR only: enough to show the bond exists and
+// to pass to btstack_host_forget_device().
+int btstack_host_list_classic_bonds(uint8_t addrs_out[][6], int max_count);
 
 // Classic BT output (for bthid drivers)
 bool btstack_classic_send_set_report_type(uint8_t conn_index, uint8_t report_type,
@@ -116,18 +127,24 @@ bool btstack_wiimote_send_raw(uint8_t conn_index, const uint8_t* data, uint16_t 
 bool btstack_wiimote_send_control(uint8_t conn_index, const uint8_t* data, uint16_t len);
 
 // ============================================================================
-// MOUTHPAD NUS CLIENT (Augmental MouthPad relay)
+// NUS CLIENT (Nordic UART Service peers: Augmental MouthPad, JoypadOS faces)
 // ============================================================================
 
 // Register a callback for device->host NUS bytes (fires in BTstack context).
 void btstack_host_set_mouthpad_nus_rx_cb(void (*cb)(const uint8_t* data, uint16_t len));
 
-// Write host->device NUS bytes. Returns false if no MouthPad NUS is ready.
-// Must be called from BTstack/run-loop context (e.g. the bridge task).
+// Write host->device NUS bytes. Returns false if no NUS peer is ready.
+// Safe from the main loop (marshaled onto the BTstack run loop).
 bool btstack_host_mouthpad_nus_send(const uint8_t* data, uint16_t len);
 
-// True once NUS service discovery has completed for a connected MouthPad.
+// True once NUS service discovery has completed for a connected peer.
 bool btstack_host_mouthpad_nus_ready(void);
+
+// Generic aliases — the NUS client serves any recognized peer, not just the
+// MouthPad. New callers (e.g. the FACE.* relay to a JoypadOS face controller)
+// should use these names.
+bool btstack_host_nus_send(const uint8_t* data, uint16_t len);
+bool btstack_host_nus_ready(void);
 
 // Connected MouthPad device info, for the dongle-level relay responses
 // (device_info_response / ble_connection_status_response).

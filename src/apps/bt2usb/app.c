@@ -129,6 +129,17 @@ static void led_status_update(void)
 {
     uint32_t now = platform_time_ms();
 
+    // Actively scanning (button press / pairing window): FAST blink so the
+    // press visibly took — even while other devices stay connected.
+    if (btstack_host_is_scanning()) {
+        if (now - led_last_toggle >= 110) {
+            led_state = !led_state;
+            platform_led_set(led_state);
+            led_last_toggle = now;
+        }
+        return;
+    }
+
     if (btstack_classic_get_connection_count() > 0) {
         // Device connected - solid on
         if (!led_state) {
@@ -373,6 +384,8 @@ void app_init(void)
 #elif defined(BTSTACK_USE_NRF)
 #ifdef BOARD_FEATHER_NRF52840
     printf("[app:bt2usb] Adafruit Feather nRF52840 Express BLE -> USB HID\n");
+#elif defined(BOARD_MAKERDIARY_NRF52840)
+    printf("[app:bt2usb] Makerdiary nRF52840 MDK USB Dongle BLE -> USB HID\n");
 #else
     printf("[app:bt2usb] Seeed XIAO nRF52840 BLE -> USB HID\n");
 #endif
@@ -477,5 +490,7 @@ void app_task(void)
 
 #ifdef OLED_I2C_DISPLAY
     oled_update_display();
+    // Pump one pending page of the async display flush per iteration.
+    display_task();
 #endif
 }

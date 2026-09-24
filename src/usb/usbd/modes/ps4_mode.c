@@ -2,15 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Robert Dale Smith
 
+#include "platform/platform.h"
 #include "tusb.h"
 #include "../usbd_mode.h"
 #include "../usbd.h"
 #include "descriptors/ps4_descriptors.h"
 #include "core/buttons.h"
+#include <stddef.h>
 #include <string.h>
 
 #ifndef DISABLE_USB_HOST
 #include "usb/usbh/hid/devices/vendors/sony/sony_ds4.h"
+
+// ps4_report_buffer below is the wire report *including* the report ID at
+// index 0, so every field sits one byte later than in sony_ds4_report_t --
+// the same DS4 layout this firmware already parses on the host side. The two
+// were agreed by hand and nothing enforced it, which is how the accelerometer
+// rest value came to be written one byte past the axis it was meant for.
+// These pin the offsets this file hardcodes to the struct, so the next edit to
+// either one fails the build instead of shipping a silent byte shift.
+_Static_assert(offsetof(sony_ds4_report_t, gyro) + 1 == 13,
+               "DS4 gyro must start at report byte 13");
+_Static_assert(offsetof(sony_ds4_report_t, accel) + 1 == 19,
+               "DS4 accel must start at report byte 19");
+_Static_assert(offsetof(sony_ds4_report_t, headset) + 1 == 30,
+               "DS4 status/power byte must be report byte 30");
+_Static_assert(offsetof(sony_ds4_report_t, tpad_counter) + 1 == 34,
+               "DS4 touchpad packet counter must be report byte 34");
+_Static_assert(offsetof(sony_ds4_report_t, tpad_f1_pos) + 1 == 36,
+               "DS4 touchpad finger 1 position must start at report byte 36");
+#endif
+
+#ifdef ENABLE_PS4_LOCAL_AUTH
+#include "ps4_local_auth.h"
+#endif
+
+#ifdef PS4_AUTH_OVER_LINK
+#include "uart_peer/ps4_auth_link.h"   // dual-RP: DS4 auth is served from the peer MCU
 #endif
 
 // ============================================================================
@@ -22,6 +50,8 @@ static uint8_t ps4_report_buffer[64];
 static ps4_out_report_t ps4_output;
 static bool ps4_output_available = false;
 static uint8_t ps4_report_counter = 0;
+static uint16_t ps4_timestamp = 0;
+
 
 // ============================================================================
 // MODE INTERFACE IMPLEMENTATION
@@ -36,13 +66,31 @@ static void ps4_mode_init(void)
     ps4_report_buffer[2] = 0x80;  // LY center
     ps4_report_buffer[3] = 0x80;  // RX center
     ps4_report_buffer[4] = 0x80;  // RY center
-    ps4_report_buffer[5] = PS4_HAT_NOTHING;  // D-pad neutral (0x0F), no buttons
+    ps4_report_buffer[5] = PS4_HAT_NOTHING;  // D-pad neutral (0x08), no buttons
     // Bytes 6-9: buttons and triggers already 0
-    // Set touchpad fingers to unpressed
+    // Set accelerometer rest state (1G on Z-axis seen in Brook as 0x2060).
+    // Accel is three little-endian int16s at bytes 19-24, so Z is 23 (low) /
+    // 24 (high). This used to write 24/25, one byte high: the rest value never
+    // landed on Z, and byte 25 -- unknown_a[0], a reserved field that nothing
+    // else in this file ever writes -- kept 0x20 in every report that went out.
+    ps4_report_buffer[23] = 0x60;
+    ps4_report_buffer[24] = 0x20;
+    // Set power level (0x1b = full battery + charging, matches Brook at offset 30)
+    ps4_report_buffer[30] = 0x1b;
+    // Set touchpad state (33=active, 34=increment, 35-42=fingers)
+    ps4_report_buffer[33] = 0x00;  // 0 touches
+    ps4_report_buffer[34] = 0x00;  // increment
     ps4_report_buffer[35] = 0x80;  // touchpad p1 unpressed
+    ps4_report_buffer[36] = 0xC0;  // X LSB
+    ps4_report_buffer[37] = 0x73;  // X MSB / Y LSB
+    ps4_report_buffer[38] = 0x1D;  // Y MSB
     ps4_report_buffer[39] = 0x80;  // touchpad p2 unpressed
+    ps4_report_buffer[40] = 0xC0;
+    ps4_report_buffer[41] = 0x73;
+    ps4_report_buffer[42] = 0x1D;
     memset(&ps4_output, 0, sizeof(ps4_out_report_t));
     ps4_report_counter = 0;
+    ps4_timestamp = 0;
 }
 
 static bool ps4_mode_is_ready(void)
@@ -64,29 +112,39 @@ static bool ps4_mode_is_ready(void)
 //   Byte 7:    PS (bit 0) + Touchpad (bit 1) + Counter (bits 2-7)
 //   Byte 8:    Left trigger analog (0x00-0xFF)
 //   Byte 9:    Right trigger analog (0x00-0xFF)
-//   Bytes 10-63: Timestamp, sensor data, touchpad data, padding
+//   Bytes 10-11: Axis timing (timestamp)
+//   Bytes 12-63: Sensor data, touchpad data, padding
 static bool ps4_mode_send_report(uint8_t player_index,
                                   const input_event_t* event,
                                   const profile_output_t* profile_out,
                                   uint32_t buttons)
 {
     (void)player_index;
-    (void)event;
 
     // Byte 0: Report ID
     ps4_report_buffer[0] = 0x01;
 
-    // Bytes 1-4: Analog sticks (HID convention: 0=up, 255=down - no inversion needed)
-    ps4_report_buffer[1] = profile_out->left_x;          // LX
-    ps4_report_buffer[2] = profile_out->left_y;          // LY
-    ps4_report_buffer[3] = profile_out->right_x;         // RX
-    ps4_report_buffer[4] = profile_out->right_y;         // RY
+    // Bytes 1-4: Analog sticks (HID convention: 0=up, 255=down)
+    ps4_report_buffer[1] = profile_out->left_x;
+    ps4_report_buffer[2] = profile_out->left_y;
+    ps4_report_buffer[3] = profile_out->right_x;
+    ps4_report_buffer[4] = profile_out->right_y;
 
     // Byte 5: D-pad (bits 0-3) + face buttons (bits 4-7)
     uint8_t up = (buttons & JP_BUTTON_DU) ? 1 : 0;
     uint8_t down = (buttons & JP_BUTTON_DD) ? 1 : 0;
     uint8_t left = (buttons & JP_BUTTON_DL) ? 1 : 0;
     uint8_t right = (buttons & JP_BUTTON_DR) ? 1 : 0;
+
+    // Detect Touchpad Click (A2 or S2+R1 combo)
+    bool s2_r1_combo = (buttons & JP_BUTTON_S2) && (buttons & JP_BUTTON_R1);
+    bool tp_clicked = (buttons & JP_BUTTON_A2) || s2_r1_combo;
+
+    // Use D-pad Left/Right as modifiers for Touchpad Click
+    if (tp_clicked) {
+        if (left) left = 0;
+        if (right) right = 0;
+    }
 
     uint8_t dpad;
     if (up && right)        dpad = PS4_HAT_UP_RIGHT;
@@ -110,11 +168,26 @@ static bool ps4_mode_send_report(uint8_t player_index,
     // Byte 6: Shoulder buttons + other buttons
     uint8_t byte6 = 0;
     if (buttons & JP_BUTTON_L1) byte6 |= 0x01;  // L1
-    if (buttons & JP_BUTTON_R1) byte6 |= 0x02;  // R1
-    if (buttons & JP_BUTTON_L2) byte6 |= 0x04;  // L2 (digital)
-    if (buttons & JP_BUTTON_R2) byte6 |= 0x08;  // R2 (digital)
+    if (!(s2_r1_combo)) {
+        if (buttons & JP_BUTTON_R1) byte6 |= 0x02;  // R1
+    }
+    
+    // Hybrid Trigger Logic (High Compatibility):
+    // Digital bits are flipped at USBD_TRIGGER_DIGITAL_THRESHOLD to support
+    // SF6 strokes, while keeping analog values raw for FC26 replay
+    // sensitivity. This mode has had it right all along - the shared helper
+    // exists so the four modes that were missing it cannot drift to some
+    // other threshold. Same value, same behaviour. See usbd_mode.h.
+    uint8_t l2_val = profile_out->l2_analog;   // raw, for bytes 8-9 below
+    uint8_t r2_val = profile_out->r2_analog;
+
+    if (usbd_l2_digital(profile_out, buttons)) byte6 |= 0x04; // L2 Digital
+    if (usbd_r2_digital(profile_out, buttons)) byte6 |= 0x08; // R2 Digital
+
     if (buttons & JP_BUTTON_S1) byte6 |= 0x10;  // Share
-    if (buttons & JP_BUTTON_S2) byte6 |= 0x20;  // Options
+    if (!(s2_r1_combo)) {
+        if (buttons & JP_BUTTON_S2) byte6 |= 0x20;  // Options
+    }
     if (buttons & JP_BUTTON_L3) byte6 |= 0x40;  // L3
     if (buttons & JP_BUTTON_R3) byte6 |= 0x80;  // R3
     ps4_report_buffer[6] = byte6;
@@ -122,16 +195,104 @@ static bool ps4_mode_send_report(uint8_t player_index,
     // Byte 7: PS + Touchpad + Counter (6-bit)
     uint8_t byte7 = 0;
     if (buttons & JP_BUTTON_A1) byte7 |= 0x01;  // PS button
-    if (buttons & JP_BUTTON_A2) byte7 |= 0x02;  // Touchpad click
+    if (tp_clicked) byte7 |= 0x02;              // Touchpad click
     byte7 |= ((ps4_report_counter++ & 0x3F) << 2);       // Counter in bits 2-7
     ps4_report_buffer[7] = byte7;
 
-    // Bytes 8-9: Analog triggers
-    ps4_report_buffer[8] = profile_out->l2_analog;  // Left trigger
-    ps4_report_buffer[9] = profile_out->r2_analog;  // Right trigger
+    // Bytes 8-9: Analog triggers (L2, R2)
+    ps4_report_buffer[8] = l2_val;
+    ps4_report_buffer[9] = r2_val;
 
-    // Bytes 10-11: Timestamp (we can just increment)
-    // Bytes 12-63: Leave as initialized (sensor data, touchpad, padding)
+    // Bytes 10-11: Timestamp (milissegundos, como GP2040-CE)
+    ps4_timestamp = platform_time_ms(); 
+    ps4_report_buffer[10] = ps4_timestamp & 0xFF;
+    ps4_report_buffer[11] = (ps4_timestamp >> 8) & 0xFF;
+
+    // Maintenance of DS4 Metadata (Matches Brook XE2)
+    // Byte 30: Battery (0x1b = Full + Charging)
+    ps4_report_buffer[30] = 0x1b;
+
+    // Motion: gyro (bytes 13-18) + accel (bytes 19-24), int16 LE — the standard DS4
+    // USB layout (Linux hid-playstation / joypad-web's DS4 parser). The event carries
+    // raw int16 + full-scale ranges; DS4 is ±2000 dps gyro / ±4 g accel over full int16,
+    // so scale each axis by its declared range into that standard.
+    //   The core delivers motion already in the canonical SDL frame; the DS4
+    //   output frame is SDL (identity), so axes pass straight — no per-input
+    //   remap. (The SC2's Triton->SDL transform now lives in its input driver.)
+    if (event->has_motion) {
+        int32_t gr = event->gyro_range  ? event->gyro_range  : 2000;
+        int32_t ar = event->accel_range ? event->accel_range : 4000;
+        int32_t gyro[3]  = { event->gyro[0],  event->gyro[1],  event->gyro[2]  };
+        int32_t accel[3] = { event->accel[0], event->accel[1], event->accel[2] };
+        for (int i = 0; i < 3; i++) {
+            int32_t g = gyro[i]  * gr / 2000;
+            int32_t a = accel[i] * ar / 4000;
+            if (g > 32767) g = 32767; else if (g < -32768) g = -32768;
+            if (a > 32767) a = 32767; else if (a < -32768) a = -32768;
+            ps4_report_buffer[13 + i * 2] = (uint8_t)(g & 0xFF);
+            ps4_report_buffer[14 + i * 2] = (uint8_t)((g >> 8) & 0xFF);
+            ps4_report_buffer[19 + i * 2] = (uint8_t)(a & 0xFF);
+            ps4_report_buffer[20 + i * 2] = (uint8_t)((a >> 8) & 0xFF);
+        }
+    } else {
+        // No motion on this input: emit neutral (zero gyro, +1 g on Z) so a DS4 parser
+        // reads "level and still" rather than the mis-aligned static value it had before.
+        memset(&ps4_report_buffer[13], 0, 10);           // gyro XYZ + accel XY = 0
+        ps4_report_buffer[23] = (uint8_t)(8192 & 0xFF);  // accel Z ~+1 g (8192 LSB/g)
+        ps4_report_buffer[24] = (uint8_t)((8192 >> 8) & 0xFF);
+    }
+
+    // Touchpad (offset 33=packet count, 34=counter, 35-42=two 4-byte fingers).
+    // Each finger: [id|bit7=released][X lo][ (Y lo<<4)|X hi ][Y hi], 12-bit X 0..1919
+    // / Y 0..942. Must be present for the Options button to work in some titles.
+    ps4_report_buffer[34]++;  // touch packet counter
+
+    if (event->has_touch) {
+        // Real touchpad: emit both fingers from the normalized event, scaled from the
+        // device-agnostic 0..65535 canonical back to DS4 native (1919x942). Each new
+        // finger-down gets a fresh id so the host tracks touches correctly.
+        static uint8_t tp_id[2] = {0, 0};
+        static bool tp_prev[2] = {false, false};
+        uint8_t active = 0;
+        for (int f = 0; f < 2; f++) {
+            uint8_t* fb = &ps4_report_buffer[35 + f * 4];
+            bool on = event->touch[f].active;
+            if (on) {
+                if (!tp_prev[f]) tp_id[f] = (uint8_t)((tp_id[f] + 1) & 0x7F);
+                uint16_t tx = touch_norm_to_range(event->touch[f].x, 1919);
+                uint16_t ty = touch_norm_to_range(event->touch[f].y, 942);
+                fb[0] = tp_id[f] & 0x7F;  // touching (bit7=0) + id
+                fb[1] = (uint8_t)(tx & 0xFF);
+                fb[2] = (uint8_t)(((ty & 0x0F) << 4) | ((tx >> 8) & 0x0F));
+                fb[3] = (uint8_t)((ty >> 4) & 0xFF);
+                active++;
+            } else {
+                fb[0] = 0x80; fb[1] = 0; fb[2] = 0; fb[3] = 0;  // released
+            }
+            tp_prev[f] = on;
+        }
+        ps4_report_buffer[33] = active ? 0x01 : 0x00;
+    } else {
+        // No real touchpad on this input: simulate a finger from the touchpad-click +
+        // D-pad region so non-touch pads can still trigger touchpad-gated actions.
+        ps4_report_buffer[33] = 0x00;
+        uint16_t tp_x = 960, tp_y = 471;  // center
+        if (tp_clicked) {
+            if (buttons & JP_BUTTON_DL)      tp_x = 480;   // left region
+            else if (buttons & JP_BUTTON_DR) tp_x = 1440;  // right region
+            ps4_report_buffer[33] = 0x01;
+            ps4_report_buffer[35] = 0x00;   // finger 1 pressed
+        } else {
+            ps4_report_buffer[35] = 0x80;   // finger 1 released
+        }
+        ps4_report_buffer[39] = 0x80;       // finger 2 released
+        ps4_report_buffer[36] = (uint8_t)(tp_x & 0xFF);
+        ps4_report_buffer[37] = (uint8_t)(((tp_y & 0x0F) << 4) | ((tp_x >> 8) & 0x0F));
+        ps4_report_buffer[38] = (uint8_t)((tp_y >> 4) & 0xFF);
+        ps4_report_buffer[40] = ps4_report_buffer[36];
+        ps4_report_buffer[41] = ps4_report_buffer[37];
+        ps4_report_buffer[42] = ps4_report_buffer[38];
+    }
 
     // Send with report_id=0x01, letting TinyUSB prepend it
     // Skip byte 0 of buffer (our report_id) and send 63 bytes of data
@@ -140,17 +301,28 @@ static bool ps4_mode_send_report(uint8_t player_index,
 
 static void ps4_mode_handle_output(uint8_t report_id, const uint8_t* data, uint16_t len)
 {
-    // PS4 output report (rumble/LED) - Report ID 5
-    if (report_id == PS4_REPORT_ID_OUTPUT && len >= sizeof(ps4_out_report_t)) {
-        memcpy(&ps4_output, data, sizeof(ps4_out_report_t));
-        ps4_output_available = true;
+    if (!data || len == 0) return;
+
+    // The PS4 sends the rumble/LED output report (ID 5) on the interrupt OUT
+    // endpoint, where TinyUSB delivers report_id=0 with the real ID in data[0]
+    // (see hid_device.c: tud_hid_set_report_cb(itf, 0, ...OUTPUT, epout, ...)).
+    // Normalize that to the control SET_REPORT form (report_id set, body only),
+    // mirroring the SInput handler — without this, the ID-5 guard below never
+    // matched and rumble was silently dropped.
+    if (report_id == 0 && data[0] == PS4_REPORT_ID_OUTPUT) {
+        report_id = data[0];
+        data += 1;
+        len  -= 1;
     }
 
-    // PS4 auth feature reports (set)
-#ifndef DISABLE_USB_HOST
-    // Note: Feature reports are typically handled via tud_hid_set_report_cb
-    // This handle_output is for interrupt OUT endpoint reports
-#endif
+    // PS4 output report (rumble/LED) - Report ID 5. `data` is now the report
+    // body (no ID byte); copy it into the struct after its report_id field so
+    // motor_right/motor_left and the lightbar land at the right offsets.
+    if (report_id == PS4_REPORT_ID_OUTPUT && len >= sizeof(ps4_out_report_t) - 1) {
+        ps4_output.report_id = PS4_REPORT_ID_OUTPUT;
+        memcpy((uint8_t*)&ps4_output + 1, data, sizeof(ps4_out_report_t) - 1);
+        ps4_output_available = true;
+    }
 }
 
 static uint8_t ps4_mode_get_rumble(void)
@@ -192,11 +364,17 @@ static uint16_t ps4_mode_get_report(uint8_t report_id, hid_report_type_t report_
             memcpy(buffer, ps4_feature_03, len);
             return len;
 
-        case PS4_REPORT_ID_AUTH_RESPONSE:   // 0xF1 - Signature from DS4
-            // Get next signature page from DS4 passthrough (auto-incrementing)
+        case PS4_REPORT_ID_AUTH_RESPONSE:   // 0xF1 - Signature
             len = 64;
             if (reqlen < len) len = reqlen;
-#ifndef DISABLE_USB_HOST
+#ifdef ENABLE_PS4_LOCAL_AUTH
+            if (ps4_local_auth_is_available()) {
+                return ps4_local_auth_get_next_page(buffer, len);
+            }
+#endif
+#ifdef PS4_AUTH_OVER_LINK
+            return ps4_auth_link_get_signature(buffer, len);  // served from peer DS4
+#elif !defined(DISABLE_USB_HOST)
             if (ds4_auth_is_available()) {
                 return ds4_auth_get_next_signature(buffer, len);
             }
@@ -205,17 +383,23 @@ static uint16_t ps4_mode_get_report(uint8_t report_id, hid_report_type_t report_
             return len;
 
         case PS4_REPORT_ID_AUTH_STATUS:     // 0xF2 - Signing status
-            // Get auth status from DS4 passthrough
             len = 16;
             if (reqlen < len) len = reqlen;
-#ifndef DISABLE_USB_HOST
+#ifdef ENABLE_PS4_LOCAL_AUTH
+            if (ps4_local_auth_is_available()) {
+                return ps4_local_auth_get_status_report(buffer, len);
+            }
+#endif
+#ifdef PS4_AUTH_OVER_LINK
+            return ps4_auth_link_get_status(buffer, len);
+#elif !defined(DISABLE_USB_HOST)
             if (ds4_auth_is_available()) {
                 return ds4_auth_get_status(buffer, len);
             }
 #endif
-            // Return "signing" status if no DS4 available
+            // No auth available — return "still signing" indefinitely
             memset(buffer, 0, len);
-            buffer[1] = 0x10;  // 16 = signing/not ready
+            buffer[1] = 0x10;
             return len;
 
         case PS4_REPORT_ID_AUTH_PAYLOAD:    // 0xF0 - handled in set_report
@@ -225,9 +409,14 @@ static uint16_t ps4_mode_get_report(uint8_t report_id, hid_report_type_t report_
             return len;
 
         case PS4_REPORT_ID_AUTH_RESET:      // 0xF3 - Return page size info
-#ifndef DISABLE_USB_HOST
-            // Reset auth state when console requests 0xF3 (per hid-remapper)
-            // This ensures signature_ready is false for new auth cycle
+#ifdef ENABLE_PS4_LOCAL_AUTH
+            if (ps4_local_auth_is_available()) {
+                ps4_local_auth_reset();
+            }
+#endif
+#ifdef PS4_AUTH_OVER_LINK
+            ps4_auth_link_device_reset();
+#elif !defined(DISABLE_USB_HOST)
             ds4_auth_reset();
 #endif
             len = sizeof(ps4_feature_f3);
@@ -244,26 +433,48 @@ static uint16_t ps4_mode_get_report(uint8_t report_id, hid_report_type_t report_
 // This is called from usbd.c's tud_hid_set_report_cb for feature reports
 void ps4_mode_set_feature_report(uint8_t report_id, const uint8_t* buffer, uint16_t bufsize)
 {
-#ifndef DISABLE_USB_HOST
     switch (report_id) {
         case PS4_REPORT_ID_AUTH_PAYLOAD:    // 0xF0 - Nonce from console
-            // Forward nonce to connected DS4
+#ifdef ENABLE_PS4_LOCAL_AUTH
+            if (ps4_local_auth_is_available()) {
+                ps4_local_auth_send_nonce_page(buffer, bufsize);
+                break;
+            }
+#endif
+#ifdef PS4_AUTH_OVER_LINK
+            ps4_auth_link_device_send_nonce(buffer, bufsize);  // relay to peer MCU's DS4
+#elif !defined(DISABLE_USB_HOST)
             if (ds4_auth_is_available()) {
                 ds4_auth_send_nonce(buffer, bufsize);
             }
+#endif
             break;
 
         case PS4_REPORT_ID_AUTH_RESET:      // 0xF3 - Reset auth
+#ifdef ENABLE_PS4_LOCAL_AUTH
+            if (ps4_local_auth_is_available()) {
+                ps4_local_auth_reset();
+            }
+#endif
+#ifdef PS4_AUTH_OVER_LINK
+            ps4_auth_link_device_reset();
+#elif !defined(DISABLE_USB_HOST)
             ds4_auth_reset();
+#endif
             break;
 
         default:
+            (void)buffer;
+            (void)bufsize;
             break;
     }
-#else
-    (void)report_id;
-    (void)buffer;
-    (void)bufsize;
+}
+
+// Called from the main loop (via usbd_mode_t.task) when PS4 mode is active
+static void ps4_mode_task(void)
+{
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    ps4_local_auth_task();
 #endif
 }
 
@@ -303,5 +514,5 @@ const usbd_mode_t ps4_mode = {
     .get_feedback = ps4_mode_get_feedback,
     .get_report = ps4_mode_get_report,
     .get_class_driver = NULL,
-    .task = NULL,
+    .task = ps4_mode_task,
 };

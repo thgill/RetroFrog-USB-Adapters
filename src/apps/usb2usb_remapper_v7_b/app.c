@@ -13,9 +13,15 @@
 #include "core/services/players/feedback.h"
 #include "usb/usbh/usbh.h"
 #include "uart_peer/uart_peer.h"
+#include "uart_peer/p5general_link.h"
+#include "uart_peer/ps4_auth_link.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
 #include <stdio.h>
+#ifdef ENABLE_BTSTACK
+#include "bt/transport/bt_transport.h"   // bt_is_ready / bt_get_connection_count
+#include "bt/btstack/btstack_host.h"     // scan control
+#endif
 
 // ============================================================================
 // INPUT INTERFACES — native USB host
@@ -55,12 +61,23 @@ static void link_output_task(void)
     // Pump the link (drain TX ring, decode incoming feedback frames).
     uart_peer_task();
 
+    // P5General (PS5) auth bridge: this host side owns the auth dongle; forward
+    // its signed reports + F1/F2 auth data + dongle-ready to the device side (A),
+    // and the incoming A->B frames were just applied by uart_peer_task().
+    p5general_link_host_task();
+
+    // PS4/DS4 auth bridge: once the genuine DS4 here has signed the console's
+    // nonce, stream its 19 signature pages back to A to serve to the PS4.
+    ps4_auth_link_host_task();
+
     // Apply any feedback (rumble/LED) the device side sent back.
     uart_peer_status_t st;
     if (uart_peer_get_status(&st)) {
         uint8_t p = st.player_number ? (uint8_t)(st.player_number - 1) : 0;
         feedback_set_rumble(p, st.rumble_left, st.rumble_right);
-        feedback_set_led_rgb(p, st.led_color[0], st.led_color[1], st.led_color[2]);
+        if (st.led_player > 0) feedback_set_led_player(p, st.led_player);
+        if (st.led_color[0] || st.led_color[1] || st.led_color[2])
+            feedback_set_led_rgb(p, st.led_color[0], st.led_color[1], st.led_color[2]);
     }
 }
 
@@ -140,19 +157,37 @@ void app_task(void)
 {
     // Output interface task pumps the link.
 
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+#ifdef ENABLE_BTSTACK
+    // B has no user button (the BOOT button is on A), so a USB BT dongle would
+    // never enter pairing on its own. Auto-start a 30s scan whenever the dongle
+    // is powered and nothing is connected; re-arm every few seconds while idle.
+    // Once a controller connects, connection_count > 0 suppresses further scans;
+    // if it drops, scanning resumes so reconnection/re-pairing just works.
+    static uint32_t last_scan_ms = 0;
+    if (bt_is_ready() && (now - last_scan_ms >= 3000)) {
+        last_scan_ms = now;
+        if (!btstack_host_is_scanning() && bt_get_connection_count() == 0) {
+            printf("[usb2usb_remapper_v7_b] BT idle -> starting 30s scan\n");
+            btstack_host_start_timed_scan(30000);
+        }
+    }
+#endif
+
     // Diagnostic heartbeat: report B liveness + USB host device count to A
     // every ~200ms so the device side can surface it over CDC during bring-up.
     static uint32_t last_dbg_ms = 0;
-    uint32_t now = to_ms_since_boot(get_absolute_time());
     if (now - last_dbg_ms >= 200) {
         last_dbg_ms = now;
 
         uart_peer_debug_t dbg = {
-            .magic = 0xDB,
+            .magic = 0xE3,   // 0xDD => this era (bt_status field + DS4-auth relay diag)
             .dev_count = 0,
             .last_vid = 0,
             .last_pid = 0,
             .uptime_ms = now,
+            .bt_status = 0,
         };
         for (uint8_t daddr = 1; daddr <= CFG_TUH_DEVICE_MAX; daddr++) {
             if (tuh_mounted(daddr)) {
@@ -163,6 +198,13 @@ void app_task(void)
                 dbg.last_pid = pid;
             }
         }
+#ifdef ENABLE_BTSTACK
+        dbg.bt_status = 0x08  // has_btstack marker (bit3): B was built with BTstack
+                      | (bt_is_ready()               ? 0x01 : 0)
+                      | (btstack_host_is_powered_on() ? 0x02 : 0)
+                      | (btstack_host_is_scanning()   ? 0x04 : 0)
+                      | ((bt_get_connection_count() & 0x0F) << 4);
+#endif
         uart_peer_send_debug(&dbg);
     }
 }

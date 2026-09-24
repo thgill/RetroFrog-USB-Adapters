@@ -14,6 +14,7 @@
 #include "devices/vendors/8bitdo/8bitdo_bta.h"
 #include "devices/vendors/8bitdo/8bitdo_m30.h"
 #include "devices/vendors/8bitdo/8bitdo_pce.h"
+#include "devices/vendors/8bitdo/8bitdo_sn30.h"
 #include "devices/vendors/nintendo/gamecube_adapter.h"
 #include "devices/vendors/nintendo/switch_pro.h"
 #include "devices/vendors/nintendo/switch2_pro.h"
@@ -26,9 +27,9 @@
 #include "devices/vendors/microsoft/ms_sidewinder_dualstrike.h"
 #include "devices/vendors/microsoft/ms_sidewinder_commander.h"
 #include "devices/vendors/valve/steam_controller_2.h"
+#include "devices/vendors/valve/steam_controller.h"
 #include "devices/vendors/elo/elo_vagabond.h"
 #include "devices/generic/sinput_host.h"
-#include "devices/vendors/misc/retrogames_thegamepad.h"
 // Include other devices here
 
 DeviceInterface* device_interfaces[CONTROLLER_TYPE_COUNT] = {0};
@@ -41,6 +42,7 @@ void register_devices() {
     device_interfaces[CONTROLLER_8BITDO_BTA] = &bitdo_bta_interface;
     device_interfaces[CONTROLLER_8BITDO_M30] = &bitdo_m30_interface;
     device_interfaces[CONTROLLER_8BITDO_PCE] = &bitdo_pce_interface;
+    device_interfaces[CONTROLLER_8BITDO_SN30] = &bitdo_sn30_interface;
     device_interfaces[CONTROLLER_HORIPAD] = &hori_horipad_interface;
     device_interfaces[CONTROLLER_POKKEN] = &hori_pokken_interface;
     device_interfaces[CONTROLLER_WINGMAN] = &logitech_wingman_interface;
@@ -54,7 +56,7 @@ void register_devices() {
     device_interfaces[CONTROLLER_SIDEWINDER_COMMANDER] = &ms_sidewinder_commander_interface;
     device_interfaces[CONTROLLER_SINPUT] = &sinput_host_interface;
     device_interfaces[CONTROLLER_STEAM_2] = &steam_controller_2_interface;
-    device_interfaces[CONTROLLER_THEGAMEPAD] = &retrogames_thegamepad_interface;
+    device_interfaces[CONTROLLER_STEAM_1] = &steam_controller_interface;
     device_interfaces[CONTROLLER_ELO_VAGABOND] = &elo_vagabond_interface;
     device_interfaces[CONTROLLER_DINPUT] = &hid_gamepad_interface;
     device_interfaces[CONTROLLER_KEYBOARD] = &hid_keyboard_interface;

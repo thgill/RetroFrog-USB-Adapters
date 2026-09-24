@@ -91,6 +91,14 @@ static void dbl_tap_timer_cb(void *arg)
 //   3. If user resets again within 500ms → step 1 triggers
 void platform_check_double_tap(void)
 {
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    // Self-heal: clear the force-download-boot bit that our CDC BOOTSEL path
+    // sets. It lives in the RTC domain and survives resets, so once the app is
+    // running we clear it — otherwise a stray reset would drop back into ROM
+    // download mode instead of the app.
+    REG_CLR_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#endif
+
     nvs_handle_t nvs;
     if (nvs_open("platform", NVS_READWRITE, &nvs) != ESP_OK) return;
 
@@ -122,15 +130,97 @@ void platform_check_double_tap(void)
 
 void platform_reboot_bootloader(void)
 {
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    // This board ships the stock bootloader (no TinyUF2). Force the ROM into
+    // download mode so esptool can flash with no button combo. Two parts:
+    // FORCE_DOWNLOAD_BOOT makes the ROM stay in download, and the USB
+    // persist flags (PERSIST_ENA|BOOT_DFU) keep the OTG connection alive
+    // across the reset — without them the ROM's download mode never
+    // enumerates on the host (invisible-device state).
+    printf("[platform] Rebooting into ROM download mode...\n");
+    // ROOT CAUSE of the enumeration lottery: TinyUSB routes the shared USB
+    // PHY to the OTG controller via RTC_CNTL_USB_CONF (RTC domain — survives
+    // soft resets). The ROM downloader uses USB-Serial-JTAG, which is left
+    // with no PHY, so it never enumerates. Hand the PHY back (both bits to
+    // their hardware default) before restarting; power-on/button resets did
+    // this implicitly, which is why THOSE always enumerated.
+    CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG,
+                        RTC_CNTL_SW_HW_USB_PHY_SEL | RTC_CNTL_SW_USB_PHY_SEL);
+    // Persist flags stay untouched (0). BOOT_DFU/PERSIST_ENA pins the OTG
+    // PHY and makes it worse — learned the hard way.
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
+    while (1) { vTaskDelay(portMAX_DELAY); }
+#else
     // TinyUF2's custom bootloader checks RTC_CNTL_STORE6_REG for hint 0x11F2
     // on SW reset, and boots factory (TinyUF2) instead of the app.
     printf("[platform] Rebooting into TinyUF2...\n");
     REG_WRITE(RTC_CNTL_STORE6_REG, 0x80000000 | (0x11F2 << 16) | 0x11F2);
     esp_restart();
     while (1) { vTaskDelay(portMAX_DELAY); }
+#endif
+}
+
+void platform_reboot_ota(void)
+{
+    // No BLE OTA path here — fall back to the TinyUF2 bootloader.
+    platform_reboot_bootloader();
 }
 
 void platform_clear_usb_persist(void)
 {
     chip_usb_set_persist_flags(0);
+}
+
+bool platform_usb_powered(void)
+{
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    // The charger PMU measures VBUS directly — real 5V reads ~4.9-5.2V,
+    // battery-only reads the 2.6V register floor (or 0 before pmu_init).
+    // This is what lets BLE advertising resume on USB unplug: tud_mounted()
+    // reads stale-true after a detach, but VBUS doesn't lie.
+    extern int pmu_vbus_mv(void);
+    return pmu_vbus_mv() > 3600;
+#else
+    return true;   // no VBUS sensing on this board — assume powered
+#endif
+}
+
+bool platform_deep_sleep(uint8_t wake_gpio, bool wake_active_high)
+{
+    (void)wake_gpio; (void)wake_active_high;
+    return false;
+}
+
+uint32_t platform_last_reset_reason(void)
+{
+    // esp_reset_reason: 1=poweron 3=sw 4=panic 5=int_wdt 6=task_wdt
+    // 7=other_wdt 8=deepsleep 9=brownout 10=sdio
+    return (uint32_t)esp_reset_reason();
+}
+
+int platform_battery_millivolts(void)
+{
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    extern int pmu_batt_mv(void);
+    int mv = pmu_batt_mv();
+    return mv > 0 ? mv : -1;
+#else
+    return -1;
+#endif
+}
+
+int platform_battery_charging(void)
+{
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    // PMU charge status: 0=not charging, 1=pre, 2=fast, 3=done.
+    extern int pmu_charge_state(void);
+    switch (pmu_charge_state()) {
+        case 1:
+        case 2:  return 1;
+        default: return 0;
+    }
+#else
+    return -1;
+#endif
 }

@@ -3,6 +3,7 @@ import { DeviceInfoCard } from './components/device-info.js';
 import { UsbOutputCard } from './components/usb-output.js';
 import { BtOutputCard } from './components/bt-output.js';
 import { NativeOutputCard } from './components/native-output.js';
+import { WifiOutputCard } from './components/wifi-output.js';
 import { PadConfigCard } from './components/pad-config.js';
 import { ProfilesCard, BUTTON_NAMES, BUTTON_LABELS, REMAPPABLE_COUNT } from './components/profiles.js';
 import { InputTestCard } from './components/input-test.js';
@@ -11,7 +12,9 @@ import { FeedbackCard } from './components/leds.js';
 import { RouterCard } from './components/router.js';
 import { HotkeysCard } from './components/hotkeys.js';
 import { BtHostCard } from './components/bt-host.js';
+import { Ps4AuthCard } from './components/ps4-auth.js';
 import { AdvancedCard } from './components/advanced.js';
+import { FaceCard } from './components/face.js';
 
 /**
  * Joypad Config — App Shell
@@ -27,7 +30,9 @@ const PAGE_GROUPS = {
     'usb':           'output',
     'bluetooth':     'output',
     'native-output': 'output',
+    'wifi-output':   'output',
     'leds':          'output',
+    'face':          'output',
     'feedback':      'output',
     'audio':         'output',
     'gpio':          'input',
@@ -67,8 +72,10 @@ class JoypadConfigApp {
         const log = (msg, type) => this.log(msg, type);
         this.deviceInfo = new DeviceInfoCard(document.getElementById('headerInfo'), document.getElementById('cardDeviceInfo'), this.protocol, log);
         this.usbOutput = new UsbOutputCard(document.getElementById('cardUsbOutput'), this.protocol, log);
+        this.ps4Auth = new Ps4AuthCard(document.getElementById('cardPs4Auth'), this.protocol, log);
         this.btOutput = new BtOutputCard(document.getElementById('cardBtOutput'), this.protocol, log);
         this.nativeOutput = new NativeOutputCard(document.getElementById('cardNativeOutput'), this.protocol, log);
+        this.wifiOutput = new WifiOutputCard(document.getElementById('cardWifiOutput'), this.protocol, log);
         this.padConfig = new PadConfigCard(document.getElementById('cardPadConfig'), this.protocol, log);
         this.feedback = new FeedbackCard(document.getElementById('cardFeedback'), this.protocol, log);
         this.router = new RouterCard(document.getElementById('cardRouter'), this.protocol, log);
@@ -78,12 +85,15 @@ class JoypadConfigApp {
         this.profiles = new ProfilesCard(document.getElementById('cardProfiles'), this.protocol, log);
         this.inputTest = new InputTestCard(document.getElementById('cardInputTest'), this.protocol, log);
         this.advanced = new AdvancedCard(document.getElementById('cardAdvanced'), this.protocol, log);
+        this.face = new FaceCard(document.getElementById('cardFace'), this.protocol, log);
 
         // Render component HTML
         this.deviceInfo.render();
         this.usbOutput.render();
+        this.ps4Auth.render();
         this.btOutput.render();
         this.nativeOutput.render();
+        this.wifiOutput.render();
         this.padConfig.render();
         this.feedback.render();
         this.router.render();
@@ -93,6 +103,7 @@ class JoypadConfigApp {
         this.profiles.render();
         this.inputTest.render();
         this.advanced.render();
+        this.face.render();
 
         // Connection events
         this.connectBtn.addEventListener('click', () => this.toggleConnection());
@@ -254,6 +265,12 @@ class JoypadConfigApp {
             gpioLink.style.display = this.hasPadConfig ? '' : 'none';
         }
 
+        // Show Face nav link only when the device answers FACE.*
+        const faceLink = document.getElementById('navFace');
+        if (faceLink) {
+            faceLink.style.display = this.face.isAvailable() ? '' : 'none';
+        }
+
         // Hide USB Host nav link if device doesn't support it
         const usbHostLink = document.getElementById('navUsbHost');
         if (usbHostLink) {
@@ -281,6 +298,17 @@ class JoypadConfigApp {
         if (nativeLink) {
             nativeLink.style.display = this.nativeOutput.isAvailable() ? '' : 'none';
         }
+        const wifiLink = document.getElementById('navWifiOutput');
+        if (wifiLink) {
+            wifiLink.style.display = this.wifiOutput.isAvailable() ? '' : 'none';
+        }
+
+        // Hide the PS4 Auth section (on the USB Device page) when the firmware
+        // doesn't answer PS4AUTH.STATUS (ESP/nRF, older builds).
+        const ps4Card = document.getElementById('cardPs4Auth');
+        if (ps4Card) {
+            ps4Card.style.display = this.ps4Auth.isAvailable() ? '' : 'none';
+        }
 
         // Hide Bluetooth host nav link if device has no BT host features
         const btHostLink = document.getElementById('navBtHost');
@@ -296,6 +324,9 @@ class JoypadConfigApp {
             this.navigateTo('usb');
         }
         if (this.currentPage === 'bluetooth' && !this.btOutput.isAvailable()) {
+            this.navigateTo('usb');
+        }
+        if (this.currentPage === 'wifi-output' && !this.wifiOutput.isAvailable()) {
             this.navigateTo('usb');
         }
         if (this.currentPage === 'native-output' && !this.nativeOutput.isAvailable()) {
@@ -448,14 +479,17 @@ class JoypadConfigApp {
     async loadAll() {
         await this.deviceInfo.load();
         await this.usbOutput.load();
+        await this.ps4Auth.load();
         await this.btOutput.load();
         await this.nativeOutput.load();
+        await this.wifiOutput.load();
         await this.padConfig.load();
         await this.feedback.load();
         await this.router.load();
         await this.hotkeys.load();
         await this.usbHost.load();
         await this.btHost.load();
+        await this.face.load();
         // Check if pad config card is visible to determine nav visibility
         const padCard = document.querySelector('#cardPadConfig .card, #cardPadConfig #padConfigCard');
         this.hasPadConfig = padCard && padCard.style.display !== 'none';

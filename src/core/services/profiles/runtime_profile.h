@@ -75,12 +75,17 @@ void runtime_profile_clear(void);
 void runtime_autofire_clear(void);
 
 // Drive the state machine with the latest raw button state.
-// Call from the output device task loop alongside profile_check_switch_combo().
+// Call from the output device task loop. (Profile-switch combos are handled by the router's
+// combo table now — profile_check_switch_combo() no longer exists.)
 // l2/r2: raw analog values (0-255) for threshold and digital normalization.
 void runtime_profile_check_combo(uint32_t input_buttons, uint8_t l2, uint8_t r2);
 
 // Returns true while the user is actively mapping entries.
 bool runtime_profile_is_active(void);
+
+// True only while a live REMAP is in progress (freeze output). Rapid-fire set
+// mode stays live and is not included here.
+bool runtime_profile_is_mapping(void);
 
 // Returns the built runtime profile if one exists, NULL otherwise.
 // Output tap callbacks use this to check for a runtime override:

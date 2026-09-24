@@ -22,11 +22,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 // Optional pad config support (controller apps)
 #ifdef CONFIG_PAD_INPUT
 #include "pad/pad_input.h"
 #include "pad/pad_config_flash.h"
+#include "platform/platform_gpio.h"
 #endif
 
 // Optional BT support
@@ -39,6 +41,33 @@
 #if REQUIRE_BLE_OUTPUT
 #include "bt/ble_output/ble_output.h"
 #endif
+
+// PS4 auth flash storage (always compiled with USB device sources)
+#include "core/services/storage/ps4_auth_flash.h"
+// PS4 local RSA signing (requires pico_mbedtls — enabled by ENABLE_PS4_LOCAL_AUTH)
+#ifdef ENABLE_PS4_LOCAL_AUTH
+#include "usb/usbd/modes/ps4_local_auth.h"
+#endif
+
+// Bluetooth host capability model (mirrors the usb_host present/configurable
+// split used by CAPS.GET). BT is "present" when the stack is compiled in.
+// It is "configurable" only for apps that actually honour the runtime
+// bt_input_enabled flag (universal, bt2wiiext, which #define
+// BT_INPUT_CONFIGURABLE). Dedicated BT bridges (bt2usb, bt2gc, bt2nuon, …)
+// always run BT and never read the flag, so their "Enable Bluetooth Host"
+// toggle is always-on / read-only and must report bt_input:true even on a
+// fresh flash — otherwise web config shows the toggle off while BT is running.
+#if defined(ENABLE_BTSTACK) || defined(CONFIG_BT_HOST)
+#  define BT_HOST_PRESENT 1
+#else
+#  define BT_HOST_PRESENT 0
+#endif
+#if defined(BT_INPUT_CONFIGURABLE) && BT_INPUT_CONFIGURABLE
+#  define BT_HOST_CONFIGURABLE 1
+#else
+#  define BT_HOST_CONFIGURABLE 0
+#endif
+#define BT_INPUT_ALWAYS_ON (BT_HOST_PRESENT && !BT_HOST_CONFIGURABLE)
 
 // ============================================================================
 // STATE
@@ -54,6 +83,7 @@ static char response_buf[CDC_MAX_PAYLOAD];
 #define PENDING_NONE    0
 #define PENDING_REBOOT  1
 #define PENDING_BOOTSEL 2
+#define PENDING_OTA     3
 static volatile uint8_t pending_reboot = PENDING_NONE;
 static uint32_t pending_reboot_time = 0;
 
@@ -61,20 +91,23 @@ static uint32_t pending_reboot_time = 0;
 // LOG CAPTURE (ring buffer + stdio driver)
 // ============================================================================
 
-#define LOG_BUF_SIZE 1024
+#define LOG_BUF_SIZE 4096
 static char log_ring[LOG_BUF_SIZE];
 static volatile uint16_t log_head = 0;  // Write position
-static volatile uint16_t log_tail = 0;  // Read position
+static volatile uint16_t log_tail = 0;  // Read position (streaming)
+
+// LOG.DUMP state: separate read position so dump doesn't interfere with streaming
+static volatile uint16_t dump_pos = 0;
+static volatile uint16_t dump_end = 0;
+static volatile bool     dump_active = false;
 
 static void log_stdio_out_chars(const char *buf, int len)
 {
-    // Skip ring buffer writes when not streaming — zero overhead on normal path
-    if (!stream_ctx || !stream_ctx->log_streaming) return;
-
+    // Always capture — ring buffer is active from startup regardless of streaming state
     for (int i = 0; i < len; i++) {
         uint16_t next = (log_head + 1) % LOG_BUF_SIZE;
         if (next == log_tail) {
-            // Buffer full - drop oldest byte
+            // Buffer full - advance tail (drop oldest byte) to make room
             log_tail = (log_tail + 1) % LOG_BUF_SIZE;
         }
         log_ring[log_head] = buf[i];
@@ -231,6 +264,11 @@ static void send_json(const char* json)
 // COMMAND HANDLERS
 // ============================================================================
 
+// Diagnostic getter from sinput_mode.c (fwd-declared to avoid pulling the
+// SInput/tusb headers into this TU).
+extern uint32_t sinput_get_feature_count(void);
+extern void sinput_get_debug_info(char* buf, int len);
+
 static void cmd_info(const char* json)
 {
     (void)json;
@@ -238,11 +276,48 @@ static void cmd_info(const char* json)
     char serial[17];
     platform_get_serial(serial, sizeof(serial));
 
+    int16_t imu_a[3] = {0}, imu_g[3] = {0};
+    char imu_str[80];
+    if (router_onboard_motion_get(imu_a, imu_g)) {
+        snprintf(imu_str, sizeof(imu_str), "[%d,%d,%d,%d,%d,%d]",
+                 imu_a[0], imu_a[1], imu_a[2], imu_g[0], imu_g[1], imu_g[2]);
+    } else {
+        snprintf(imu_str, sizeof(imu_str), "false");  // no IMU reporting
+    }
+
+    // Dual-RP: the SWD relay writes a B-flash result to WATCHDOG_SCRATCH0/1
+    // (0x40058000 + 0x0c/0x10) before its warm reboot. status 1=bad header
+    // (likely XIP read failure), 2=SWD flash failed, 3=success; SCRATCH1 = image
+    // length (or the bad magic for status 1). Only valid until the next COLD
+    // boot clears it, so read INFO after flashing but BEFORE power-cycling.
+    char bflash_str[80] = "null";
+#ifdef HOST_OVER_LINK
+    {
+        uint32_t s0 = *(volatile uint32_t*)(0x40058000u + 0x0cu);  // result
+        uint32_t s1 = *(volatile uint32_t*)(0x40058000u + 0x10u);  // length
+        uint32_t s2 = *(volatile uint32_t*)(0x40058000u + 0x14u);  // progress
+        int has_res  = (s0 & 0xFFFFFF00u) == 0xB0000000u;
+        int has_prog = (s2 & 0xF0000000u) == 0xC0000000u;
+        if (has_res || has_prog)
+            snprintf(bflash_str, sizeof(bflash_str),
+                     "{\"st\":%lu,\"v\":%lu,\"prog\":\"%08lx\"}",
+                     (unsigned long)(has_res ? (s0 & 0xFFu) : 0),
+                     (unsigned long)s1,
+                     (unsigned long)(has_prog ? s2 : 0));
+    }
+#endif
+
     snprintf(response_buf, sizeof(response_buf),
              "{\"app\":\"%s\",\"version\":\"%s\",\"board\":\"%s\",\"serial\":\"%s\",\"commit\":\"%s\",\"build\":\"%s\""
+             ",\"reset\":\"0x%lx\",\"up\":%lu,\"battery_mv\":%d,\"chg\":%d,\"imu\":%s,\"flashw\":%lu,\"featw\":%lu"
+             ",\"bflash\":%s"
              ",\"features\":{\"onboard_led\":%s}}"
              ,
              APP_NAME, JOYPAD_VERSION, BOARD_NAME, serial, GIT_COMMIT, BUILD_TIME,
+             (unsigned long)platform_last_reset_reason(),
+             (unsigned long)platform_time_ms(), platform_battery_millivolts(),
+             platform_battery_charging(), imu_str, (unsigned long)flash_get_write_count(),
+             (unsigned long)sinput_get_feature_count(), bflash_str,
 #ifdef BTSTACK_USE_CYW43
              "true"
 #elif defined(BOARD_LED_PIN)
@@ -252,6 +327,17 @@ static void cmd_info(const char* json)
 #endif
              );
     printf("[CDC] INFO response: %s\n", response_buf);
+    send_json(response_buf);
+}
+
+// SINPUT.DBG — report the values driving the SInput identity SDL reads (CDC-visible
+// diagnostic; printf goes to UART on this board so we can't see it otherwise).
+static void cmd_sinput_dbg(const char* json)
+{
+    (void)json;
+    char dbg[256];
+    sinput_get_debug_info(dbg, sizeof(dbg));
+    snprintf(response_buf, sizeof(response_buf), "{\"sinput_dbg\":\"%s\"}", dbg);
     send_json(response_buf);
 }
 
@@ -318,6 +404,282 @@ static void cmd_reboot(const char* json)
     pending_reboot_time = platform_time_ms();
 }
 
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+// --- FACE.* — remote control of the AMOLED companion face (eyes_esp32.c).
+// FACE.SPEAK {"v":0-100}  speech envelope -> mouth (lip-sync)
+// FACE.STATE {"state":"idle"|"think"|"speak"}
+// FACE.EMO   {"emo":"happy"|...}
+// FACE.LOOK  {"x":-100..100,"y":-100..100}
+extern void face_remote_speak(int level);
+extern void face_remote_state(const char* state);
+extern bool face_remote_emotion(const char* name);
+extern void face_remote_look(int x_pct, int y_pct);
+
+static void cmd_face_speak(const char* json)
+{
+    int v = 0;
+    json_get_int(json, "v", &v);
+    face_remote_speak(v);
+    send_ok();
+}
+
+static void cmd_face_state(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "state", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    face_remote_state(buf);
+    send_ok();
+}
+
+static void cmd_face_emo(const char* json)
+{
+    int len = 0;
+    const char* e = json_get_string(json, "emo", &len);
+    char buf[16] = {0};
+    if (e && len > 0 && len < (int)sizeof(buf)) memcpy(buf, e, (size_t)len);
+    if (face_remote_emotion(buf)) send_ok();
+    else send_error("unknown emotion");
+}
+
+extern bool face_remote_style(const char* name);
+
+static void cmd_face_style(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "style", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    if (face_remote_style(buf)) send_ok();
+    else send_error("unknown style");
+}
+
+static void cmd_face_look(const char* json)
+{
+    int x = 0, y = 0;
+    json_get_int(json, "x", &x);
+    json_get_int(json, "y", &y);
+    face_remote_look(x, y);
+    send_ok();
+}
+extern bool pmu_init(void);
+extern int pmu_batt_mv(void);
+extern int pmu_vbus_mv(void);
+extern int pmu_charge_state(void);
+extern int pmu_charge_ma(void);
+extern void amoled_brightness(uint8_t level);
+
+static void cmd_batt_get(const char* json)
+{
+    (void)json;
+    int mv = pmu_batt_mv();
+    int pct = (mv - 3300) * 100 / (4200 - 3300);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    static const char* st[] = {"none", "pre", "charging", "done"};
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"mv\":%d,\"pct\":%d,\"vbus_mv\":%d,"
+             "\"charge\":\"%s\",\"charge_ma\":%d}",
+             mv, pct, pmu_vbus_mv(), st[pmu_charge_state() & 3], pmu_charge_ma());
+    cdc_protocol_send_response(active_ctx, response_buf);
+}
+
+extern void amoled_set_shift(int panel_px);
+
+static void cmd_face_offset(const char* json)
+{
+    int x = 0;
+    json_get_int(json, "x", &x);
+    if (x < -100) x = -100;
+    if (x > 100) x = 100;
+    amoled_set_shift(x);
+    send_ok();
+}
+
+static void cmd_face_bright(const char* json)
+{
+    int v = 208;
+    json_get_int(json, "v", &v);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    amoled_brightness((uint8_t)v);
+    send_ok();
+}
+
+// FACE.TRACK: pre-shipped lip-sync envelope, played on the face's own clock
+// (zero radio traffic during speech). Chunked to fit the NUS relay:
+//   {"cmd":"FACE.TRACK","seq":0,"d":"<b64 bytes>"}   seq 0 resets the buffer
+//   {"cmd":"FACE.TRACK.GO","step":64,"delay":580}    starts playback
+extern void face_track_reset(void);
+extern bool face_track_append(const uint8_t* d, int n);
+extern void face_track_go(int step_ms, int delay_ms);
+
+static int face_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static void cmd_face_track(const char* json)
+{
+    int seq = 0;
+    json_get_int(json, "seq", &seq);
+    if (seq == 0) face_track_reset();
+    int dlen = 0;
+    const char* d = json_get_string(json, "d", &dlen);
+    if (!d || dlen <= 0) {
+        send_error("missing d");
+        return;
+    }
+    uint8_t out[144];
+    int o = 0, acc = 0, bits = 0;
+    for (int i = 0; i < dlen && o < (int)sizeof(out); i++) {
+        int v = face_b64_val(d[i]);
+        if (v < 0) continue;                    // skip '=' / whitespace
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (uint8_t)(acc >> bits); }
+    }
+    if (!face_track_append(out, o)) {
+        send_error("track overflow");
+        return;
+    }
+    send_ok();
+}
+
+static void cmd_face_track_go(const char* json)
+{
+    int step = 64, delay = 0;
+    json_get_int(json, "step", &step);
+    json_get_int(json, "delay", &delay);
+    face_track_go(step, delay);
+    send_ok();
+}
+
+// FACE.COLOR {"r","g","b"} tints the current style's palette (accent derived);
+// {"reset":1} returns to the style's stock colors.
+extern void eyes_set_color(uint8_t r, uint8_t g, uint8_t b);
+extern void eyes_reset_color(void);
+static void cmd_face_color(const char* json)
+{
+    int reset = 0;
+    json_get_int(json, "reset", &reset);
+    if (reset) {
+        eyes_reset_color();
+        send_ok();
+        return;
+    }
+    int r = 0, g = 0, b = 0;
+    bool any = json_get_int(json, "r", &r);
+    any |= json_get_int(json, "g", &g);
+    any |= json_get_int(json, "b", &b);
+    if (!any) {
+        send_error("missing r/g/b");
+        return;
+    }
+    eyes_set_color((uint8_t)(r & 255), (uint8_t)(g & 255), (uint8_t)(b & 255));
+    send_ok();
+}
+#elif defined(ENABLE_BTSTACK)
+// --- FACE.* on a dongle build: relay to an untethered JoypadOS face.
+// No local display here — a paired JoypadOS BLE controller (e.g. the AMOLED
+// eyes board) carries the face, and its NUS RX feeds the same framed CDC
+// parser as USB. So forwarding = re-frame the command JSON verbatim and write
+// it to the peer's NUS. The host (e.g. Dusty's bridge) talks to one CDC port
+// and the face follows, wired or wireless.
+static void cmd_face_forward(const char* json)
+{
+    static uint8_t fwd_seq;
+    uint16_t len = (uint16_t)strlen(json);
+    uint8_t pkt[5 + 200 + 2];
+    if (len > 200) {
+        send_error("face cmd too long");
+        return;
+    }
+    pkt[0] = CDC_SYNC_BYTE;
+    pkt[1] = len & 0xFF;
+    pkt[2] = (len >> 8) & 0xFF;
+    pkt[3] = CDC_MSG_CMD;
+    pkt[4] = fwd_seq;
+    memcpy(&pkt[5], json, len);
+    uint16_t crc = cdc_crc16(&pkt[3], 2 + len);   // type + seq + payload
+    pkt[5 + len] = crc & 0xFF;
+    pkt[6 + len] = (crc >> 8) & 0xFF;
+    fwd_seq++;
+    if (btstack_host_nus_send(pkt, (uint16_t)(5 + len + 2))) send_ok();
+    else send_error("no face connected");
+}
+
+// NUS.* — forward non-FACE commands to the paired face board. The face's NUS
+// feeds the same framed command parser, so the dongle can reboot it, drop it
+// into the ROM bootloader for a reflash, or change its USB mode even when the
+// face has no usable USB of its own (e.g. a broken CDC descriptor — the exact
+// situation these were added to dig out of).
+static void cmd_nus_reboot(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"REBOOT\"}");
+}
+
+static void cmd_nus_bootsel(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"BOOTSEL\"}");
+}
+
+static void cmd_nus_mode(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+    char inner[48];
+    snprintf(inner, sizeof(inner), "{\"cmd\":\"MODE.SET\",\"mode\":%d}", mode);
+    cmd_face_forward(inner);
+}
+#endif // BOARD_LILYGO_TDISPLAY_S3_AMOLED
+
+// COREDUMP.SUM is available only when esp-idf's coredump component is enabled
+// (CONFIG_ESP_COREDUMP_ENABLE) — espcoredump/CMakeLists.txt puts its public header
+// on the include path only then. Boards without coredump (devkit/feather) omit the
+// command; the lilygo face board enables it in its sdkconfig.
+#if defined(PLATFORM_ESP32) && defined(__has_include)
+#  if __has_include("esp_core_dump.h")
+#    define JOYPAD_HAS_ESP_COREDUMP 1
+#  endif
+#endif
+
+#ifdef JOYPAD_HAS_ESP_COREDUMP
+// COREDUMP.SUM — panic PC + backtrace from the flash coredump (esp-idf).
+// addr2line the addresses against the matching .elf on the host.
+#include "esp_core_dump.h"
+static void cmd_coredump_sum(const char* json)
+{
+    (void)json;
+    esp_core_dump_summary_t sum;
+    if (esp_core_dump_get_summary(&sum) != ESP_OK) {
+        send_error("no coredump");
+        return;
+    }
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"task\":\"%s\",\"pc\":\"0x%08lx\",\"bt\":[",
+                       sum.exc_task, (unsigned long)sum.exc_pc);
+    for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s\"0x%08lx\"", i ? "," : "",
+                        (unsigned long)sum.exc_bt_info.bt[i]);
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos,
+             "],\"corrupt\":%s}", sum.exc_bt_info.corrupted ? "true" : "false");
+    send_json(response_buf);
+}
+#endif
+
 static void cmd_bootsel(const char* json)
 {
     (void)json;
@@ -325,6 +687,83 @@ static void cmd_bootsel(const char* json)
     // Defer reboot to cdc_commands_task() to avoid nested tud_task() calls
     pending_reboot = PENDING_BOOTSEL;
     pending_reboot_time = platform_time_ms();
+}
+
+#ifdef APP_CAN_FLASH_B
+#include "flash_b_app.h"
+#include <string.h>
+// FLASH.B — SWD-flash the host MCU (B) from A's running app, using the image
+// combine_uf2.py staged in A's flash. Blocks ~10-20s (USB drops during the
+// flash, then returns). The last progress line is echoed back so the outcome /
+// failure point is visible over CDC even though logs can't stream mid-block.
+static char flashb_last[96];
+static void flashb_log(const char* m) {
+    strncpy(flashb_last, m, sizeof(flashb_last) - 1);
+    flashb_last[sizeof(flashb_last) - 1] = 0;
+    printf("[FLASH.B] %s\n", m);
+}
+static void cmd_flash_b(const char* json)
+{
+    (void)json;
+    flashb_last[0] = 0;
+    int rc = flash_b_app(flashb_log);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":%s,\"rc\":%d,\"last\":\"%s\"}",
+             rc == 0 ? "true" : "false", rc, flashb_last);
+    send_json(response_buf);
+}
+#endif
+
+// OTA — reboot into over-the-air (BLE) DFU. Works over the BLE NUS too (the NUS
+// tunnels this command protocol), so a USB-less nRF52 board can be updated
+// wirelessly: send OTA, then push the DFU .zip with nRF Connect.
+static void cmd_ota(const char* json)
+{
+    (void)json;
+    send_ok();
+    pending_reboot = PENDING_OTA;
+    pending_reboot_time = platform_time_ms();
+}
+
+// IMU.MAP — get/set the onboard-IMU axis remap (mounting orientation).
+// Optional x/y/z, each a signed source axis: ±1=X ±2=Y ±3=Z (negative inverts).
+// Omitted axes keep their current value. Always replies with the resulting map,
+// e.g. {"cmd":"IMU.MAP","x":-1,"y":-2,"z":3} → {"x":-1,"y":-2,"z":3}.
+static void cmd_imu_map(const char* json)
+{
+    int gx = 0, gy = 0, gz = 0;
+    bool hx = json_get_int(json, "x", &gx);
+    bool hy = json_get_int(json, "y", &gy);
+    bool hz = json_get_int(json, "z", &gz);
+    if (hx || hy || hz) {
+        router_set_motion_remap(hx ? gx : 0, hy ? gy : 0, hz ? gz : 0);
+    }
+    int m[3];
+    router_get_motion_remap(m);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"x\":%d,\"y\":%d,\"z\":%d}", m[0], m[1], m[2]);
+    send_json(response_buf);
+}
+
+// Tilt steering: roll the controller → right stick X (while D-pad is in LEFT-
+// stick mode). Tune live over CDC/NUS — no reflash.
+// {"cmd":"TILT.STEER","on":1,"range":45,"dead":3,"sign":-1} — all fields optional.
+// Weak no-op so apps that don't compile pad/pad_input.c (e.g. bt2usb) still
+// link; the real implementation overrides it wherever pad_input.c is built.
+__attribute__((weak)) void pad_set_tilt_steer(int on, int range_deg,
+                                              int dead_deg, int sign)
+{
+    (void)on; (void)range_deg; (void)dead_deg; (void)sign;
+}
+static void cmd_tilt_steer(const char* json)
+{
+    int on = -1, range = -1, dead = -1, sign = 0;
+    json_get_int(json, "on", &on);
+    json_get_int(json, "range", &range);
+    json_get_int(json, "dead", &dead);
+    json_get_int(json, "sign", &sign);
+    pad_set_tilt_steer(on, range, dead, sign);
+    send_ok();
 }
 
 static void cmd_mode_get(const char* json)
@@ -374,7 +813,9 @@ static void cmd_mode_set(const char* json)
     platform_sleep_ms(50);
     tud_task();
 #endif
-    usbd_set_mode((usb_output_mode_t)mode);
+    if (!usbd_set_mode((usb_output_mode_t)mode)) {
+        send_error("mode switch rejected");
+    }
 }
 
 static void cmd_mode_list(const char* json)
@@ -398,8 +839,10 @@ static void cmd_mode_list(const char* json)
         if (i == USB_OUTPUT_MODE_GBA_LINK) continue;
 #endif
 
-#ifdef CONFIG_NGC
-        // GameCube config mode: only expose CDC mode
+#if defined(CONFIG_NGC) || defined(CONFIG_PCE)
+        // GameCube / PCEngine config mode: the USB device exists only for the web
+        // config, so expose CDC only — the console-output modes (XInput, PS4, …)
+        // are meaningless for these adapters.
         if (i != USB_OUTPUT_MODE_CDC) continue;
 #endif
 
@@ -417,6 +860,28 @@ static void cmd_mode_list(const char* json)
 // ============================================================================
 
 #if REQUIRE_BLE_OUTPUT
+
+// BLE.PAIR — bench tool: send an SM Security Request on the current BLE
+// peripheral link so the connected central initiates pairing. Lets a script
+// exercise the pairing path without a GUI (e.g. macOS pairs just-works
+// silently). Safe threading: over NUS this runs in the BTstack thread.
+static void cmd_ble_pair(const char* json)
+{
+    (void)json;
+    extern void ble_output_request_pairing(void);
+    ble_output_request_pairing();
+    send_ok();
+}
+
+// BT.TRACE — dump the live diagnostic mark ring (nRF: noinit ring in main.c;
+// weak no-op elsewhere). Read-only bench tool.
+__attribute__((weak)) void bt_diag_dump(void) { }
+static void cmd_bt_trace(const char* json)
+{
+    (void)json;
+    bt_diag_dump();
+    send_ok();
+}
 
 static void cmd_ble_mode_get(const char* json)
 {
@@ -436,7 +901,10 @@ static void cmd_ble_mode_set(const char* json)
         return;
     }
 
-    if (mode < 0 || mode >= BLE_MODE_COUNT) {
+    // Reject unknown modes and modes not compiled into this build (e.g. Switch-BT
+    // on a BLE-only radio) — the same gate the list uses, so a stale client can't
+    // select something this firmware can't run.
+    if (!ble_output_mode_available((ble_output_mode_t)mode)) {
         send_error("invalid mode");
         return;
     }
@@ -472,12 +940,61 @@ static void cmd_ble_mode_list(const char* json)
 
     bool first = true;
     for (int i = 0; i < BLE_MODE_COUNT && pos < (int)sizeof(response_buf) - 50; i++) {
+        // Hide modes this build can't run (e.g. Switch-BT on a BLE-only radio) so
+        // the web config never offers a mode with no implementation behind it.
+        if (!ble_output_mode_available((ble_output_mode_t)i)) continue;
         if (!first) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
         first = false;
         pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
                         "{\"id\":%d,\"name\":\"%s\"}", i, ble_output_get_mode_name(i));
     }
     snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+// WIRELESS.POLICY.GET/SET — which output wins when USB and BLE could both be
+// live: 0=both (default), 1=USB dominant, 2=BLE dominant. Applies live (the
+// dominance timer and USB tap read it each pass), no reboot.
+static const char* wireless_policy_name(uint8_t p)
+{
+    switch (p) {
+        case WIRELESS_POLICY_USB: return "usb";
+        case WIRELESS_POLICY_BLE: return "ble";
+        default:                  return "both";
+    }
+}
+
+static void cmd_wireless_policy_get(const char* json)
+{
+    (void)json;
+    flash_t* settings = flash_get_settings();
+    uint8_t policy = settings ? settings->wireless_policy : WIRELESS_POLICY_BOTH;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"policy\":%d,\"name\":\"%s\"}", policy, wireless_policy_name(policy));
+    send_json(response_buf);
+}
+
+static void cmd_wireless_policy_set(const char* json)
+{
+    int policy;
+    if (!json_get_int(json, "policy", &policy)) {
+        send_error("missing policy");
+        return;
+    }
+    if (policy < 0 || policy > WIRELESS_POLICY_MAX) {
+        send_error("invalid policy");
+        return;
+    }
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        send_error("no settings");
+        return;
+    }
+    settings->wireless_policy = (uint8_t)policy;
+    flash_save(settings);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"policy\":%d,\"name\":\"%s\"}",
+             policy, wireless_policy_name((uint8_t)policy));
     send_json(response_buf);
 }
 
@@ -599,12 +1116,14 @@ static void cmd_profile_list(const char* json)
 
     // Add built-in profiles (or virtual Default)
     if (builtin_count > 0) {
-        for (int i = 0; i < builtin_count && pos < (int)sizeof(response_buf) - 80; i++) {
+        uint8_t disabled_mask = flash_get_builtin_disabled_mask();
+        for (int i = 0; i < builtin_count && pos < (int)sizeof(response_buf) - 90; i++) {
             const char* name = profile_get_name(get_profile_target(), i);
             if (idx > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
             pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                            "{\"index\":%d,\"name\":\"%s\",\"builtin\":true,\"editable\":false}",
-                            idx, name ? name : "Default");
+                            "{\"index\":%d,\"name\":\"%s\",\"builtin\":true,\"editable\":false,\"disabled\":%s}",
+                            idx, name ? name : "Default",
+                            ((disabled_mask >> i) & 1u) ? "true" : "false");
             idx++;
         }
     } else {
@@ -691,12 +1210,16 @@ static void cmd_profile_get(const char* json)
             mpos += snprintf(map_str + mpos, sizeof(map_str) - mpos, "%d", p->button_map[i]);
         }
 
+        uint32_t turbo_mask = (uint32_t)p->turbo_mask[0] | ((uint32_t)p->turbo_mask[1] << 8) |
+                              ((uint32_t)p->turbo_mask[2] << 16) | ((uint32_t)p->turbo_mask[3] << 24);
         snprintf(response_buf, sizeof(response_buf),
                  "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\",\"builtin\":false,\"editable\":true,"
                  "\"button_map\":[%s],"
-                 "\"left_stick_sens\":%d,\"right_stick_sens\":%d,\"flags\":%d,\"socd_mode\":%d}",
+                 "\"left_stick_sens\":%d,\"right_stick_sens\":%d,\"flags\":%d,\"socd_mode\":%d,"
+                 "\"autofire_rate\":%d,\"turbo_mask\":%lu,\"output_mode\":%d}",
                  index, p->name, map_str,
-                 p->left_stick_sens, p->right_stick_sens, p->flags, p->socd_mode);
+                 p->left_stick_sens, p->right_stick_sens, p->flags, p->socd_mode,
+                 p->autofire_rate, (unsigned long)turbo_mask, p->output_mode);
     }
     send_json(response_buf);
 }
@@ -765,6 +1288,9 @@ static void cmd_input_stream(const char* json)
         stream_ctx = active_ctx;
         // Reset throttle so the first event per device re-sends the name
         stream_throttle_reset();
+        // Surface the Virtual Pad row right away instead of having it pop
+        // into existence on the first Input Test click.
+        router_announce_virtual_pad();
     } else if (stream_ctx == active_ctx) {
         stream_ctx = NULL;
     }
@@ -899,6 +1425,33 @@ static void cmd_profile_save(const char* json)
         p->socd_mode = (uint8_t)(socd > 3 ? 0 : (socd < 0 ? 0 : socd));
     } else if (is_new) {
         p->socd_mode = 0;  // Default to passthrough
+    }
+
+    // Turbo / auto-fire (per-profile rate + physical-button bitmask)
+    int rate;
+    if (json_get_int(json, "autofire_rate", &rate)) {
+        p->autofire_rate = (uint8_t)(rate < 0 ? 0 : (rate >= AUTOFIRE_RATE_COUNT ? 0 : rate));
+    } else if (is_new) {
+        p->autofire_rate = 0;  // off
+    }
+    int tmask;
+    if (json_get_int(json, "turbo_mask", &tmask)) {
+        uint32_t m = (uint32_t)tmask;
+        p->turbo_mask[0] = m & 0xFF;         p->turbo_mask[1] = (m >> 8) & 0xFF;
+        p->turbo_mask[2] = (m >> 16) & 0xFF; p->turbo_mask[3] = (m >> 24) & 0xFF;
+    } else if (is_new) {
+        p->turbo_mask[0] = p->turbo_mask[1] = p->turbo_mask[2] = p->turbo_mask[3] = 0;
+    }
+
+    // Generic device/output mode (app-interpreted; clamped to the app's count).
+    int omode;
+    if (json_get_int(json, "output_mode", &omode)) {
+        uint8_t mode_count = 0;
+        profile_get_output_modes(NULL, &mode_count);
+        if (mode_count == 0 || omode < 0 || omode >= mode_count) omode = 0;
+        p->output_mode = (uint8_t)omode;
+    } else if (is_new) {
+        p->output_mode = 0;
     }
 
     // Save to flash (runtime settings are already updated)
@@ -1045,6 +1598,16 @@ static void cmd_profile_clone(const char* json)
                 if ((uint32_t)out_bit + 1u > BUTTON_MAP_MAX_TARGET) continue;
 
                 new_profile->button_map[in_bit] = (uint8_t)(out_bit + 1);
+
+                // Preserve built-in auto-fire: flag the input button for turbo and
+                // carry its rate over to the profile's single rate. (Multiple
+                // auto-fire entries collapse to the last one's rate — built-ins
+                // use one rate for all, so this is exact in practice.)
+                if (entry->autofire_period_ms) {
+                    custom_profile_turbo_set(new_profile, in_bit, true);
+                    new_profile->autofire_rate =
+                        profile_autofire_index_from_ms(entry->autofire_period_ms);
+                }
             }
 
             // Stick sensitivities: built-in float (1.0 = 100%) → custom int 0-200
@@ -1059,6 +1622,7 @@ static void cmd_profile_clone(const char* json)
             new_profile->socd_mode    = (uint8_t)src->socd_mode;
             new_profile->l2_threshold = src->l2_threshold;
             new_profile->r2_threshold = src->r2_threshold;
+            new_profile->output_mode  = src->output_mode;  // preserve device mode
         }
     } else {
         // Custom → custom: byte-for-byte copy of the supported fields
@@ -1072,6 +1636,9 @@ static void cmd_profile_clone(const char* json)
             new_profile->socd_mode        = src->socd_mode;
             new_profile->l2_threshold     = src->l2_threshold;
             new_profile->r2_threshold     = src->r2_threshold;
+            new_profile->autofire_rate    = src->autofire_rate;
+            memcpy(new_profile->turbo_mask, src->turbo_mask, sizeof(new_profile->turbo_mask));
+            new_profile->output_mode      = src->output_mode;
         }
     }
 
@@ -1081,6 +1648,55 @@ static void cmd_profile_clone(const char* json)
     int new_unified_idx = custom_to_unified_index(new_custom_idx);
     snprintf(response_buf, sizeof(response_buf),
              "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\"}", new_unified_idx, new_profile->name);
+    send_json(response_buf);
+}
+
+// PROFILE.DISABLE - Hide/show a built-in profile in the SELECT+Up/Down cycle.
+// Body: { "index": <unified built-in index>, "disabled": <bool> }
+// Disabled built-ins are still selectable directly (PROFILE.SET / web config) but
+// are skipped by the profile hotkey. Custom profiles cannot be disabled.
+static void cmd_profile_disable(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        send_error("missing index");
+        return;
+    }
+    if (index < 0 || index >= 8 || !is_builtin_profile(index)) {
+        send_error("only built-in profiles can be disabled");
+        return;
+    }
+    bool disabled = true;
+    json_get_bool(json, "disabled", &disabled);
+
+    uint8_t mask = flash_get_builtin_disabled_mask();
+    if (disabled) mask |= (uint8_t)(1u << index);
+    else          mask &= (uint8_t)~(1u << index);
+    flash_set_builtin_disabled_mask(mask);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"index\":%d,\"disabled\":%s}", index, disabled ? "true" : "false");
+    send_json(response_buf);
+}
+
+// PROFILE.MODES - Report the app's generic device/output modes, so the web
+// config can offer a "Device Mode" selector per profile. Empty when the app has
+// no selectable modes. Response: { ok, type, modes:[...] }
+static void cmd_profile_modes(const char* json)
+{
+    (void)json;
+    const char* const* names = NULL;
+    uint8_t count = 0;
+    const char* type = profile_get_output_modes(&names, &count);
+
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"ok\":true,\"type\":%s%s%s,\"modes\":[",
+                       type ? "\"" : "null", type ? type : "", type ? "\"" : "");
+    for (uint8_t i = 0; i < count && names && pos < (int)sizeof(response_buf) - 40; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s\"%s\"", i ? "," : "", names[i] ? names[i] : "");
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
     send_json(response_buf);
 }
 
@@ -1253,12 +1869,17 @@ static void cmd_overlay_clear(const char* json)
 // Body: {
 //   "buttons": <uint32 JP_BUTTON_* mask>,        required
 //   "slot":    0..7,                             optional, default 0
-//   "analog":  [LX,LY,RX,RY,L2,R2,RZ],           optional, defaults to neutral
+//   "analog":  [LX,LY,RX,RY,L2,R2,RZ],           optional, 0-255 each
 // }
 //
 // Stateful: each INPUT.INJECT call replaces the synthetic slot's full
 // state (matches how real controllers report). For a tap, the host sends
 // {buttons:N} then {buttons:0} after a few ms.
+//
+// Omitting "analog" leaves whatever was last injected in place, so a host
+// sending only buttons never disturbs the sticks. Send an explicit neutral
+// array ([128,128,128,128,0,0,128]) to centre them, or "analog":false to stop
+// injecting analog at all and hand the axes back to the real controller.
 static void cmd_input_inject(const char* json)
 {
     int buttons_val;
@@ -1270,17 +1891,116 @@ static void cmd_input_inject(const char* json)
     json_get_int(json, "slot", &slot);
     if (slot < 0 || slot > 7) slot = 0;
 
-    (void)slot;  // reserved; today we OR a single global mask into events
+    (void)slot;  // reserved; today we merge a single global state into events
 
-    // Cache the synthetic button state in the router. Each real input event
-    // (PSX poll, USB poll, BT notification) gets `buttons |= s_inject_buttons`
-    // applied at the top of router_submit_input — works regardless of the
-    // app's routing mode (SIMPLE, MERGE, BROADCAST). Pass buttons=0 to release.
+    // Cache the synthetic state in the router. Each real input event (PSX poll,
+    // USB poll, BT notification) gets the buttons OR'd and the analog merged at
+    // the top of router_submit_input — works regardless of the app's routing
+    // mode (SIMPLE, MERGE, BROADCAST). Pass buttons=0 to release. With no
+    // controller attached, router_inject_task carries it instead.
     router_set_inject_buttons((uint32_t)buttons_val);
 
+    bool analog_clear = false;
+    if (json_get_bool(json, "analog", &analog_clear) && !analog_clear) {
+        // "analog":false gives the axes back to the real controller.
+        router_set_inject_analog(NULL);
+    } else {
+        uint8_t analog[ANALOG_COUNT];
+        int count = json_get_int_array(json, "analog", analog, ANALOG_COUNT);
+        if (count > 0) {
+            // A short array is padded with resting values rather than rejected,
+            // so a host that only cares about the sticks can send four.
+            for (int i = count; i < ANALOG_COUNT; i++) {
+                analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+            }
+            router_set_inject_analog(analog);
+        }
+    }
+
+    uint8_t current[ANALOG_COUNT];
+    bool has_analog = router_get_inject_analog(current);
     snprintf(response_buf, sizeof(response_buf),
-             "{\"ok\":true,\"buttons\":%u}",
-             (unsigned)buttons_val);
+             "{\"ok\":true,\"buttons\":%u,\"analog\":%s}",
+             (unsigned)buttons_val, has_analog ? "true" : "false");
+    send_json(response_buf);
+}
+
+// MOUSE.INJECT - Submit a synthetic mouse event into the router from the
+// config host. One-shot, like a real mouse report: deltas apply once, button
+// state is whatever this call carries (send buttons:0 to release a click).
+//   { "dx": <int16>, "dy": <int16>, "wheel": <int8>, "buttons": <bitmask> }
+// buttons: bit0=left, bit1=right, bit2=middle (HID order), mapped onto the
+// same JP_BUTTON_B1/B2/B3 encoding real pointer drivers use. Routes to every
+// output with a pointer path (SInput USB mouse interface, BLE composite,
+// mouse-to-analog transforms) exactly as a physical mouse would.
+static void cmd_mouse_inject(const char* json)
+{
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_MOUSE_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_MOUSE;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (int i = 0; i < ANALOG_COUNT; i++) {
+        event.analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+    }
+
+    int v;
+    if (json_get_int(json, "dx", &v)) {
+        if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+        event.delta_x = (int16_t)v;
+    }
+    if (json_get_int(json, "dy", &v)) {
+        if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+        event.delta_y = (int16_t)v;
+    }
+    if (json_get_int(json, "wheel", &v)) {
+        if (v > 127) v = 127; else if (v < -127) v = -127;
+        event.delta_wheel = (int8_t)v;
+    }
+    int buttons = 0;
+    json_get_int(json, "buttons", &buttons);
+    if (buttons & 0x01) event.buttons |= JP_BUTTON_B1;  // left
+    if (buttons & 0x02) event.buttons |= JP_BUTTON_B2;  // right
+    if (buttons & 0x04) event.buttons |= JP_BUTTON_B3;  // middle
+
+    router_submit_input(&event);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"dx\":%d,\"dy\":%d,\"wheel\":%d,\"buttons\":%d}",
+             event.delta_x, event.delta_y, event.delta_wheel, buttons & 7);
+    send_json(response_buf);
+}
+
+// KEY.INJECT - Submit synthetic keyboard state into the router from the
+// config host. Held-state, like a real keyboard report: the keys and modifiers
+// in this call stay pressed until the next call replaces them.
+//   { "mod": <HID modifier mask>, "keys": [<up to 6 HID usage IDs, page 0x07>] }
+// Send {} (or keys:[] with mod:0) to release everything.
+static void cmd_key_inject(const char* json)
+{
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_KB_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_KEYBOARD;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (int i = 0; i < ANALOG_COUNT; i++) {
+        event.analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+    }
+
+    int mod = 0;
+    json_get_int(json, "mod", &mod);
+    event.kb_modifier = (uint8_t)mod;
+
+    uint8_t keys[6] = {0};
+    int count = json_get_int_array(json, "keys", keys, 6);
+    for (int i = 0; i < count; i++) event.kb_keys[i] = keys[i];
+
+    router_submit_input(&event);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"mod\":%d,\"keys\":%d}", mod, count > 0 ? count : 0);
     send_json(response_buf);
 }
 
@@ -1319,6 +2039,265 @@ static void cmd_cprofile_delete(const char* json)
     cmd_profile_delete(json);
 }
 
+#ifdef CONFIG_DS5_COMPANION
+// ============================================================================
+// AI COMPANION VOICE BRIDGE (DS5 mic -> host, host speech -> DS5 speaker)
+// ============================================================================
+
+// ds5_bt.c hooks
+extern bool ds5_companion_push_speak(const uint8_t* frame200);
+extern uint8_t ds5_companion_ring_free(void);
+extern void ds5_companion_set_state(uint8_t state);
+
+static const char b64_tab[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int voice_b64_encode(const uint8_t* in, int len, char* out, int out_max)
+{
+    int o = 0;
+    for (int i = 0; i < len; i += 3) {
+        if (o + 4 >= out_max) return -1;
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        out[o++] = b64_tab[(v >> 18) & 63];
+        out[o++] = b64_tab[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? b64_tab[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < len) ? b64_tab[v & 63] : '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+static int voice_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int voice_b64_decode(const char* in, int in_len, uint8_t* out, int out_max)
+{
+    int o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (int i = 0; i < in_len; i++) {
+        if (in[i] == '=') break;
+        int v = voice_b64_val(in[i]);
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= out_max) return -1;
+            out[o++] = (uint8_t)(acc >> bits);
+        }
+    }
+    return o;
+}
+
+// Called from the DS5 driver for every mic-audio input report while
+// listening — that call arrives DEEP in the BTstack packet-handler chain.
+// cdc_protocol_send() puts ~2KB of packet+CRC buffers on the stack, which
+// smashed the stack from that context at 100 reports/s and knocked the whole
+// device off USB the moment LISTEN engaged. So: enqueue-only here; the JSON
+// encode + CDC transmit happen in cdc_commands_task() (main loop, deep
+// stack, correct TinyUSB context).
+#define MIC_RING_SLOTS 16
+#define MIC_RING_MAX   96
+static uint8_t mic_ring[MIC_RING_SLOTS][MIC_RING_MAX];
+static uint8_t mic_ring_len[MIC_RING_SLOTS];
+static volatile uint8_t mic_ring_head, mic_ring_tail;
+
+void cdc_voice_mic_event(const uint8_t* data, uint16_t len)
+{
+    if (!stream_ctx) return;
+    uint8_t next = (uint8_t)((mic_ring_head + 1) % MIC_RING_SLOTS);
+    if (next == mic_ring_tail) return;  // full: drop (host PLC covers gaps)
+    if (len > MIC_RING_MAX) len = MIC_RING_MAX;
+    memcpy(mic_ring[mic_ring_head], data, len);
+    mic_ring_len[mic_ring_head] = (uint8_t)len;
+    mic_ring_head = next;
+}
+
+// Drained from cdc_commands_task() — see above.
+static void mic_ring_drain(void)
+{
+    while (mic_ring_tail != mic_ring_head) {
+        if (!stream_ctx) {  // stream detached: discard
+            mic_ring_tail = mic_ring_head;
+            return;
+        }
+        static char mic_buf[1200];
+        const uint8_t* data = mic_ring[mic_ring_tail];
+        uint16_t len = mic_ring_len[mic_ring_tail];
+        int n = snprintf(mic_buf, sizeof(mic_buf), "{\"type\":\"mic\",\"d\":\"");
+        int e = voice_b64_encode(data, len, mic_buf + n, (int)sizeof(mic_buf) - n - 3);
+        if (e >= 0) {
+            n += e;
+            mic_buf[n++] = '\"';
+            mic_buf[n++] = '}';
+            mic_buf[n] = 0;
+            if (cdc_protocol_send_event(stream_ctx, mic_buf) == 0) {
+                return;  // TX backlogged: retry this slot next task tick
+            }
+        }
+        mic_ring_tail = (uint8_t)((mic_ring_tail + 1) % MIC_RING_SLOTS);
+    }
+}
+
+// Companion state notifications (listen / mic_end / speak_end).
+// Same BT-context hazard as mic events: queue the name, emit from task.
+static const char* voice_notify_q[4];
+static volatile uint8_t voice_nq_head, voice_nq_tail;
+
+void cdc_voice_notify(const char* what)
+{
+    if (!stream_ctx) return;
+    uint8_t next = (uint8_t)((voice_nq_head + 1) % 4);
+    if (next == voice_nq_tail) return;
+    voice_notify_q[voice_nq_head] = what;  // callers pass string literals
+    voice_nq_head = next;
+}
+
+static void voice_notify_drain(void)
+{
+    while (voice_nq_tail != voice_nq_head) {
+        if (!stream_ctx) { voice_nq_tail = voice_nq_head; return; }
+        static char ev_buf[64];
+        snprintf(ev_buf, sizeof(ev_buf), "{\"type\":\"voice\",\"ev\":\"%s\"}",
+                 voice_notify_q[voice_nq_tail]);
+        if (cdc_protocol_send_event(stream_ctx, ev_buf) == 0) return;
+        voice_nq_tail = (uint8_t)((voice_nq_tail + 1) % 4);
+    }
+}
+
+// {"cmd":"VOICE.SPEAK","d":"<base64 of exactly 200 Opus bytes>"}
+static void cmd_voice_speak(const char* json)
+{
+    int dlen;
+    int end = 0;
+    json_get_int(json, "end", &end);
+    if (end) {
+        extern void ds5_companion_speak_flush(void);
+        ds5_companion_speak_flush();
+        return;
+    }
+    const char* d = json_get_string(json, "d", &dlen);
+    if (!d) {
+        send_error("missing d");
+        return;
+    }
+    // 1-3 Opus frames per command (200B each). Batching matters: during BT
+    // audio streaming the main loop slows and the host can only land a
+    // command every ~17ms — one frame per command (10.67ms budget) starves
+    // the ring and the audio chops. Three per command = 32ms budget.
+    uint8_t frames[600];
+    int n = voice_b64_decode(d, dlen, frames, (int)sizeof(frames));
+    if (n != 200 && n != 400 && n != 600) {
+        send_error("need 1-3 x 200-byte frames");
+        return;
+    }
+    // Fire-and-forget: no response. 89/197 speak sends measured over budget
+    // (worst 103ms) — per-command response building + TX was throttling the
+    // host's write acceptance during playback. Errors still respond.
+    for (int off = 0; off < n; off += 200) {
+        (void)ds5_companion_push_speak(frames + off);
+    }
+}
+
+// {"cmd":"VOICE.CTX"} -> controller context for the AI (battery, held time,
+// drop tally). The bridge injects this before each model turn.
+static void cmd_voice_ctx(const char* json)
+{
+    (void)json;
+    extern bool ds5_companion_get_ctx(uint8_t*, bool*, uint32_t*, uint8_t*, uint8_t*, uint8_t*);
+    uint8_t batt = 0, drops = 0, catches = 0, shakes = 0;
+    bool chg = false;
+    uint32_t held = 0;
+    if (!ds5_companion_get_ctx(&batt, &chg, &held, &drops, &catches, &shakes)) {
+        send_error("no controller");
+        return;
+    }
+    extern uint32_t ds5_companion_get_presses(char*, int);
+    extern bool ds5_companion_get_ctx2(uint8_t*, bool*, uint32_t*, char*, int);
+    char presses[160];
+    uint32_t press_age = ds5_companion_get_presses(presses, sizeof(presses));
+    uint8_t pets = 0;
+    bool flipped = false;
+    uint32_t idle_min = 0;
+    char top_btns[64] = "";
+    ds5_companion_get_ctx2(&pets, &flipped, &idle_min, top_btns, sizeof(top_btns));
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"batt\":%u,\"chg\":%s,\"held_s\":%lu,"
+             "\"drops\":%u,\"catches\":%u,\"shakes\":%u,\"pets\":%u,"
+             "\"flipped\":%s,\"idle_min\":%lu,\"top_btns\":\"%s\","
+             "\"btns\":\"%s\",\"btn_age_s\":%lu}",
+             batt, chg ? "true" : "false", (unsigned long)held, drops, catches,
+             shakes, pets, flipped ? "true" : "false",
+             (unsigned long)idle_min, top_btns,
+             presses, (unsigned long)press_age);
+    send_json(response_buf);
+}
+
+// {"cmd":"VOICE.FX","led":[r,g,b],"led_ms":N,"rumble":[lo,hi],"rumble_ms":N,
+//  "scream":true} — the model's body control (lightbar, rumble, scream)
+static bool fx_parse_triplet(const char* json, const char* key,
+                             int* a, int* b, int* c)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* q = strstr(json, pat);
+    if (!q) return false;
+    q = strchr(q, '[');
+    if (!q) return false;
+    int n = sscanf(q, c ? "[%d,%d,%d" : "[%d,%d", a, b, c ? c : a);
+    return c ? n == 3 : n == 2;
+}
+
+static void cmd_voice_fx(const char* json)
+{
+    extern bool ds5_companion_fx(const uint8_t*, uint32_t, uint8_t, uint8_t,
+                                 uint32_t, bool);
+    int r = 0, g = 0, b = 0, lo = 0, hi = 0;
+    int led_ms = 0, rum_ms = 0, scream = 0;
+    bool has_led = fx_parse_triplet(json, "led", &r, &g, &b);
+    bool has_rum = fx_parse_triplet(json, "rumble", &lo, &hi, NULL);
+    json_get_int(json, "led_ms", &led_ms);
+    json_get_int(json, "rumble_ms", &rum_ms);
+    json_get_int(json, "scream", &scream);
+    uint8_t led[3] = { (uint8_t)r, (uint8_t)g, (uint8_t)b };
+    bool ok = ds5_companion_fx(led,
+                               has_led ? (uint32_t)(led_ms > 0 ? led_ms : 3000) : 0,
+                               (uint8_t)lo, (uint8_t)hi,
+                               has_rum ? (uint32_t)(rum_ms > 0 ? rum_ms : 1000) : 0,
+                               scream != 0);
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":%s}",
+             ok ? "true" : "false");
+    send_json(response_buf);
+}
+
+// {"cmd":"VOICE.STATE","state":"idle"|"think"}
+static void cmd_voice_state(const char* json)
+{
+    int slen;
+    const char* st = json_get_string(json, "state", &slen);
+    if (!st) {
+        send_error("missing state");
+        return;
+    }
+    if (strncmp(st, "think", 5) == 0) {
+        ds5_companion_set_state(2);   // DS5_COMP_THINK
+    } else {
+        ds5_companion_set_state(0);   // DS5_COMP_IDLE
+    }
+    send_json("{\"ok\":true}");
+}
+#endif  // CONFIG_DS5_COMPANION
+
 // ============================================================================
 // DEBUG LOG STREAM COMMAND
 // ============================================================================
@@ -1342,8 +2321,14 @@ static void cmd_debug_stream(const char* json)
         // Drain any stale data when disabling
         log_tail = log_head;
     } else {
-        // Flush stale data so only fresh logs are streamed
-        log_tail = log_head;
+        // Flush stale data so only fresh logs are streamed — unless the
+        // caller asks to keep the backlog ({"keep":true}), which streams
+        // everything still in the ring (e.g. boot-time logs).
+        bool keep = false;
+        json_get_bool(json, "keep", &keep);
+        if (!keep) {
+            log_tail = log_head;
+        }
     }
 
     snprintf(response_buf, sizeof(response_buf),
@@ -1358,18 +2343,241 @@ static void cmd_debug_stream(const char* json)
 }
 
 // ============================================================================
+// LOG COMMANDS
+// ============================================================================
+
+// LOG.DUMP — snapshot ring buffer and stream it as log events, then send response
+static void cmd_log_dump(const char* json)
+{
+    (void)json;
+    // Snapshot: drain from current tail to current head
+    dump_pos    = log_tail;
+    dump_end    = log_head;
+    dump_active = true;
+    // Make sure we have a stream context to send events on
+    if (!stream_ctx) stream_ctx = active_ctx;
+    send_ok();
+}
+
+// LOG.CLEAR — discard all buffered log data
+static void cmd_log_clear(const char* json)
+{
+    (void)json;
+    dump_active = false;
+    log_tail = log_head;   // discard all pending streaming data
+    dump_pos = dump_end = log_head;
+    send_ok();
+}
+
+// ============================================================================
+// PS4 LOCAL AUTH COMMANDS
+// ============================================================================
+
+// Base64 decode table (-1 = invalid, -2 = padding '=')
+static const int8_t b64_table[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+// Decode base64 string (in_len chars) into out (max out_max bytes).
+// Returns number of bytes written, or -1 on error.
+static int b64_decode(const char *in, int in_len, uint8_t *out, int out_max)
+{
+    int out_len = 0;
+    uint32_t buf = 0;
+    int bits = 0;
+
+    for (int i = 0; i < in_len; i++) {
+        int8_t val = b64_table[(uint8_t)in[i]];
+        if (val == -1) continue;  // Skip whitespace and invalid chars
+        if (val == -2) break;     // Padding — end of data
+
+        buf = (buf << 6) | (uint32_t)val;
+        bits += 6;
+
+        if (bits >= 8) {
+            if (out_len >= out_max) return -1;  // Output overflow
+            bits -= 8;
+            out[out_len++] = (uint8_t)((buf >> bits) & 0xFF);
+        }
+    }
+    return out_len;
+}
+
+// PS4AUTH.SET — receives all key material and saves to flash
+// {"cmd":"PS4AUTH.SET","args":{"N":"<b64>","E":"<b64>","P":"<b64>","Q":"<b64>",
+//   "serial":"<b64>","signature":"<b64>"}}
+static void cmd_ps4auth_set(const char *json)
+{
+    static ps4_auth_data_t auth;
+    memset(&auth, 0, sizeof(auth));
+
+    const char *val;
+    int val_len;
+    int decoded_len;
+
+    // N — RSA modulus (256 bytes)
+    val = json_get_string(json, "N", &val_len);
+    if (!val) { send_error("missing N"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_n, sizeof(auth.rsa_n));
+    if (decoded_len != 256) { send_error("N must be 256 bytes"); return; }
+
+    // E — RSA public exponent (4 bytes)
+    val = json_get_string(json, "E", &val_len);
+    if (!val) { send_error("missing E"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_e, sizeof(auth.rsa_e));
+    if (decoded_len < 1 || decoded_len > 4) { send_error("E must be 1-4 bytes"); return; }
+    // Right-align E in 4-byte field if shorter than 4 bytes
+    if (decoded_len < 4) {
+        uint8_t tmp[4] = {0};
+        memcpy(tmp + (4 - decoded_len), auth.rsa_e, decoded_len);
+        memcpy(auth.rsa_e, tmp, 4);
+    }
+
+    // P — RSA prime (128 bytes)
+    val = json_get_string(json, "P", &val_len);
+    if (!val) { send_error("missing P"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_p, sizeof(auth.rsa_p));
+    if (decoded_len != 128) { send_error("P must be 128 bytes"); return; }
+
+    // Q — RSA prime (128 bytes)
+    val = json_get_string(json, "Q", &val_len);
+    if (!val) { send_error("missing Q"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_q, sizeof(auth.rsa_q));
+    if (decoded_len != 128) { send_error("Q must be 128 bytes"); return; }
+
+    // serial — 16 bytes
+    val = json_get_string(json, "serial", &val_len);
+    if (!val) { send_error("missing serial"); return; }
+    decoded_len = b64_decode(val, val_len, auth.serial, sizeof(auth.serial));
+    if (decoded_len != 16) { send_error("serial must be 16 bytes"); return; }
+
+    // signature — 256 bytes (sig.bin)
+    val = json_get_string(json, "signature", &val_len);
+    if (!val) { send_error("missing signature"); return; }
+    decoded_len = b64_decode(val, val_len, auth.sig, sizeof(auth.sig));
+    if (decoded_len != 256) { send_error("signature must be 256 bytes"); return; }
+
+    // Save to flash — read-back verified, so a false here means the sector does
+    // not hold a usable record no matter what the write path reported.
+    if (!ps4_auth_flash_save(&auth)) {
+        printf("[CDC] PS4AUTH.SET: flash write failed\n");
+        send_error("flash write failed — key not stored");
+        return;
+    }
+
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Reload local auth module so it takes effect immediately. This re-reads the
+    // sector and re-imports N/E/P/Q through mbedTLS, so it is the strongest
+    // available check that the stored key is actually usable — report it rather
+    // than only printing it to a serial console the user cannot reach in PS4
+    // output mode (see #228).
+    ps4_local_auth_reload();
+    if (!ps4_local_auth_is_available()) {
+        printf("[CDC] PS4AUTH.SET: stored, but key failed to load\n");
+        send_error("key stored but failed to load — check N/E/P/Q and signature");
+        return;
+    }
+    printf("[CDC] PS4AUTH.SET: saved, local auth=ready\n");
+#else
+    printf("[CDC] PS4AUTH.SET: saved (RSA signing not available in this build)\n");
+#endif
+
+    send_ok();
+}
+
+// PS4AUTH.STATUS — returns whether auth data is installed
+static void cmd_ps4auth_status(const char *json)
+{
+    (void)json;
+
+    // Load once — reuse for both installed check and serial
+    ps4_auth_data_t auth;
+    bool installed = ps4_auth_flash_load(&auth);
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    bool active = ps4_local_auth_is_available();
+    if (!installed) installed = active;
+#else
+    bool active = false;
+#endif
+
+    if (installed) {
+        char serial_hex[33] = {0};
+        for (int i = 0; i < 16; i++) {
+            snprintf(serial_hex + i * 2, 3, "%02X", auth.serial[i]);
+        }
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"installed\":true,\"active\":%s,\"serial\":\"%s\"}",
+                 active ? "true" : "false",
+                 serial_hex);
+    } else {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"installed\":false,\"active\":false}");
+    }
+    send_json(response_buf);
+}
+
+// PS4AUTH.CLEAR — removes auth data from flash
+static void cmd_ps4auth_clear(const char *json)
+{
+    (void)json;
+    bool erased = ps4_auth_flash_erase();
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Reinit local auth (will fail, disabling local auth)
+    ps4_local_auth_reload();
+#endif
+    if (!erased) {
+        printf("[CDC] PS4AUTH.CLEAR: erase failed\n");
+        send_error("flash erase failed — key may still be stored");
+        return;
+    }
+    printf("[CDC] PS4AUTH.CLEAR: auth data erased\n");
+    send_ok();
+}
+
+// ============================================================================
 // SETTINGS COMMANDS
 // ============================================================================
+
+// Read-only view of the device's current settings.
+//
+// Prefer the live runtime copy over flash_load(): flash_load() reads the flash
+// sector, which lags runtime_settings by up to SAVE_DEBOUNCE_MS (5s) after any
+// debounced write. A GET issued right after a SET would otherwise report the
+// pre-SET value, and the web config — which re-reads state after a write — shows
+// the setting snapping back. Falls back to the flash record when storage has not
+// been initialised; returns NULL when neither is available.
+static const flash_t* settings_for_read(flash_t* scratch)
+{
+    const flash_t* s = flash_get_settings();
+    if (s) return s;
+    return flash_load(scratch) ? scratch : NULL;
+}
 
 static void cmd_settings_get(const char* json)
 {
     (void)json;
-    flash_t flash_data;
-    if (flash_load(&flash_data)) {
+    flash_t scratch;
+    const flash_t* s = settings_for_read(&scratch);
+    if (s) {
         snprintf(response_buf, sizeof(response_buf),
                  "{\"profile\":%d,\"mode\":%d}",
-                 flash_data.active_profile_index,
-                 flash_data.usb_output_mode);
+                 s->active_profile_index,
+                 s->usb_output_mode);
     } else {
         snprintf(response_buf, sizeof(response_buf),
                  "{\"profile\":0,\"mode\":0,\"valid\":false}");
@@ -1388,23 +2596,30 @@ static void cmd_router_get(const char* json)
 #define MERGE_MODE 0
 #endif
 
-    flash_t flash_data;
-#if REQUIRE_BT_INPUT
+    flash_t scratch;
+#if BT_INPUT_ALWAYS_ON || REQUIRE_BT_INPUT
     uint8_t rm = ROUTING_MODE, mm = MERGE_MODE, dm = 0, bti = 1;
 #else
     uint8_t rm = ROUTING_MODE, mm = MERGE_MODE, dm = 0, bti = 0;
 #endif
-    if (flash_load(&flash_data) && flash_data.router_saved) {
-        if (flash_data.routing_mode <= 2) rm = flash_data.routing_mode;
-        if (flash_data.merge_mode <= 2) mm = flash_data.merge_mode;
-        if (flash_data.dpad_mode <= 2) dm = flash_data.dpad_mode;
-        bti = flash_data.bt_input_enabled;
+    // D-pad mode + shoulder swap come from LIVE router state so the value is
+    // consistent the instant a hotkey or CDC set happens (the flash write is
+    // debounced). router_init() has already restored them from flash on boot.
+    dm = router_get_dpad_mode();
+    uint8_t ss = router_get_shoulder_swap() ? 1 : 0;
+    const flash_t* s = settings_for_read(&scratch);
+    if (s && s->router_saved) {
+        if (s->routing_mode <= 2) rm = s->routing_mode;
+        if (s->merge_mode <= 2) mm = s->merge_mode;
+#if !BT_INPUT_ALWAYS_ON
+        bti = s->bt_input_enabled;   // always-on bridges ignore the persisted flag
+#endif
     }
     snprintf(response_buf, sizeof(response_buf),
              "{\"ok\":true,\"routing_mode\":%d,\"merge_mode\":%d,\"dpad_mode\":%d,"
-             "\"bt_input\":%s,"
+             "\"shoulder_swap\":%s,\"bt_input\":%s,"
              "\"default_routing_mode\":%d,\"default_merge_mode\":%d}",
-             rm, mm, dm, bti ? "true" : "false",
+             rm, mm, dm, ss ? "true" : "false", bti ? "true" : "false",
              (int)ROUTING_MODE, (int)MERGE_MODE);
     send_json(response_buf);
 }
@@ -1412,12 +2627,24 @@ static void cmd_router_get(const char* json)
 static void cmd_router_dpad_set(const char* json)
 {
     int mode;
-    if (!json_get_int(json, "mode", &mode) || mode < 0 || mode > 2) {
-        send_error("Invalid mode (0-2)");
+    if (!json_get_int(json, "mode", &mode) || mode < 0 || mode > 3) {
+        send_error("Invalid mode (0=normal,1=dpad<->L,2=dpad<->R,3=L<->R)");
         return;
     }
     router_set_dpad_mode((uint8_t)mode);
     flash_set_dpad_mode((uint8_t)mode);   // persist (no reboot needed)
+    send_ok();
+}
+
+static void cmd_router_shoulder_set(const char* json)
+{
+    bool on;
+    if (!json_get_bool(json, "enable", &on)) {
+        send_error("missing enable");
+        return;
+    }
+    router_set_shoulder_swap(on);
+    flash_set_shoulder_swap(on ? 1 : 0);   // persist (no reboot needed)
     send_ok();
 }
 
@@ -1436,11 +2663,12 @@ static void cmd_caps_get(const char* json)
 #endif
 
     // Routing mode honors any persisted override (matches cmd_router_get).
-    flash_t flash_data;
+    flash_t scratch;
     uint8_t rm = ROUTING_MODE, mm = MERGE_MODE;
-    if (flash_load(&flash_data) && flash_data.router_saved) {
-        if (flash_data.routing_mode <= 2) rm = flash_data.routing_mode;
-        if (flash_data.merge_mode <= 2) mm = flash_data.merge_mode;
+    const flash_t* s = settings_for_read(&scratch);
+    if (s && s->router_saved) {
+        if (s->routing_mode <= 2) rm = s->routing_mode;
+        if (s->merge_mode <= 2) mm = s->merge_mode;
     }
 
     char* out = response_buf;
@@ -1455,6 +2683,14 @@ static void cmd_caps_get(const char* json)
     if (n < 0 || n >= rem) goto overflow;
     out += n; rem -= n;
 
+    // Track which input sources we've listed so we can backfill any source
+    // that routes reference but the input-interface registry doesn't expose
+    // (e.g. BLE Central on universal — it's routed as input but isn't
+    // a polled InputInterface). A CAPS payload whose routes point at a source
+    // missing from inputs[] is internally inconsistent and breaks host tools
+    // that map routes back to inputs.
+    uint32_t seen_sources = 0;
+    bool first_input = true;
     uint8_t in_count = 0;
     const InputInterface* const* ins = app_registry_inputs(&in_count);
     for (uint8_t i = 0; i < in_count; i++) {
@@ -1468,13 +2704,37 @@ static void cmd_caps_get(const char* json)
         n = snprintf(out, rem,
                      "%s{\"name\":\"%s\",\"source\":%d,\"source_name\":\"%s\""
                      ",\"connected\":%s,\"devices\":%u}",
-                     i == 0 ? "" : ",",
+                     first_input ? "" : ",",
                      name, (int)it->source,
                      app_registry_input_source_name(it->source),
                      has_conn ? (connected ? "true" : "false") : "null",
                      has_devs ? devs : 0);
         if (n < 0 || n >= rem) goto overflow;
         out += n; rem -= n;
+        first_input = false;
+        if ((unsigned)it->source < 32) seen_sources |= (1u << it->source);
+    }
+
+    // Backfill input sources referenced only by routes (not in the registry).
+    {
+        uint8_t rc = router_get_route_count();
+        for (uint8_t i = 0; i < rc; i++) {
+            const route_entry_t* r = router_get_route(i);
+            if (!r || !r->active) continue;
+            unsigned src = (unsigned)r->input;
+            if (src < 32 && (seen_sources & (1u << src))) continue;
+            if (src < 32) seen_sources |= (1u << src);
+            n = snprintf(out, rem,
+                         "%s{\"name\":\"%s\",\"source\":%d,\"source_name\":\"%s\""
+                         ",\"connected\":null,\"devices\":0}",
+                         first_input ? "" : ",",
+                         app_registry_input_source_name(r->input),
+                         (int)r->input,
+                         app_registry_input_source_name(r->input));
+            if (n < 0 || n >= rem) goto overflow;
+            out += n; rem -= n;
+            first_input = false;
+        }
     }
 
     n = snprintf(out, rem, "],\"outputs\":[");
@@ -1526,7 +2786,56 @@ static void cmd_caps_get(const char* json)
         first_route = false;
     }
 
-    n = snprintf(out, rem, "]}");
+    // USB host capability. Advertised even in config mode (no live host) so the
+    // web config can show a USB Host page for host-capable adapters:
+    //   present      — this build hosts USB controllers (REQUIRE_USB_HOST app flag)
+    //   configurable — the D+ pin is user-settable (PIO USB on controller apps).
+    //                   Native-USB adapters (usb2pce/usb2gc) are fixed by silicon
+    //                   → present but not configurable → read-only page.
+    //   dp           — the PIO USB D+ pin, or -1 for native USB / no host.
+#if (defined(REQUIRE_USB_HOST) && REQUIRE_USB_HOST) || (defined(HOST_OVER_LINK) && HOST_OVER_LINK)
+    // HOST_OVER_LINK: this MCU hosts nothing itself but proxies a USB host that
+    // lives on the peer MCU (dual-RP remapper) — advertise it so the config UI
+    // shows the USB input page. Presence is real; the controllers arrive via the
+    // inter-MCU link and register as players like any USB device.
+    const char* uh_present = "true";
+#else
+    const char* uh_present = "false";
+#endif
+#ifdef CONFIG_PAD_INPUT
+    const char* uh_configurable = "true";
+#else
+    const char* uh_configurable = "false";
+#endif
+#ifdef PICO_DEFAULT_PIO_USB_DP_PIN
+    int uh_dp = PICO_DEFAULT_PIO_USB_DP_PIN;
+#else
+    int uh_dp = -1;   // native USB (fixed pins) or no host
+#endif
+    // Canonical I/O: the app's true input→output even when config mode has the
+    // device enumerated as a USB CDC device (e.g. usb2pce reports USB Host →
+    // PCEngine, not "— → USB"). Sourced from the app-set native_input/output.
+    extern const InputInterface* native_input;
+    extern const OutputInterface* native_output;
+    const char* nin  = native_input  ? native_input->name  : NULL;
+    const char* nout = native_output ? native_output->name : NULL;
+    const char* nin_src  = native_input  ? app_registry_input_source_name(native_input->source) : "";
+    const char* nout_tgt = native_output ? app_registry_output_target_name(native_output->target) : "";
+    int nout_players = native_output ? router_get_max_players(native_output->target) : 0;
+    // Bluetooth host capability (mirror of usb_host). present = stack compiled
+    // in; configurable = the app honours the runtime enable toggle. Dedicated BT
+    // bridges are present-but-not-configurable → read-only always-on page.
+    const char* bt_present      = BT_HOST_PRESENT      ? "true" : "false";
+    const char* bt_configurable = BT_HOST_CONFIGURABLE ? "true" : "false";
+    n = snprintf(out, rem,
+                 "],\"usb_host\":{\"present\":%s,\"configurable\":%s,\"dp\":%d}"
+                 ",\"bt_host\":{\"present\":%s,\"configurable\":%s}"
+                 ",\"native\":{\"in\":%s%s%s,\"in_source_name\":\"%s\""
+                 ",\"out\":%s%s%s,\"out_target_name\":\"%s\",\"out_players\":%d}}",
+                 uh_present, uh_configurable, uh_dp,
+                 bt_present, bt_configurable,
+                 nin  ? "\"" : "null", nin  ? nin  : "", nin  ? "\"" : "", nin_src,
+                 nout ? "\"" : "null", nout ? nout : "", nout ? "\"" : "", nout_tgt, nout_players);
     if (n < 0 || n >= rem) goto overflow;
     send_json(response_buf);
     return;
@@ -1537,20 +2846,25 @@ overflow:
 
 static void cmd_router_set(const char* json)
 {
-    flash_t flash_data;
-    if (!flash_load(&flash_data)) {
-        memset(&flash_data, 0, sizeof(flash_data));
+    // Mutate the live settings in place so the record we force out carries any
+    // other change still sitting in runtime_settings (a debounced profile or
+    // shoulder-swap write, say) instead of reverting it to the on-flash value.
+    flash_t scratch;
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        if (!flash_load(&scratch)) memset(&scratch, 0, sizeof(scratch));
+        settings = &scratch;
     }
 
     int ival;
-    if (json_get_int(json, "routing_mode", &ival)) flash_data.routing_mode = (uint8_t)ival;
-    if (json_get_int(json, "merge_mode", &ival)) flash_data.merge_mode = (uint8_t)ival;
-    if (json_get_int(json, "dpad_mode", &ival)) flash_data.dpad_mode = (uint8_t)ival;
+    if (json_get_int(json, "routing_mode", &ival)) settings->routing_mode = (uint8_t)ival;
+    if (json_get_int(json, "merge_mode", &ival)) settings->merge_mode = (uint8_t)ival;
+    if (json_get_int(json, "dpad_mode", &ival)) settings->dpad_mode = (uint8_t)ival;
     bool bval;
-    if (json_get_bool(json, "bt_input", &bval)) flash_data.bt_input_enabled = bval ? 1 : 0;
-    flash_data.router_saved = 1;
+    if (json_get_bool(json, "bt_input", &bval)) settings->bt_input_enabled = bval ? 1 : 0;
+    settings->router_saved = 1;
 
-    flash_save_force(&flash_data);
+    flash_save_force(settings);
 
     snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"reboot\":true}");
     send_json(response_buf);
@@ -1594,7 +2908,7 @@ static void cmd_output_native_get(const char* json)
         send_json(response_buf);
         return;
     }
-    char body[512];
+    char body[1024];   // room for remoteplay's WiFi AP + console lists
     uint16_t len = out->get_native_config(body, sizeof(body));
     if (len == 0) {
         snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"available\":false}");
@@ -1628,6 +2942,14 @@ static void cmd_settings_reset(const char* json)
     // Factory reset — erase all stored data
     flash_factory_reset();
 
+    // Bonds live in a separate flash bank (btstack_tlv), so flash_factory_reset()
+    // alone leaves them behind. Clear them too so a factory reset really is a
+    // clean slate. Guarded on ENABLE_BTSTACK — btstack_host.h (the prototype) is
+    // only included for BT builds; non-BT builds have no bonds to clear anyway.
+#ifdef ENABLE_BTSTACK
+    btstack_host_delete_all_bonds();
+#endif
+
 #ifdef CONFIG_PAD_INPUT
     pad_config_reset();
 #endif
@@ -1642,9 +2964,28 @@ static void cmd_settings_reset(const char* json)
 }
 
 #ifdef ENABLE_BTSTACK
+// BLE.DROP {"ms":60000} — drop all BLE links, hold reconnection off for the
+// window. Bench tool for radio-contention A/B tests (e.g. DS5 audio with and
+// without the face link) without unpairing anything.
+static void cmd_ble_drop(const char* json)
+{
+    int ms = 60000;
+    json_get_int(json, "ms", &ms);
+    if (ms < 1000) ms = 1000;
+    btstack_host_ble_drop_all((uint32_t)ms);
+    send_ok();
+}
+
 static void cmd_bt_status(const char* json)
 {
     (void)json;
+#ifdef ENABLE_BTSTACK
+    extern int btstack_host_nus_debug(int*);
+    int gattfree = -2;
+    int nus_state = btstack_host_nus_debug(&gattfree);
+#else
+    int gattfree = -2, nus_state = -1;
+#endif
     // Determine transport at compile time
 #if defined(BTSTACK_USE_CYW43)
     const char* transport = "Onboard (CYW43, Classic + BLE)";
@@ -1658,12 +2999,22 @@ static void cmd_bt_status(const char* json)
     const char* transport = "None";
 #endif
 
+    // Uptime discriminates reboot-vs-USB-linkflap after a drop; crash_pc is
+    // the hard-fault black box breadcrumb (0 = no fault since power-on).
+    uint32_t crash_pc = 0, crash_lr = 0;
+#ifdef CONFIG_DS5_DROP_SCREAM
+    extern void btstack_host_get_crash_info(uint32_t* pc, uint32_t* lr);
+    btstack_host_get_crash_info(&crash_pc, &crash_lr);
+#endif
     int pos = snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"transport\":\"%s\",\"devices\":[",
+             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
+             "\"up_s\":%lu,\"crash_pc\":\"%08lx\",\"crash_lr\":\"%08lx\",\"devices\":[",
              btstack_host_is_initialized() ? "true" : "false",
              btstack_host_is_scanning() ? "true" : "false",
              btstack_classic_get_connection_count(),
-             transport);
+             nus_state, gattfree, transport,
+             (unsigned long)(platform_time_ms() / 1000),
+             (unsigned long)crash_pc, (unsigned long)crash_lr);
 
     // Track which bonded addresses are currently connected
     uint8_t connected_addrs[8][6];
@@ -1704,7 +3055,45 @@ static void cmd_bt_status(const char* json)
                         bond_addr[0], bond_addr[1], bond_addr[2],
                         bond_addr[3], bond_addr[4], bond_addr[5]);
                 first = false;
+                // Track it so the Classic sweep below can't list it twice.
+                if (connected_count < 8) {
+                    memcpy(connected_addrs[connected_count++], bond_addr, 6);
+                }
             }
+        }
+    }
+
+    // Persisted Classic BT bonds (DS4/DS5, Switch Pro, Wiimote) that aren't
+    // currently connected. Without this the list shows nothing at all for a
+    // powered-off Classic pad — its link key is in flash and it will reconnect
+    // fine, but every surface said "no bonded devices", which reads as "the
+    // pairing didn't save". The last-connected slot above can't cover them: it
+    // is written from Security Manager events, which are BLE-only.
+    {
+        uint8_t classic_addrs[8][6];
+        int classic_count = btstack_host_list_classic_bonds(classic_addrs, 8);
+        for (int i = 0; i < classic_count; i++) {
+            // Leave room for this entry plus the closing "]}".
+            if (pos + 128 >= (int)sizeof(response_buf)) break;
+
+            bool already_shown = false;
+            for (int j = 0; j < connected_count; j++) {
+                if (memcmp(classic_addrs[i], connected_addrs[j], 6) == 0) {
+                    already_shown = true;
+                    break;
+                }
+            }
+            if (already_shown) continue;
+
+            // No name is stored alongside a link key, so the name is empty and
+            // the web config falls back to showing the address.
+            pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    "%s{\"name\":\"\",\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+                    "\"vid\":\"\",\"pid\":\"\",\"ble\":false,\"connected\":false}",
+                    first ? "" : ",",
+                    classic_addrs[i][0], classic_addrs[i][1], classic_addrs[i][2],
+                    classic_addrs[i][3], classic_addrs[i][4], classic_addrs[i][5]);
+            first = false;
         }
     }
 
@@ -1766,11 +3155,14 @@ static void cmd_wiimote_orient_set(const char* json)
     }
     wiimote_set_orient_mode((uint8_t)mode);
 
-    // Save to flash
-    flash_t flash_data;
-    if (flash_load(&flash_data)) {
-        flash_data.wiimote_orient_mode = (uint8_t)mode;
-        flash_save(&flash_data);
+    // Persist through the live settings, not a stack copy of the flash record:
+    // a stack copy leaves runtime_settings holding the old orientation, so the
+    // next unrelated flash_save(&runtime_settings) writes a higher-sequence
+    // record that silently reverts this change.
+    flash_t* settings = flash_get_settings();
+    if (settings) {
+        settings->wiimote_orient_mode = (uint8_t)mode;
+        flash_save(settings);
     }
 
     snprintf(response_buf, sizeof(response_buf),
@@ -1852,13 +3244,20 @@ static void cmd_players_list(const char* json)
                                players[i].transport == INPUT_TRANSPORT_BT_CLASSIC ||
                                players[i].transport == INPUT_TRANSPORT_BT_BLE);
 
+        // Battery (0 = not reported by this controller)
+        uint8_t batt = 0; bool batt_chg = false;
+        router_get_device_battery((uint8_t)players[i].dev_addr, &batt, &batt_chg);
+
         len += snprintf(response_buf + len, sizeof(response_buf) - len,
-                        "%s{\"slot\":%d,\"name\":\"%s\",\"transport\":\"%s\",\"rumble\":%s}",
+                        "%s{\"slot\":%d,\"name\":\"%s\",\"transport\":\"%s\",\"rumble\":%s,"
+                        "\"battery\":%u,\"charging\":%s}",
                         i > 0 ? "," : "",
                         i,
                         name ? name : "Unknown",
                         transport,
-                        supports_rumble ? "true" : "false");
+                        supports_rumble ? "true" : "false",
+                        (unsigned)batt,
+                        batt_chg ? "true" : "false");
     }
 
     snprintf(response_buf + len, sizeof(response_buf) - len, "]}");
@@ -1958,6 +3357,15 @@ static void cmd_rumble_stop(const char* json)
 // Call from main loop to auto-stop rumble after duration and drain log buffer
 void cdc_commands_task(void)
 {
+    // Carries injected input when no controller is attached to overlay it onto.
+    // Rate-limits itself and stands down while real input is arriving.
+    router_inject_task();
+
+#ifdef CONFIG_DS5_COMPANION
+    mic_ring_drain();
+    voice_notify_drain();
+#endif
+
     // Handle deferred reboots (runs outside tud_task/protocol handler context)
     if (pending_reboot != PENDING_NONE) {
         uint32_t elapsed = platform_time_ms() - pending_reboot_time;
@@ -1965,12 +3373,15 @@ void cdc_commands_task(void)
             uint8_t type = pending_reboot;
             pending_reboot = PENDING_NONE;
             printf("[CDC] Executing deferred %s...\n",
-                   type == PENDING_BOOTSEL ? "bootloader" : "reboot");
+                   type == PENDING_BOOTSEL ? "bootloader" :
+                   type == PENDING_OTA ? "OTA DFU" : "reboot");
             // Disconnect USB cleanly so host sees device removal
             tud_disconnect();
             platform_sleep_ms(500);
             if (type == PENDING_BOOTSEL) {
                 platform_reboot_bootloader();
+            } else if (type == PENDING_OTA) {
+                platform_reboot_ota();
             } else {
                 platform_reboot();
             }
@@ -2416,42 +3827,75 @@ static void cmd_pad_config_reset(const char* json)
     pending_reboot_time = platform_time_ms();
 }
 
+// Append to response_buf, clamping so a truncated write can't push `pos` past
+// the end. snprintf returns the length it *would* have written, so the common
+// `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)` chain makes the next
+// size argument underflow to a huge size_t once the buffer fills. The pin
+// response is ~600 bytes against CDC_MAX_PAYLOAD, so this cannot fire today —
+// but it is now sized by the board's pin count rather than a fixed 30.
+static int pins_append(int pos, const char* fmt, ...)
+{
+    if (pos < 0 || (size_t)pos >= sizeof(response_buf)) return (int)sizeof(response_buf);
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(response_buf + pos, sizeof(response_buf) - pos, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return pos;                       // encoding error, leave pos put
+    pos += n;
+    if ((size_t)pos > sizeof(response_buf)) pos = (int)sizeof(response_buf);
+    return pos;
+}
+
 static void cmd_pad_config_pins(const char* json)
 {
     (void)json;
 
-    // Report available GPIO pins for this board
-    // RP2040 has GPIO 0-29, ADC on channels 0-3 (GPIO 26-29)
+    // Report the pins this board actually has. Every value here used to be
+    // hardcoded to an RP2040 (GPIO 0-29, ADC on 26-29), which is wrong on both
+    // of the other platforms that compile this command: the nRF52840 numbers
+    // P0/P1 as 0-47 and cannot use 0/1 (LFXO crystal), and the ESP32's
+    // numbering space has gaps. The config tool builds its pin menus from this
+    // response, so a hardcoded range there means offering pins that silently
+    // do nothing when written.
     int pos = 0;
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    "{\"ok\":true,\"gpio\":[");
+    pos = pins_append(pos, "{\"ok\":true,\"gpio\":[");
 
-    // GPIO 0-29 (all available on RP2040)
-    for (int i = 0; i <= 29; i++) {
-        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
-        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "%d", i);
+    bool first = true;
+    uint8_t pin_count = platform_gpio_pin_count();
+    for (uint8_t i = 0; i < pin_count; i++) {
+        if (!platform_gpio_pin_usable(i)) continue;
+        pos = pins_append(pos, first ? "%u" : ",%u", (unsigned)i);
+        first = false;
     }
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+    pos = pins_append(pos, "]");
 
-    // ADC channels
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"adc\":[0,1,2,3]");
+    // ADC channels, plus the GPIO backing each one where the platform numbers
+    // its analog inputs as GPIOs (-1 elsewhere, so the UI drops the hint).
+    pos = pins_append(pos, ",\"adc\":[");
+    uint8_t adc_count = platform_adc_channel_count();
+    for (uint8_t i = 0; i < adc_count; i++) {
+        pos = pins_append(pos, i ? ",%u" : "%u", (unsigned)i);
+    }
+    pos = pins_append(pos, "],\"adc_gpio\":[");
+    for (uint8_t i = 0; i < adc_count; i++) {
+        pos = pins_append(pos, i ? ",%d" : "%d", (int)platform_adc_channel_gpio(i));
+    }
+    pos = pins_append(pos, "]");
 
     // I2C expander pin ranges
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"i2c_exp_0\":[100,115],\"i2c_exp_1\":[200,215]");
+    pos = pins_append(pos, ",\"i2c_exp_0\":[100,115],\"i2c_exp_1\":[200,215]");
 
-    // Button names for UI labels
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"button_names\":[");
+    // Button names for UI labels — the authoritative order, matching the
+    // positional "buttons" array that PAD.CONFIG.SET reads.
+    pos = pins_append(pos, ",\"button_names\":[");
     for (int i = 0; i < PAD_BTN_COUNT; i++) {
-        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
-        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                        "\"%s\"", pad_button_names[i]);
+        pos = pins_append(pos, i ? ",\"%s\"" : "\"%s\"", pad_button_names[i]);
     }
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+    pos = pins_append(pos, "]");
 
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "}");
+    pos = pins_append(pos, "}");
     send_json(response_buf);
 }
 
@@ -2782,14 +4226,53 @@ typedef struct {
 
 static const cmd_entry_t commands[] = {
     {"INFO", cmd_info},
+    {"SINPUT.DBG", cmd_sinput_dbg},
     {"MP.STATS", cmd_mp_stats},
     {"MP.MODE", cmd_mp_mode},
     {"PING", cmd_ping},
+#ifdef APP_CAN_FLASH_B
+    {"FLASH.B", cmd_flash_b},
+#endif
     {"REBOOT", cmd_reboot},
     {"BOOTSEL", cmd_bootsel},
+#ifdef JOYPAD_HAS_ESP_COREDUMP
+    {"COREDUMP.SUM", cmd_coredump_sum},
+#endif
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    {"FACE.SPEAK", cmd_face_speak},
+    {"FACE.STATE", cmd_face_state},
+    {"FACE.EMO", cmd_face_emo},
+    {"FACE.LOOK", cmd_face_look},
+    {"FACE.BRIGHT", cmd_face_bright},
+    {"FACE.OFFSET", cmd_face_offset},
+    {"FACE.STYLE", cmd_face_style},
+    {"FACE.COLOR", cmd_face_color},
+    {"FACE.TRACK", cmd_face_track},
+    {"FACE.TRACK.GO", cmd_face_track_go},
+    {"BATT.GET", cmd_batt_get},
+#elif defined(ENABLE_BTSTACK)
+    // Relay every FACE.* command to a paired JoypadOS face over BLE NUS.
+    {"FACE.SPEAK", cmd_face_forward},
+    {"FACE.STATE", cmd_face_forward},
+    {"FACE.EMO", cmd_face_forward},
+    {"FACE.LOOK", cmd_face_forward},
+    {"FACE.BRIGHT", cmd_face_forward},
+    {"FACE.OFFSET", cmd_face_forward},
+    {"FACE.STYLE", cmd_face_forward},
+    {"FACE.COLOR", cmd_face_forward},
+    {"FACE.TRACK", cmd_face_forward},
+    {"FACE.TRACK.GO", cmd_face_forward},
+    // Remote management of the paired face over the same NUS tunnel.
+    {"NUS.REBOOT", cmd_nus_reboot},
+    {"NUS.BOOTSEL", cmd_nus_bootsel},
+    {"NUS.MODE", cmd_nus_mode},
+#endif
+    {"OTA", cmd_ota},
     {"MODE.GET", cmd_mode_get},
     {"MODE.SET", cmd_mode_set},
     {"MODE.LIST", cmd_mode_list},
+    {"IMU.MAP", cmd_imu_map},
+    {"TILT.STEER", cmd_tilt_steer},
     // Unified profile commands
     {"PROFILE.LIST", cmd_profile_list},
     {"PROFILE.GET", cmd_profile_get},
@@ -2797,12 +4280,16 @@ static const cmd_entry_t commands[] = {
     {"PROFILE.SAVE", cmd_profile_save},
     {"PROFILE.DELETE", cmd_profile_delete},
     {"PROFILE.CLONE", cmd_profile_clone},
+    {"PROFILE.DISABLE", cmd_profile_disable},
+    {"PROFILE.MODES", cmd_profile_modes},
     {"PROFILE.APPLY", cmd_profile_apply},
     {"PROFILE.CLEAR", cmd_profile_clear},
     {"PROFILE.SELECT", cmd_profile_select},
     {"OVERLAY.SET", cmd_overlay_set},
     {"OVERLAY.CLEAR", cmd_overlay_clear},
     {"INPUT.INJECT", cmd_input_inject},
+    {"MOUSE.INJECT", cmd_mouse_inject},
+    {"KEY.INJECT", cmd_key_inject},
     // Legacy CPROFILE.* aliases (deprecated - redirect to unified commands)
     {"CPROFILE.LIST", cmd_cprofile_list},
     {"CPROFILE.GET", cmd_cprofile_get},
@@ -2816,6 +4303,7 @@ static const cmd_entry_t commands[] = {
     {"ROUTER.GET", cmd_router_get},
     {"ROUTER.SET", cmd_router_set},
     {"ROUTER.DPAD.SET", cmd_router_dpad_set},
+    {"ROUTER.SHOULDER.SET", cmd_router_shoulder_set},
     {"CAPS.GET", cmd_caps_get},
     {"OUTPUT.NATIVE.GET", cmd_output_native_get},
     {"OUTPUT.NATIVE.SET", cmd_output_native_set},
@@ -2838,7 +4326,14 @@ static const cmd_entry_t commands[] = {
     {"MAX3421.STATUS", cmd_max3421_status},
 #endif
 #ifdef ENABLE_BTSTACK
+#ifdef CONFIG_DS5_COMPANION
+    {"VOICE.SPEAK", cmd_voice_speak},
+    {"VOICE.CTX", cmd_voice_ctx},
+    {"VOICE.FX", cmd_voice_fx},
+    {"VOICE.STATE", cmd_voice_state},
+#endif
     {"BT.STATUS", cmd_bt_status},
+    {"BLE.DROP", cmd_ble_drop},
     {"BT.BONDS.CLEAR", cmd_bt_bonds_clear},
     {"BT.FORGET", cmd_bt_forget},
     {"WIIMOTE.ORIENT.GET", cmd_wiimote_orient_get},
@@ -2848,6 +4343,10 @@ static const cmd_entry_t commands[] = {
     {"BLE.MODE.GET", cmd_ble_mode_get},
     {"BLE.MODE.SET", cmd_ble_mode_set},
     {"BLE.MODE.LIST", cmd_ble_mode_list},
+    {"BLE.PAIR", cmd_ble_pair},
+    {"BT.TRACE", cmd_bt_trace},
+    {"WIRELESS.POLICY.GET", cmd_wireless_policy_get},
+    {"WIRELESS.POLICY.SET", cmd_wireless_policy_set},
 #endif
 #ifdef CONFIG_PAD_INPUT
     {"PAD.CONFIG.GET", cmd_pad_config_get},
@@ -2859,6 +4358,11 @@ static const cmd_entry_t commands[] = {
     {"SD.INFO", cmd_sd_info},
     {"SD.LIST", cmd_sd_list},
 #endif
+    {"LOG.DUMP",       cmd_log_dump},
+    {"LOG.CLEAR",      cmd_log_clear},
+    {"PS4AUTH.SET",    cmd_ps4auth_set},
+    {"PS4AUTH.STATUS", cmd_ps4auth_status},
+    {"PS4AUTH.CLEAR",  cmd_ps4auth_clear},
     {NULL, NULL}
 };
 

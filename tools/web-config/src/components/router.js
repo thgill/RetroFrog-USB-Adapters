@@ -44,17 +44,23 @@ export class RouterCard {
             </div>
 
             <div class="card">
-                <h2>D-Pad Mode</h2>
+                <h2>D-Pad / Stick Swap</h2>
                 <div class="card-content">
                     <div class="row">
                         <span class="label">Mode</span>
                         <select id="dpadMode">
-                            <option value="0">D-Pad</option>
-                            <option value="1">Left Stick</option>
-                            <option value="2">Right Stick</option>
+                            <option value="0">Normal</option>
+                            <option value="1">D-Pad ↔ Left Stick</option>
+                            <option value="2">D-Pad ↔ Right Stick</option>
+                            <option value="3">Left ↔ Right Stick</option>
                         </select>
                     </div>
-                    <p class="hint">Maps d-pad buttons to analog stick. Applies to all input sources.</p>
+                    <p class="hint">Swaps the d-pad with a stick (both directions), or swaps the two sticks. Also on-controller: SELECT + D-pad Left/Right. Applies to all input sources.</p>
+                    <div class="row">
+                        <span class="label">Shoulder Swap</span>
+                        <input type="checkbox" id="shoulderSwap">
+                    </div>
+                    <p class="hint">Swaps L1↔L2 and R1↔R2. Also on-controller: START + D-pad Up.</p>
                 </div>
             </div>`;
 
@@ -63,6 +69,7 @@ export class RouterCard {
         });
         this.el.querySelector('#routerSaveBtn').addEventListener('click', () => this.save());
         this.el.querySelector('#dpadMode').addEventListener('change', (e) => this.setDpadMode(e.target.value));
+        this.el.querySelector('#shoulderSwap').addEventListener('change', (e) => this.setShoulderSwap(e.target.checked));
 
         // Dirty tracking — only the routing/merge mode card needs save+reboot
         this.dirty = new DirtyTracker(
@@ -77,6 +84,7 @@ export class RouterCard {
             this.el.querySelector('#routingMode').value = config.routing_mode || 0;
             this.el.querySelector('#mergeMode').value = config.merge_mode || 0;
             this.el.querySelector('#dpadMode').value = config.dpad_mode || 0;
+            this.el.querySelector('#shoulderSwap').checked = !!config.shoulder_swap;
             this.el.querySelector('#mergeModeRow').style.display =
                 (config.routing_mode || 0) === 1 ? '' : 'none';
             this.dirty?.snapshot();
@@ -98,14 +106,32 @@ export class RouterCard {
         const body = this.el.querySelector('#topologyBody');
         if (!body) return;
 
-        const inputs = caps.inputs || [];
-        const outputs = caps.outputs || [];
-        const routes = caps.routes || [];
+        let inputs = caps.inputs || [];
+        let outputs = caps.outputs || [];
+        let routes = caps.routes || [];
         const routing = caps.routing || {};
+
+        // In config mode the router is reconfigured to a USB CDC device with no
+        // host inputs. Show the firmware's true topology from the native I/O so
+        // the page reflects what it does on the console (e.g. USB Host → PCEngine).
+        const nat = caps.native || {};
+        if (inputs.length === 0 && (nat.in || nat.out)) {
+            if (nat.in) inputs = [{ name: nat.in, source_name: nat.in_source_name || '', connected: null }];
+            if (nat.out) outputs = [{ name: nat.out, target_name: nat.out_target_name || '', max_players: nat.out_players || 0 }];
+            if (nat.in && nat.out) routes = [{ input_name: nat.in, output_name: nat.out, priority: 0 }];
+        }
 
         const modeLabel = (routing.mode_name || '').replace(/^./, c => c.toUpperCase()) || '—';
         const showMerge = routing.mode_name === 'merge';
         const mergeLabel = (routing.merge_mode_name || '').replace(/^./, c => c.toUpperCase());
+
+        // Summarize by player capacity (from the outputs) rather than a raw
+        // interface count — "1 input · 1 output" reads like one controller and
+        // hides the multitap. Fall back to the interface count if no capacity.
+        const totalPlayers = outputs.reduce((s, o) => s + (o.max_players || 0), 0);
+        const capacityLabel = totalPlayers === 0
+            ? `${inputs.length} input${inputs.length === 1 ? '' : 's'} · ${outputs.length} output${outputs.length === 1 ? '' : 's'}`
+            : totalPlayers === 1 ? 'single player' : `up to ${totalPlayers} players`;
 
         const inputCard = inputs.length === 0
             ? '<div class="topology-empty">No inputs registered</div>'
@@ -144,7 +170,7 @@ export class RouterCard {
             <div class="topology-header">
                 <span class="topology-tag topology-tag-mode">${modeLabel}</span>
                 ${showMerge ? `<span class="topology-tag">strategy: ${mergeLabel}</span>` : ''}
-                <span class="hint">${inputs.length} input${inputs.length === 1 ? '' : 's'} · ${outputs.length} output${outputs.length === 1 ? '' : 's'}</span>
+                <span class="hint">${capacityLabel}</span>
             </div>
             <div class="topology-grid">
                 <div class="topology-col">
@@ -185,10 +211,19 @@ export class RouterCard {
     async setDpadMode(mode) {
         try {
             await this.protocol.setDpadMode(parseInt(mode));
-            const names = ['D-Pad', 'Left Stick', 'Right Stick'];
-            this.log(`D-Pad mode: ${names[parseInt(mode)]}`, 'success');
+            const names = ['Normal', 'D-Pad ↔ Left Stick', 'D-Pad ↔ Right Stick', 'Left ↔ Right Stick'];
+            this.log(`D-Pad / Stick swap: ${names[parseInt(mode)]}`, 'success');
         } catch (e) {
             this.log(`Failed to set D-Pad mode: ${e.message}`, 'error');
+        }
+    }
+
+    async setShoulderSwap(on) {
+        try {
+            await this.protocol.setShoulderSwap(on);
+            this.log(`Shoulder swap: ${on ? 'on' : 'off'}`, 'success');
+        } catch (e) {
+            this.log(`Failed to set shoulder swap: ${e.message}`, 'error');
         }
     }
 }

@@ -1,5 +1,7 @@
 // sony_ds4.c
 #include "sony_ds4.h"
+#include "ds5_auth.h"
+#include "p5general_host.h"
 #include <stdio.h>
 #include "core/buttons.h"
 #include "core/router/router.h"
@@ -41,6 +43,10 @@ static ds4_device_t ds4_devices[MAX_DEVICES] = { 0 };
 #define DS4_AUTH_SIGNATURE_SIZE  (DS4_AUTH_PAGE_SIZE * DS4_AUTH_SIGNATURE_PAGES) // 1064 bytes
 #define DS4_AUTH_STATUS_SIZE     16   // Status report size
 #define DS4_AUTH_REPORT_SIZE     64   // Full report size with report ID
+#define DS4_AUTH_STEP_MS         3    // Min gap between auth control transfers
+                                      // so they don't starve input polling
+#define DS4_AUTH_TIMEOUT_MS      1500 // Abort a stalled handshake after this so a
+                                      // wedged re-auth stops hammering the bus
 
 // Internal auth states (matching hid-remapper)
 typedef enum {
@@ -131,7 +137,22 @@ bool diff_report_ds4(sony_ds4_report_t const* rpt1, sony_ds4_report_t const* rpt
   result |= memcmp(&rpt1->rz + 1, &rpt2->rz + 1, 2);
   result |= (rpt1->ps != rpt2->ps);
   result |= (rpt1->tpad != rpt2->tpad);
+  // Both touch fingers, position AND the down/up bit — checking only f1's
+  // position missed finger releases (the down bit flips without the coords
+  // changing) and finger 2 entirely, leaving a released touch stuck active.
+  result |= (rpt1->tpad_f1_down != rpt2->tpad_f1_down);
   result |= memcmp(&rpt1->tpad_f1_pos, &rpt2->tpad_f1_pos, 3);
+  result |= (rpt1->tpad_f2_down != rpt2->tpad_f2_down);
+  result |= memcmp(&rpt1->tpad_f2_pos, &rpt2->tpad_f2_pos, 3);
+
+  // Motion: a DS4 streams gyro/accel every report. Submit on ANY change so the
+  // output IMU tracks at the full poll rate (matching a direct connection) —
+  // mirrors the DS5 fix (33578ed1). Sensor noise means a real controller is
+  // essentially never identical frame-to-frame, so this streams continuously.
+  for (int i = 0; i < 3; i++) {
+    result |= (rpt1->gyro[i]  != rpt2->gyro[i]);
+    result |= (rpt1->accel[i] != rpt2->accel[i]);
+  }
 
   return result;
 }
@@ -309,10 +330,13 @@ void input_sony_ds4(uint8_t dev_addr, uint8_t instance, uint8_t const* report, u
         .analog = {analog_1x, analog_1y, analog_2x, analog_2y, analog_l, analog_r},
         .delta_x = touchpad_delta_x,  // Touchpad horizontal swipe as mouse-like delta
         .keys = 0,
-        // Motion data (DS4 has full 3-axis gyro and accel)
+        // Motion data (DS4 has full 3-axis gyro and accel).
+        // DS4 native frame already matches the canonical SDL frame -> identity.
         .has_motion = true,
         .accel = {ds4_report.accel[0], ds4_report.accel[1], ds4_report.accel[2]},
         .gyro = {ds4_report.gyro[0], ds4_report.gyro[1], ds4_report.gyro[2]},
+        .gyro_range = 2000,   // ±2000 dps, ±32767 full-scale
+        .accel_range = 4000,  // ±4g
         .battery_level = bat_level,
         .battery_charging = bat_charging,
         // Touchpad (2-finger capacitive)
@@ -449,6 +473,32 @@ bool ds4_auth_is_available(void) {
     return ds4_auth.ds4_available;
 }
 
+// Diagnostic: flash the auth DS4's lightbar (green) so a handshake is observable
+// with no serial tap and without rumbling the pad off the shelf. Green while a
+// fresh nonce is signing, off when the signature is ready. The auth DS4 isn't
+// driven for normal output (init not called), so its lightbar is free to use.
+static void ds4_auth_indicate(bool on) {
+    if (!ds4_auth.ds4_available) return;
+    sony_ds4_output_report_t r = {0};
+    r.set_led = 1;
+    r.lightbar_red   = 0;
+    r.lightbar_green = on ? 255 : 0;
+    r.lightbar_blue  = 0;
+    tuh_hid_send_report(ds4_auth.dev_addr, ds4_auth.instance, 5, &r, sizeof(r));
+}
+
+// Self-timed diagnostic flash: green on now, auto-off after ~350ms (cleared in
+// ds4_auth_task). Signals a console-side event (A relays it over the link)
+// distinctly from the signing flash. 0 = no pending pulse.
+static uint32_t ds4_auth_diag_off_ms = 0;
+// Deadline for the in-progress handshake; 0 = no handshake running.
+static uint32_t ds4_auth_deadline_ms = 0;
+void ds4_auth_diag_pulse(void) {
+    if (!ds4_auth.ds4_available) return;
+    ds4_auth_indicate(true);
+    ds4_auth_diag_off_ms = platform_time_ms() + 350;
+}
+
 // Get the current auth state
 ds4_auth_state_t ds4_auth_get_state(void) {
     return ds4_auth.state;
@@ -498,40 +548,65 @@ bool ds4_auth_send_nonce(const uint8_t* data, uint16_t len) {
         ds4_auth.nonce_page_sending = 0;
         ds4_auth.internal = AUTH_SENDING_RESET;  // First get 0xF3 from DS4
         ds4_auth.state = DS4_AUTH_STATE_NONCE_PENDING;
+        ds4_auth_deadline_ms = platform_time_ms() + DS4_AUTH_TIMEOUT_MS;  // arm watchdog
+        // (no DS4 output report here: sending one mid-auth jammed the shared
+        //  USB host and stalled the other controller's input passthrough)
         printf("[DS4 Auth] All 5 nonce pages received, starting auth with DS4\n");
     }
 
     return true;
 }
 
-// Get cached signature response (0xF1) for a specific page
-// Format: [nonce_id][page][0][signature_data(56)][padding(4)]
+// PS4 auth reports carry a CRC32 over [report_id .. payload] in their last 4
+// bytes, LITTLE-ENDIAN. Standard reflected CRC-32 (poly 0xEDB88320, init and
+// final-xor 0xFFFFFFFF — same as zlib/PKZIP), and it MUST include the report ID
+// byte even though TinyUSB carries the ID separately (matches GP2040-CE). We
+// were never appending this, so the console rejected every signature page.
+static uint32_t ds4_auth_crc32(uint8_t report_id, const uint8_t* data, uint16_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    uint8_t first = report_id;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint8_t* p = pass == 0 ? &first : data;
+        uint16_t n = pass == 0 ? 1 : len;
+        for (uint16_t i = 0; i < n; i++) {
+            crc ^= p[i];
+            for (int b = 0; b < 8; b++)
+                crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+        }
+    }
+    return ~crc;
+}
+
+// Get cached signature response (0xF1) for a specific page. Returns the 63-byte
+// payload (report ID stripped; TinyUSB prepends it): [nonce_id][page][0]
+// [signature_data(56)][crc32(4, LE)]. Returns the payload length (63).
 uint16_t ds4_auth_get_signature(uint8_t* buffer, uint16_t max_len, uint8_t page) {
-    // Zero entire buffer first to avoid uninitialized bytes
+    if (max_len < 63) return 0;
     memset(buffer, 0, max_len);
 
     if (page >= DS4_AUTH_SIGNATURE_PAGES) {
         TU_LOG1("[DS4 Auth] Invalid signature page request %d\r\n", page);
-        return max_len;
+        return 0;
     }
 
-    // Build response: [nonce_id][page][0][signature_data(56)]
+    // [nonce_id][page][0][signature_data(56)] = 59 bytes at buffer[0..58]
     buffer[0] = ds4_auth.nonce_id;
     buffer[1] = page;
     buffer[2] = 0;
-
-    if (!ds4_auth.signature_ready) {
-        // Signature not ready - already zeroed above
-        TU_LOG1("[DS4 Auth] Signature page %d requested but not ready (have %d pages)\r\n",
-                page, ds4_auth.signature_pages_fetched);
-    } else {
-        // Copy signature data for this page
+    if (ds4_auth.signature_ready) {
         memcpy(&buffer[3], &ds4_auth.signature_buffer[page * DS4_AUTH_PAGE_SIZE], 56);
+    } else {
+        TU_LOG1("[DS4 Auth] Signature page %d requested but not ready (have %d)\r\n",
+                page, ds4_auth.signature_pages_fetched);
     }
 
-    TU_LOG1("[DS4 Auth] Returning signature page %d (id=%d, ready=%d)\r\n",
-            page, ds4_auth.nonce_id, ds4_auth.signature_ready);
-    return max_len;
+    // CRC32 over [0xF1][buffer[0..58]] (60 bytes incl. report ID) -> buffer[59..62] LE
+    uint32_t crc = ds4_auth_crc32(DS4_AUTH_REPORT_SIGNATURE, buffer, 59);
+    buffer[59] = (uint8_t)(crc & 0xFF);
+    buffer[60] = (uint8_t)((crc >> 8) & 0xFF);
+    buffer[61] = (uint8_t)((crc >> 16) & 0xFF);
+    buffer[62] = (uint8_t)((crc >> 24) & 0xFF);
+    return 63;
 }
 
 // Get next signature page (auto-incrementing)
@@ -551,20 +626,47 @@ uint16_t ds4_auth_get_next_signature(uint8_t* buffer, uint16_t max_len) {
     return len;
 }
 
-// Get auth status (0xF2)
-// Format: [nonce_id][status][zeros(13)]
-// status: 0 = ready, 16 = signing
+// Get auth status (0xF2). 15-byte payload (report ID stripped; TinyUSB prepends
+// it): [nonce_id][status][zeros(9)][crc32(4, LE)]. status 0=ready, 16=signing.
+// Ready only once WE'VE fetched all 19 pages (signature_ready), so the console
+// doesn't start reading 0xF1 before the pages are cached.
 uint16_t ds4_auth_get_status(uint8_t* buffer, uint16_t max_len) {
-    // Zero entire buffer first to avoid uninitialized bytes
+    if (max_len < 15) return 0;
     memset(buffer, 0, max_len);
 
     buffer[0] = ds4_auth.nonce_id;
     buffer[1] = ds4_auth.signature_ready ? 0 : 16;
+    // buffer[2..10] = 0 (already)
 
-    TU_LOG1("[DS4 Auth] Status: %s (id=%d, ready=%d)\r\n",
-            ds4_auth.signature_ready ? "ready" : "signing",
-            ds4_auth.nonce_id, ds4_auth.signature_ready);
-    return max_len;
+    // CRC32 over [0xF2][buffer[0..10]] (12 bytes incl. report ID) -> buffer[11..14] LE
+    uint32_t crc = ds4_auth_crc32(DS4_AUTH_REPORT_STATUS, buffer, 11);
+    buffer[11] = (uint8_t)(crc & 0xFF);
+    buffer[12] = (uint8_t)((crc >> 8) & 0xFF);
+    buffer[13] = (uint8_t)((crc >> 16) & 0xFF);
+    buffer[14] = (uint8_t)((crc >> 24) & 0xFF);
+
+    TU_LOG1("[DS4 Auth] Status: %s (id=%d)\r\n",
+            ds4_auth.signature_ready ? "ready" : "signing", ds4_auth.nonce_id);
+    return 15;
+}
+
+// --- Dual-chip bridge accessors (host side B) ---
+bool ds4_auth_signature_ready(void) { return ds4_auth.signature_ready; }
+uint8_t ds4_auth_get_nonce_id(void) { return ds4_auth.nonce_id; }
+
+void ds4_auth_copy_raw_page(uint8_t page, uint8_t* out56) {
+    if (page >= DS4_AUTH_SIGNATURE_PAGES) { memset(out56, 0, DS4_AUTH_PAGE_SIZE); return; }
+    memcpy(out56, &ds4_auth.signature_buffer[page * DS4_AUTH_PAGE_SIZE], DS4_AUTH_PAGE_SIZE);
+}
+
+void ds4_auth_feed_nonce_page(uint8_t nonce_id, uint8_t page, const uint8_t* data56) {
+    // Re-frame as the console's 0xF0 payload and reuse the normal path.
+    uint8_t buf[59];
+    buf[0] = nonce_id;
+    buf[1] = page;
+    buf[2] = 0;
+    memcpy(&buf[3], data56, DS4_AUTH_PAGE_SIZE);
+    ds4_auth_send_nonce(buf, sizeof(buf));
 }
 
 // Reset auth state (0xF3)
@@ -589,6 +691,12 @@ uint8_t* ds3_get_verify_buffer(void) {
 void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t idx,
                                     uint8_t report_id, uint8_t report_type,
                                     uint16_t len) {
+    // DualSense (PS5) auth passthrough shares this global callback. Route first;
+    // it only consumes completions for its own registered DualSense.
+    if (ds5_auth_on_get_report_complete(dev_addr, idx, report_id, len)) return;
+    // P5General dongle relay shares this global callback too.
+    if (p5general_host_on_get_report_complete(dev_addr, idx, report_id, len)) return;
+
     // Handle DS3 BT address verification (report 0xF5)
     if (report_id == 0xF5) {
         // Notify DS3 driver that GET_REPORT completed
@@ -658,6 +766,7 @@ void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t idx,
                 ds4_auth.internal = AUTH_IDLE;
                 ds4_auth.signature_ready = true;
                 ds4_auth.state = DS4_AUTH_STATE_READY;
+                ds4_auth_deadline_ms = 0;  // handshake done, disarm watchdog
                 printf("[DS4 Auth] CB: All 19 signature pages received, auth ready!\n");
             }
             break;
@@ -668,6 +777,11 @@ void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t idx,
 void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t idx,
                                     uint8_t report_id, uint8_t report_type,
                                     uint16_t len) {
+    // DualSense (PS5) auth passthrough shares this global callback (see above).
+    if (ds5_auth_on_set_report_complete(dev_addr, idx, report_id, len)) return;
+    // P5General dongle relay shares this global callback too.
+    if (p5general_host_on_set_report_complete(dev_addr, idx, report_id, len)) return;
+
     // DS3 BT address programming complete
     if (report_id == 0xF5) {
         if (len == 8) {
@@ -713,6 +827,29 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t idx,
 // Auth task - state machine matching hid-remapper approach
 void ds4_auth_task(void) {
     if (!ds4_auth.ds4_available || ds4_auth.busy) return;
+    if (ds4_auth.internal == AUTH_IDLE) return;
+
+    // Watchdog: if a handshake stalls (e.g. the DS4 stops returning signing
+    // status after repeated re-auths), abort it so we stop hammering 0xF2 on the
+    // shared bus. Freeing the bus lets input recover instead of crawling forever;
+    // the next console nonce starts a fresh handshake.
+    if (ds4_auth_deadline_ms && (int32_t)(platform_time_ms() - ds4_auth_deadline_ms) >= 0) {
+        printf("[DS4 Auth] Handshake timed out -> abort, freeing bus\n");
+        ds4_auth.internal = AUTH_IDLE;
+        ds4_auth.busy = false;
+        ds4_auth_deadline_ms = 0;
+        return;
+    }
+
+    // Throttle the handshake's control transfers. On the shared PIO-USB bus a
+    // back-to-back burst (the 0xF2 signing-status poll loop + 19 signature
+    // fetches) starves the other controllers' interrupt polling, so input gets
+    // delayed/missed whenever (re-)auth runs. One step per few ms leaves bus
+    // time for input while still finishing auth well within the console's wait.
+    static uint32_t last_step_ms = 0;
+    uint32_t now_ms = platform_time_ms();
+    if ((uint32_t)(now_ms - last_step_ms) < DS4_AUTH_STEP_MS) return;
+    last_step_ms = now_ms;
 
     switch (ds4_auth.internal) {
         case AUTH_IDLE:
@@ -739,6 +876,17 @@ void ds4_auth_task(void) {
             memcpy(&ds4_auth.report_buffer[3],
                    &ds4_auth.nonce_buffer[page * DS4_AUTH_PAGE_SIZE],
                    DS4_AUTH_PAGE_SIZE);
+
+            // Append CRC32 over [0xF0][buffer[0..58]] (LE) — the DS4 validates
+            // the nonce report's CRC exactly like the console validates ours.
+            // Without it the DS4 rejects the nonce and never signs it correctly,
+            // so the console rejects the signature (single failed auth -> 8-min
+            // grace -> drop). Mirrors the outgoing 0xF1/0xF2 framing.
+            uint32_t ncrc = ds4_auth_crc32(DS4_AUTH_REPORT_NONCE, ds4_auth.report_buffer, 59);
+            ds4_auth.report_buffer[59] = (uint8_t)(ncrc);
+            ds4_auth.report_buffer[60] = (uint8_t)(ncrc >> 8);
+            ds4_auth.report_buffer[61] = (uint8_t)(ncrc >> 16);
+            ds4_auth.report_buffer[62] = (uint8_t)(ncrc >> 24);
 
             printf("[DS4 Auth] Task: Sending nonce page %d to DS4\n", page);
             tuh_hid_set_report(ds4_auth.dev_addr, ds4_auth.instance,

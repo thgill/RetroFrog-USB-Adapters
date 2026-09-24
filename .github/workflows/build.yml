@@ -3,6 +3,11 @@ name: Build & Release
 on:
   push:
     branches: [main]
+  # Open PRs against main get a build-only run: the three matrix jobs compile
+  # and stop there. A branch pushed without a PR runs nothing, so work in
+  # progress doesn't burn minutes or storage.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       bump_version:
@@ -16,9 +21,19 @@ on:
           - minor
           - major
 
+# One in-flight run per PR — a new push supersedes the previous build. Non-PR
+# runs fall through to run_id, which is unique per run, so pushes to main and
+# release dispatches are never queued behind or cancelled by anything.
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Build RP2040/RP2350 apps in parallel using matrix (Docker + pico-sdk)
   build-rpi:
+    needs: check-version
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,6 +48,7 @@ jobs:
           - usb2neogeo_kb2040
           - usb2neogeo_pico
           - usb2neogeo_rp2040zero
+          - usb2neogeo_te_rp2040zero
           - n642dc_kb2040
           - usb23do_rp2040zero
           - usb2uart_kb2040
@@ -58,10 +74,16 @@ jobs:
           - nes2usb_pico_w
           - gc2usb_kb2040
           - gc2usb_rp2040zero
+          - gc2usb_pico
+          - jag2usb_pico
+          - jag2usb_pico_w
           - nes2usb_kb2040
           - pce2usb_kb2040
           - pce2usb_pico
           - pce2usb_pico_w
+          - psx2usb_pico
+          - psx2usb_kb2040
+          - psx2usb_qtpy
           - jvs2usb_rp2040zero
           - neogeo2usb_kb2040
           - neogeo2usb_rp2040zero
@@ -73,18 +95,24 @@ jobs:
           - controller_fisherprice_v1_kb2040
           - controller_fisherprice_v2_kb2040
           - controller_alpakka_pico
-          - controller_btusb_pico_w
-          - controller_btusb_pico2_w
-          - controller_btusb_rp2040_abb
+          - universal_pico_w
+          - universal_pico2_w
+          - universal_rp2040_abb
           - lodgenet2usb_pico
           - lodgenet2usb_pico2
           - lodgenet2n64_pico
           - lodgenet2gc_pico
+          - 24g2usb_pico2_w
+          - 24g2usb_pico_w
+          - 24g2usb_pico
+          - 24g2usb_pico2
+          - 24g2usb_rp2350zero
 
     steps:
       - name: Checkout code with submodules
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.check-version.outputs.sha }}
           token: ${{ secrets.JOYBOT_PAT || secrets.GITHUB_TOKEN }}
           submodules: recursive
           fetch-depth: 0
@@ -104,7 +132,7 @@ jobs:
 
       - name: Get commit hash
         id: commit
-        run: echo "hash=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: echo "hash=$(echo ${{ needs.check-version.outputs.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Build ${{ matrix.app }}
         run: |
@@ -127,6 +155,9 @@ jobs:
   # Build ESP32 targets (separate job — needs ESP-IDF toolchain)
   build-esp:
     name: build-esp (${{ matrix.app }})
+    needs: check-version
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -138,24 +169,25 @@ jobs:
             config_app: bt2usb
             bin_name: bt2usb
             uf2_family: "0xc47e5767"
-          - app: controller_btusb_feather_esp32s3
+          - app: universal_feather_esp32s3
             idf_target: esp32s3
             board: feather_esp32s3
-            config_app: controller_btusb
-            bin_name: controller_btusb
+            config_app: universal
+            bin_name: universal
             uf2_family: "0xc47e5767"
 
     steps:
       - name: Checkout code with submodules
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.check-version.outputs.sha }}
           token: ${{ secrets.JOYBOT_PAT || secrets.GITHUB_TOKEN }}
           submodules: recursive
           fetch-depth: 0
 
       - name: Get commit hash
         id: commit
-        run: echo "hash=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: echo "hash=$(echo ${{ needs.check-version.outputs.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Build ${{ matrix.app }}
         run: |
@@ -167,6 +199,7 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace/esp \
+            -e GIT_COMMIT=${{ steps.commit.outputs.hash }} \
             espressif/idf:v6.0-beta2 \
             bash -c "SDKCONFIG_DEFAULTS='$SDKCFG' idf.py -DCONFIG_APP=${{ matrix.config_app }} -DCONFIG_BOARD=${{ matrix.board }} build"
 
@@ -177,7 +210,7 @@ jobs:
           mkdir -p releases
           python3 esp/tools/uf2conv.py esp/build/joypad_${{ matrix.bin_name }}.bin \
             --base 0 --family ${{ matrix.uf2_family }} \
-            --output releases/joypad_${{ steps.commit.outputs.hash }}_${{ matrix.app }}.uf2 \
+            --output releases/joypad_os_${{ steps.commit.outputs.hash }}_${{ matrix.app }}.uf2 \
             --convert
 
       - name: Upload firmware
@@ -191,6 +224,9 @@ jobs:
   # Build nRF52840 targets (separate job — needs nRF Connect SDK)
   build-nrf:
     name: build-nrf (${{ matrix.app }})
+    needs: check-version
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -199,6 +235,17 @@ jobs:
           - app: bt2usb_seeed_xiao_nrf52840
             board: xiao_ble
             app_type: bt2usb
+          # board = overlay/conf name under nrf/boards/; zephyr_board = the
+          # real Zephyr board target when it differs (nrf/Makefile does the
+          # same mapping locally).
+          - app: bt2usb_makerdiary_nrf52840
+            board: makerdiary_nrf52840
+            zephyr_board: nrf52840_mdk_usb_dongle
+            app_type: bt2usb
+          - app: universal_makerdiary_nrf52840
+            board: makerdiary_nrf52840
+            zephyr_board: nrf52840_mdk_usb_dongle
+            app_type: universal
           - app: bt2usb_feather_nrf52840
             board: adafruit_feather_nrf52840
             app_type: bt2usb
@@ -208,14 +255,18 @@ jobs:
           - app: btusb2usb_feather_nrf52840
             board: adafruit_feather_nrf52840
             app_type: btusb2usb
-          - app: controller_btusb_feather_nrf52840
+          - app: universal_feather_nrf52840
             board: adafruit_feather_nrf52840
-            app_type: controller_btusb
+            app_type: universal
+          - app: universal_seeed_xiao_nrf52840
+            board: xiao_ble
+            app_type: universal
 
     steps:
       - name: Checkout code with submodules
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.check-version.outputs.sha }}
           token: ${{ secrets.JOYBOT_PAT || secrets.GITHUB_TOKEN }}
           submodules: recursive
           fetch-depth: 0
@@ -260,12 +311,14 @@ jobs:
 
       - name: Get commit hash
         id: commit
-        run: echo "hash=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: echo "hash=$(echo ${{ needs.check-version.outputs.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Build ${{ matrix.app }}
         working-directory: nrf
+        env:
+          GIT_COMMIT: ${{ steps.commit.outputs.hash }}
         run: |
-          west build -b ${{ matrix.board }} . --pristine=always -- \
+          west build -b ${{ matrix.zephyr_board || matrix.board }} . --pristine=always -- \
             -DAPP_TYPE=${{ matrix.app_type }} \
             $([ -f boards/${{ matrix.board }}.overlay ] && echo "-DDTC_OVERLAY_FILE=$(pwd)/boards/${{ matrix.board }}.overlay") \
             $(EXTRA=""; \
@@ -277,7 +330,7 @@ jobs:
         run: |
           mkdir -p releases
           cp nrf/build/nrf/zephyr/zephyr.uf2 \
-            releases/joypad_${{ steps.commit.outputs.hash }}_${{ matrix.app }}.uf2
+            releases/joypad_os_${{ steps.commit.outputs.hash }}_${{ matrix.app }}.uf2
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
@@ -289,7 +342,11 @@ jobs:
 
   # Collect all artifacts and create combined release package
   collect:
-    needs: [build-rpi, build-esp, build-nrf]
+    needs: [check-version, build-rpi, build-esp, build-nrf]
+    # Packaging only — PR runs stop after the build jobs. This is where the 30
+    # per-app artifacts are produced, so skipping it keeps PR storage at the
+    # matrix jobs' retention-days: 1.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Download all firmware artifacts
@@ -301,7 +358,7 @@ jobs:
 
       - name: Get commit hash
         id: commit
-        run: echo "hash=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: echo "hash=$(echo ${{ needs.check-version.outputs.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Organize artifacts
         run: |
@@ -311,10 +368,10 @@ jobs:
           # Known board suffixes (order matters - check longer suffixes first)
           BOARDS="feather_esp32s3 esp32s3 seeed_xiao_nrf52840 feather_nrf52840_max3421 feather_nrf52840 pico2_w pico2 pico_w rp2040_abb rp2040zero rp2350usba kb2040 feather_rp2040_usb_host_max3421 feather_rp2040_usb_host feather_rp2040_max3421 feather_rp2040 feather pico macropad"
 
-          for file in releases/joypad_*.uf2; do
+          for file in releases/joypad_os_*.uf2; do
             if [ -f "$file" ]; then
               basename=$(basename "$file" .uf2)
-              app_board=${basename#joypad_*_}
+              app_board=${basename#joypad_os_*_}
 
               app="$app_board"
               for board in $BOARDS; do
@@ -336,215 +393,245 @@ jobs:
       - name: Upload usb2pce
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2pce
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2pce
           path: organized/usb2pce/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2gc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2gc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2gc
           path: organized/usb2gc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2nuon
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2nuon
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2nuon
           path: organized/usb2nuon/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2dc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2dc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2dc
           path: organized/usb2dc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2neogeo
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2neogeo
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2neogeo
           path: organized/usb2neogeo/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload n642dc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_n642dc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_n642dc
           path: organized/n642dc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb23do
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb23do
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb23do
           path: organized/usb23do/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2uart
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2uart
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2uart
           path: organized/usb2uart/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload usb2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_usb2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_usb2usb
           path: organized/usb2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload bt2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_bt2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_bt2usb
           path: organized/bt2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload bt2n64
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_bt2n64
+          name: joypad_os_${{ steps.commit.outputs.hash }}_bt2n64
           path: organized/bt2n64/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload bt2nuon
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_bt2nuon
+          name: joypad_os_${{ steps.commit.outputs.hash }}_bt2nuon
           path: organized/bt2nuon/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload n642nuon
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_n642nuon
+          name: joypad_os_${{ steps.commit.outputs.hash }}_n642nuon
           path: organized/n642nuon/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload btusb2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_btusb2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_btusb2usb
           path: organized/btusb2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload snes2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_snes2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_snes2usb
           path: organized/snes2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload n642usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_n642usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_n642usb
           path: organized/n642usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload gc2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_gc2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_gc2usb
           path: organized/gc2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload lodgenet2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_lodgenet2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_lodgenet2usb
           path: organized/lodgenet2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload lodgenet2n64
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_lodgenet2n64
+          name: joypad_os_${{ steps.commit.outputs.hash }}_lodgenet2n64
           path: organized/lodgenet2n64/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload lodgenet2gc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_lodgenet2gc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_lodgenet2gc
           path: organized/lodgenet2gc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload nes2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_nes2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_nes2usb
           path: organized/nes2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload pce2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_pce2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_pce2usb
           path: organized/pce2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload jvs2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_jvs2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_jvs2usb
           path: organized/jvs2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload neogeo2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_neogeo2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_neogeo2usb
           path: organized/neogeo2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload wii2usb
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_wii2usb
+          name: joypad_os_${{ steps.commit.outputs.hash }}_wii2usb
           path: organized/wii2usb/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload wii2gc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_wii2gc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_wii2gc
           path: organized/wii2gc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload bt2wiiext
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_bt2wiiext
+          name: joypad_os_${{ steps.commit.outputs.hash }}_bt2wiiext
           path: organized/bt2wiiext/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload bt2gc
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_bt2gc
+          name: joypad_os_${{ steps.commit.outputs.hash }}_bt2gc
           path: organized/bt2gc/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload controllers
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_controllers
+          name: joypad_os_${{ steps.commit.outputs.hash }}_controllers
           path: |
             organized/controller_fisherprice_v1/*.uf2
             organized/controller_fisherprice_v2/*.uf2
             organized/controller_alpakka/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
-      - name: Upload controller_btusb
+      - name: Upload universal
         uses: actions/upload-artifact@v4
         with:
-          name: joypad_${{ steps.commit.outputs.hash }}_controller_btusb
-          path: organized/controller_btusb/*.uf2
+          name: joypad_os_${{ steps.commit.outputs.hash }}_universal
+          path: organized/universal/*.uf2
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload release-firmware
         uses: actions/upload-artifact@v4
@@ -570,25 +657,39 @@ jobs:
           ls -lh releases/*.uf2 >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
-  # Check version and optionally bump it (only on manual trigger)
+  # Resolve the version to build, bumping it first on a manual release trigger.
+  #
+  # This job MUST run before the build jobs. When CI bumps VERSION it creates a
+  # new commit, and the build jobs have to check that commit out — otherwise they
+  # compile the pre-bump tree and every UF2 self-reports the OLD version through
+  # JOYPAD_VERSION (CDC `INFO`, the boot banner, and the USB bcdDevice derived in
+  # src/CMakeLists.txt). That is exactly what shipped: the v2.3.0 assets report
+  # 2.2.0 and the v2.4.0 assets report 2.3.0.
   check-version:
-    if: github.event_name == 'workflow_dispatch'
+    # Runs on PRs too — the build jobs need its `sha` output. Its only writes
+    # (the version bump and its commit) are already gated on workflow_dispatch,
+    # so on a PR this is read-only: resolve the SHA, read VERSION, decide
+    # should_release.
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
       should_release: ${{ steps.check.outputs.should_release }}
+      sha: ${{ steps.resolve.outputs.sha }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.JOYBOT_PAT }}
+          # JOYBOT_PAT is what pushes the bump commit, but it is empty for a
+          # fork pull request. Fall back so checkout still works there; the
+          # bump steps are event-guarded and never run on that path anyway.
+          token: ${{ secrets.JOYBOT_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Bump version (if requested)
-        if: github.event.inputs.bump_version != 'none'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.bump_version != 'none'
         id: bump
         run: |
           CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
@@ -617,7 +718,8 @@ jobs:
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and push version bump
-        if: github.event.inputs.bump_version != 'none'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.bump_version != 'none'
+        id: commit_bump
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Bump version to ${{ steps.bump.outputs.new_version }}"
@@ -635,12 +737,41 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "📦 Current VERSION: ${VERSION}"
 
+      # The commit the build jobs must check out. When the bump ran, that is the
+      # bump commit (which github.sha predates); otherwise the triggering commit.
+      - name: Resolve build ref
+        id: resolve
+        run: |
+          SHA="${{ steps.commit_bump.outputs.commit_hash }}"
+          if [ -z "$SHA" ]; then
+            SHA="${{ github.sha }}"
+            echo "🔗 No version bump — building ${SHA}"
+          else
+            echo "🔗 Version bumped — building the bump commit ${SHA}"
+          fi
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+
+          # Guard the whole point of this job: the tree the builds will compile
+          # must carry the version we are about to release.
+          REF_VERSION=$(git show "${SHA}:VERSION" | tr -d '[:space:]')
+          if [ "$REF_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Build ref ${SHA} has VERSION ${REF_VERSION}, expected ${{ steps.version.outputs.version }}"
+            exit 1
+          fi
+          echo "✅ ${SHA} carries VERSION ${REF_VERSION}"
+
       - name: Check if should create release
         id: check
         run: |
           VERSION="${{ steps.version.outputs.version }}"
 
-          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+          # A release is only ever cut from a manual dispatch. check-version now
+          # runs on push too (the build jobs need its ref), so without this guard
+          # an ordinary push to main with an untagged VERSION would publish one.
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "⏭️  Not a manual dispatch — no release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          elif git rev-parse "v${VERSION}" >/dev/null 2>&1; then
             echo "⏭️  Version v${VERSION} already has a release"
             echo "should_release=false" >> $GITHUB_OUTPUT
           else
@@ -652,7 +783,7 @@ jobs:
   # Create GitHub Release (only on manual trigger when version is new)
   create-release:
     needs: [collect, check-version]
-    if: needs.check-version.outputs.should_release == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -670,11 +801,11 @@ jobs:
           echo "📦 Preparing v${VERSION} release:"
 
           cd releases
-          for file in joypad_*_*.uf2; do
+          for file in joypad_os_*_*.uf2; do
             if [ -f "$file" ]; then
-              temp="${file#joypad_}"
+              temp="${file#joypad_os_}"
               suffix="${temp#*_}"
-              newname="joypad_${VERSION}_${suffix}"
+              newname="joypad_os_${VERSION}_${suffix}"
               echo "Renaming: $file -> $newname"
               mv "$file" "$newname"
             fi
@@ -691,7 +822,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ needs.check-version.outputs.version }}
-          name: Joypad v${{ needs.check-version.outputs.version }}
+          name: JoypadOS v${{ needs.check-version.outputs.version }}
           body: |
             📋 **See [CHANGELOG.md](https://github.com/joypad-ai/joypad-os/blob/main/CHANGELOG.md) for full release notes.**
 

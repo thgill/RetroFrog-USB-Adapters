@@ -24,7 +24,10 @@ extern "C" {
 // ============================================================================
 
 #define CDC_SYNC_BYTE       0xAA
-#define CDC_MAX_PAYLOAD     1024    // Max payload size (JSON commands)
+// CDC_MAX_PAYLOAD: 1536 bytes to accommodate PS4AUTH.SET command which carries
+// ~1100 bytes of base64-encoded RSA key material in a single JSON payload.
+// Cost: +2KB RAM (receive buffer + response buffer). RP2040 has 264KB SRAM.
+#define CDC_MAX_PAYLOAD     1536    // Max payload size (JSON commands)
 #define CDC_HEADER_SIZE     5       // sync(1) + len(2) + type(1) + seq(1)
 #define CDC_CRC_SIZE        2
 #define CDC_MAX_PACKET      (CDC_HEADER_SIZE + CDC_MAX_PAYLOAD + CDC_CRC_SIZE)
@@ -72,6 +75,7 @@ typedef enum {
     CDC_RX_PAYLOAD,     // Receiving payload
     CDC_RX_CRC_LO,      // Waiting for CRC low byte
     CDC_RX_CRC_HI,      // Waiting for CRC high byte
+    CDC_RX_TEXT,        // Accumulating a newline-delimited text JSON command
 } cdc_rx_state_t;
 
 typedef struct {
@@ -79,6 +83,7 @@ typedef struct {
     cdc_packet_t packet;
     uint16_t payload_pos;
     uint16_t crc_received;
+    uint32_t last_rx_ms;    // for mid-frame timeout resync
 } cdc_receiver_t;
 
 // ============================================================================
@@ -100,6 +105,7 @@ typedef struct {
     bool input_streaming;       // Input event streaming enabled
     bool log_streaming;         // Debug log streaming enabled
     bool ble_transport;         // True if transport is BLE NUS (slower throttle)
+    bool text_mode;             // Last command arrived as text → reply as text
 } cdc_protocol_t;
 
 // ============================================================================

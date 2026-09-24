@@ -8,6 +8,7 @@
 #include "core/buttons.h"
 #include "core/services/storage/flash.h"
 #include "core/services/profiles/profile.h"
+#include "core/services/profiles/runtime_profile.h"
 #include "platform/platform.h"
 #include "core/services/players/manager.h"
 #include <string.h>
@@ -96,9 +97,19 @@ static inline bool analog_beyond_threshold(const input_event_t* event) {
 // Get device name based on transport type and device address
 // Returns pointer to static string or device name buffer
 static const char* get_device_name(const input_event_t* event) {
+    // The synthetic CDC-injected gamepad (web config Input Test, INPUT.INJECT)
+    // — name it for the player list instead of falling through to the bare
+    // transport label ("Native (native)"). The injected mouse/keyboard never
+    // register as players, so they need no names here.
+    if (event->dev_addr == ROUTER_INJECT_ADDR) return "Virtual Pad";
     switch (event->transport) {
 #ifndef DISABLE_USB_HOST
         case INPUT_TRANSPORT_USB: {
+            uint16_t vid, pid;
+            if (tuh_vid_pid_get(event->dev_addr, &vid, &pid) &&
+                vid == 0x8086 && pid == 0xc013) {
+                return "Intel Wireless Series Gamepad";
+            }
             int ctrl_type = hid_get_ctrl_type(event->dev_addr, event->instance);
             if (ctrl_type >= 0 && ctrl_type < CONTROLLER_TYPE_COUNT &&
                 device_interfaces[ctrl_type] && device_interfaces[ctrl_type]->name) {
@@ -225,6 +236,23 @@ static const char* get_device_name(const input_event_t* event) {
 // Each output has up to MAX_PLAYERS_PER_OUTPUT player slots
 static output_state_t router_outputs[MAX_OUTPUTS][MAX_PLAYERS_PER_OUTPUT];
 
+// ---- Cross-core seqlock handoff (see output_state_t doc in router.h) ----------
+// Producer (Core 0) publishes a full event into a slot wait-free; consumer
+// (Core 1) reads a torn-free snapshot via router_get_output(). Barriers use GCC
+// __atomic builtins (no <stdatomic.h>, C++-safe) → DMB on ARM / MEMW on Xtensa.
+// Bound the consumer's retries so a pathological collision run can't stall the
+// timing-critical console core — it falls back to "no new data" (reuse last frame).
+#define ROUTER_CONSUME_MAX_RETRY 4
+
+static inline void router_publish(output_state_t* s, const input_event_t* ev) {
+    uint32_t seq = s->seq;
+    s->seq = seq + 1;                          // odd: write in progress
+    __atomic_thread_fence(__ATOMIC_RELEASE);   // payload writes land after the odd bump
+    s->current_state = *ev;
+    __atomic_thread_fence(__ATOMIC_RELEASE);   // publish only after payload is committed
+    s->seq = seq + 2;                          // even: new version visible
+}
+
 // Router configuration (set at init)
 static router_config_t router_config;
 
@@ -232,13 +260,63 @@ static router_config_t router_config;
 static uint8_t global_dpad_mode = 0;
 static bool global_shoulder_swap = false;  // swap L1<->L2, R1<->R2
 
+// True after router_init() installs the built-in SELECT+D-pad hotkeys. The first
+// app router_set_combo() call clears them so the app's own combo table takes over
+// (gc2usb, universal); apps that register nothing keep the defaults.
+static bool router_default_combos_active = false;
+
+// ---- Global on-the-fly runtime profile (SELECT-hold → autofire / live remap) ----
+// Wired for every app in router_init(). Apps that call runtime_profile_init()
+// themselves (e.g. usb2neogeo) override this because their init runs afterward.
+static const uint32_t rt_output_buttons[] = {
+    JP_BUTTON_B1, JP_BUTTON_B2, JP_BUTTON_B3, JP_BUTTON_B4,
+    JP_BUTTON_L1, JP_BUTTON_R1, JP_BUTTON_L2, JP_BUTTON_R2,
+};
+static profile_t rt_scratch_profile = {
+    .name = "runtime", .description = "Runtime profile",
+    .button_map = NULL, .button_map_count = 0,
+    .l2_behavior = TRIGGER_PASSTHROUGH, .r2_behavior = TRIGGER_PASSTHROUGH,
+    .l2_threshold = 128, .r2_threshold = 128,
+    .left_stick_sensitivity = 1.0f, .right_stick_sensitivity = 1.0f,
+    .socd_mode = SOCD_UP_PRIORITY,
+};
+static const runtime_profile_output_config_t rt_output_config = {
+    .output_buttons      = rt_output_buttons,
+    .output_button_count = sizeof(rt_output_buttons) / sizeof(rt_output_buttons[0]),
+    .input_mask          = (JP_BUTTON_B1 | JP_BUTTON_B2 | JP_BUTTON_B3 | JP_BUTTON_B4 |
+                            JP_BUTTON_L1 | JP_BUTTON_R1 | JP_BUTTON_L2 | JP_BUTTON_R2 |
+                            JP_BUTTON_L3 | JP_BUTTON_R3 | JP_BUTTON_A1 |
+                            JP_BUTTON_L4 | JP_BUTTON_R4 | JP_BUTTON_L5 | JP_BUTTON_R5),
+    .hold_ms             = 2000,
+    .output_button_names = NULL,
+    .profile             = &rt_scratch_profile,
+};
+static runtime_profile_config_t rt_config;  // output_configs[] filled in router_init()
+
 // Global button combo hotkeys
 static struct {
     uint32_t input_mask;
     uint32_t output_mask;
     uint8_t required_layout;   // controller_layout_t, 0 = any layout
     bool fired;
+    uint32_t held_since;       // ms timestamp the combo became fully held (0 = not held)
+    uint32_t held_dev;         // device that owns the in-progress hold (0 = none)
 } router_combos[ROUTER_COMBO_MAX];
+
+// Identity of the device an event came from, for combo hold ownership. Raw
+// dev_addr/instance rather than the shared player slot: a Joy-Con Grip's two
+// interfaces are one player but only one of them is pressing the combo, so the
+// other half's traffic must not count as the holder. Never 0 — 0 means "none".
+static inline uint32_t combo_dev_key(const input_event_t* event) {
+    return 0x10000u | ((uint32_t)event->dev_addr << 8) | (uint8_t)event->instance;
+}
+
+// Built-in default combos (SELECT/START + D-pad) require a brief deliberate hold
+// before they fire AND before they consume the buttons, so a quick in-game
+// SELECT/START + D-pad passes through to the console instead of silently
+// switching a profile on the 40+ apps that inherit the defaults. App-registered
+// combo tables (router_default_combos_active == false) keep instant behavior.
+#define ROUTER_DEFAULT_COMBO_HOLD_MS 700
 
 // Active output count (for broadcast mode)
 static output_target_t active_outputs[MAX_OUTPUTS];
@@ -272,6 +350,22 @@ typedef struct {
 // Per-output blend state (tracks each device's contribution)
 static blend_device_state_t blend_devices[MAX_OUTPUTS][MAX_BLEND_DEVICES];
 
+// Map an analog axis index to its INPUT_VALID_* bit. Returns 0 for indices
+// without a corresponding field in valid_fields, so the caller treats the
+// field as "always valid" by default.
+static inline uint32_t valid_field_bit_for_axis(int axis) {
+    switch (axis) {
+        case ANALOG_LX: return INPUT_VALID_LX;
+        case ANALOG_LY: return INPUT_VALID_LY;
+        case ANALOG_RX: return INPUT_VALID_RX;
+        case ANALOG_RY: return INPUT_VALID_RY;
+        case ANALOG_L2: return INPUT_VALID_L2;
+        case ANALOG_R2: return INPUT_VALID_R2;
+        case ANALOG_RZ: return INPUT_VALID_RZ;
+        default:       return 0;
+    }
+}
+
 // ============================================================================
 // ROUTING TABLE (Phase 6)
 // ============================================================================
@@ -287,9 +381,120 @@ static uint8_t route_count = 0;
 static router_tap_callback_t output_taps[MAX_OUTPUTS] = {NULL};
 static bool output_tap_exclusive[MAX_OUTPUTS] = {false};
 
+// Onboard battery: this device's OWN battery (e.g. universal on a board
+// with a LiPo), as opposed to a battery reported by a connected input
+// controller. The app updates it from an ADC read; the router stamps it into
+// output states that have no input-device battery, so the SInput report's
+// charge_level/plug_status reflect the device itself. percent <0 = none.
+static volatile int onboard_batt_pct = -1;
+static volatile bool onboard_batt_charging = false;
+
+void router_set_onboard_battery(int percent, bool charging) {
+    onboard_batt_pct = percent;
+    onboard_batt_charging = charging;
+}
+int router_onboard_battery_percent(void) { return onboard_batt_pct; }
+bool router_onboard_battery_charging(void) { return onboard_batt_charging; }
+
+// Look up a routed input device's last-reported battery by dev_addr. Returns
+// true and fills level (0-100) / charging if any output slot has a battery
+// reading for that device. level 0 = not reported.
+bool router_get_device_battery(uint8_t dev_addr, uint8_t* level, bool* charging) {
+    for (int output = 0; output < MAX_OUTPUTS; output++) {
+        for (int i = 0; i < MAX_BLEND_DEVICES; i++) {
+            if (blend_devices[output][i].active &&
+                blend_devices[output][i].dev_addr == dev_addr &&
+                blend_devices[output][i].state.battery_level > 0) {
+                if (level) *level = blend_devices[output][i].state.battery_level;
+                if (charging) *charging = blend_devices[output][i].state.battery_charging;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Onboard motion: this device's OWN IMU (e.g. universal on a XIAO Sense),
+// as opposed to motion from a connected input controller (DS4/DS5). The app
+// updates it from the IMU; the router stamps it into output states that have no
+// input-device motion, so the SInput report carries accel/gyro. valid=false
+// when there's no IMU.
+static struct {
+    int16_t accel[3];
+    int16_t gyro[3];
+    uint16_t accel_range;
+    uint16_t gyro_range;
+    volatile bool valid;
+} onboard_motion = { .accel_range = 4000, .gyro_range = 2000 };
+
+// Onboard IMU axis remap (mounting orientation). For each output axis i,
+// out[i] = sign(motion_remap[i]) * in[ |motion_remap[i]|-1 ]. Default {1,2,3}
+// is identity. Applied to accel and gyro together (same physical chip axes), so
+// a rotated/flipped IMU mount is corrected once, at the source, for every
+// consumer (SInput report, Steam/SDL, joypad-web). Set at runtime via the CDC
+// "IMU.MAP" command while tuning; bake the final values in as the default.
+static int8_t motion_remap[3] = { 1, 2, 3 };
+
+void router_set_motion_remap(int x, int y, int z) {
+    if (x >= -3 && x <= 3 && x != 0) motion_remap[0] = (int8_t)x;
+    if (y >= -3 && y <= 3 && y != 0) motion_remap[1] = (int8_t)y;
+    if (z >= -3 && z <= 3 && z != 0) motion_remap[2] = (int8_t)z;
+}
+
+void router_get_motion_remap(int out[3]) {
+    for (int i = 0; i < 3; i++) out[i] = motion_remap[i];
+}
+
+static inline int16_t remap_one(const int16_t v[3], int8_t m) {
+    int idx = (m < 0 ? -m : m) - 1;
+    int16_t val = v[idx];
+    if (val == INT16_MIN) val = INT16_MIN + 1;  // avoid negate overflow
+    return m < 0 ? (int16_t)(-val) : val;
+}
+
+void router_set_onboard_motion(const int16_t accel[3], const int16_t gyro[3],
+                               uint16_t accel_range, uint16_t gyro_range) {
+    for (int i = 0; i < 3; i++) {
+        onboard_motion.accel[i] = remap_one(accel, motion_remap[i]);
+        onboard_motion.gyro[i]  = remap_one(gyro,  motion_remap[i]);
+    }
+    onboard_motion.accel_range = accel_range;
+    onboard_motion.gyro_range = gyro_range;
+    onboard_motion.valid = true;
+}
+
+bool router_onboard_motion_get(int16_t accel[3], int16_t gyro[3]) {
+    if (!onboard_motion.valid) return false;
+    for (int i = 0; i < 3; i++) {
+        accel[i] = onboard_motion.accel[i];
+        gyro[i] = onboard_motion.gyro[i];
+    }
+    return true;
+}
+
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
+
+// Built-in hotkeys so profile-switch / d-pad-mode / shoulder-swap work on every
+// app out of the box (previously only gc2usb/universal registered combos).
+// All require a ~0.7 s deliberate hold (ROUTER_DEFAULT_COMBO_HOLD_MS) before they fire and
+// before they consume the buttons — see the note above the constant. App-registered tables are
+// instant.
+//   SELECT + Up/Down     → profile prev/next   (clamps at the ends, no wrap)
+//   SELECT + Left/Right  → d-pad mode slider [left stick <- d-pad -> right stick]
+//   START  + Up          → shoulder swap toggle (L1<->L2, R1<->R2)
+// Choices persist via flash (profile index / dpad mode / shoulder swap) and are
+// restored on boot. Any app that registers its own combos wipes these on its
+// first router_set_combo() call (see router_set_combo).
+static void router_install_default_combos(void) {
+    router_set_combo(0, JP_BUTTON_S1 | JP_BUTTON_DU, (10u << 24)); // profile prev (clamp)
+    router_set_combo(1, JP_BUTTON_S1 | JP_BUTTON_DD, (11u << 24)); // profile next (clamp)
+    router_set_combo(2, JP_BUTTON_S1 | JP_BUTTON_DL, (8u  << 24)); // d-pad slider ← left stick
+    router_set_combo(3, JP_BUTTON_S1 | JP_BUTTON_DR, (9u  << 24)); // d-pad slider → right stick
+    router_set_combo(4, JP_BUTTON_S2 | JP_BUTTON_DU, (7u  << 24)); // shoulder swap toggle
+    router_default_combos_active = true;
+}
 
 void router_init(const router_config_t* config) {
     if (!config) {
@@ -299,6 +504,28 @@ void router_init(const router_config_t* config) {
 
     // Copy configuration
     router_config = *config;
+
+    // Restore persisted router settings (d-pad mode + shoulder swap) so a saved
+    // selection survives a reboot on EVERY app, not just the few that restore
+    // themselves. Gated on router_saved so untouched flash is left at defaults.
+    flash_t flash_data;
+    if (flash_load(&flash_data) && flash_data.router_saved) {
+        if (flash_data.dpad_mode <= FLASH_DPAD_MODE_MAX)
+            router_set_dpad_mode(flash_data.dpad_mode);
+        router_set_shoulder_swap(flash_data.shoulder_swap != 0);
+    }
+
+    // Install the built-in SELECT+D-pad hotkeys. Apps that register their own
+    // combos (gc2usb, universal) clear these on first router_set_combo().
+    router_install_default_combos();
+
+    // Register the global on-the-fly runtime profile for every output target so
+    // the SELECT-hold autofire/remap gesture works on every app. Apps that call
+    // runtime_profile_init() themselves override this (their init runs later).
+    for (int t = 0; t < MAX_OUTPUT_TARGETS; t++) {
+        rt_config.output_configs[t] = &rt_output_config;
+    }
+    runtime_profile_init(&rt_config);
 
     printf(LOG_TAG "Initializing router\n");
     printf(LOG_TAG "  Mode: %s\n",
@@ -317,7 +544,7 @@ void router_init(const router_config_t* config) {
     for (uint8_t output = 0; output < MAX_OUTPUTS; output++) {
         for (uint8_t player = 0; player < MAX_PLAYERS_PER_OUTPUT; player++) {
             init_input_event(&router_outputs[output][player].current_state);
-            router_outputs[output][player].updated = false;
+            router_outputs[output][player].seq = 0;   // even, "no data yet"
             router_outputs[output][player].player_id = player;
             router_outputs[output][player].source = INPUT_SOURCE_USB_HOST;  // Default
 
@@ -576,6 +803,15 @@ static uint8_t router_find_routes(const input_event_t* event, route_entry_t* mat
 
 // SIMPLE MODE: Direct 1:1 pass-through (zero overhead, can be inlined)
 static inline void router_simple_mode(const input_event_t* event, output_target_t output) {
+    // CDC-injected mouse/keyboard are report streams, not players — no slot,
+    // no LED, no player-list row. Publish straight to the output.
+    if (event->dev_addr == ROUTER_INJECT_MOUSE_ADDR ||
+        event->dev_addr == ROUTER_INJECT_KB_ADDR) {
+        router_publish(&router_outputs[output][0], event);
+        if (output_taps[output]) output_taps[output](output, 0, event);
+        return;
+    }
+
     // Find or add player (multi-instance devices like Joy-Con Grip share one slot)
     int8_t slot_inst = player_slot_instance(event);
     int player_index = find_player_index(event->dev_addr, slot_inst);
@@ -614,9 +850,8 @@ static inline void router_simple_mode(const input_event_t* event, output_target_
 
         // Store to output slot (skip when tap-exclusive — tap delivers directly)
         if (!output_tap_exclusive[output]) {
-            router_outputs[output][player_index].current_state = *final_event;
-            router_outputs[output][player_index].updated = true;
             router_outputs[output][player_index].source = INPUT_SOURCE_USB_HOST;
+            router_publish(&router_outputs[output][player_index], final_event);
         }
 
         // Notify tap if registered (for push-based outputs like UART)
@@ -629,6 +864,15 @@ static inline void router_simple_mode(const input_event_t* event, output_target_
 
 // MERGE MODE: Multiple inputs → single output
 static inline void router_merge_mode(const input_event_t* event, output_target_t output) {
+    // CDC-injected mouse/keyboard are report streams, not players — no slot,
+    // no LED, no player-list row. Publish straight to the output.
+    if (event->dev_addr == ROUTER_INJECT_MOUSE_ADDR ||
+        event->dev_addr == ROUTER_INJECT_KB_ADDR) {
+        router_publish(&router_outputs[output][0], event);
+        if (output_taps[output]) output_taps[output](output, 0, event);
+        return;
+    }
+
     // Register player if not already registered (for LED and rumble support).
     // Multi-instance devices (Joy-Con Grip) share one slot via player_slot_instance.
     int8_t slot_inst = player_slot_instance(event);
@@ -636,7 +880,13 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
     if (player_index < 0) {
         uint32_t buttons_pressed = event->buttons | event->keys;
         bool analog_active = analog_beyond_threshold(event);
-        if (buttons_pressed || analog_active || event->type == INPUT_TYPE_MOUSE) {
+        // A keyboard event may carry only kb_modifier/kb_keys[] (the lossy
+        // `keys` gamepad-mapping stays 0), so gate on the type like MOUSE —
+        // otherwise its first press never registers a player and is dropped.
+        bool kb_active = event->type == INPUT_TYPE_KEYBOARD &&
+                         (event->kb_modifier || event->kb_keys[0]);
+        if (buttons_pressed || analog_active || kb_active ||
+            event->type == INPUT_TYPE_MOUSE) {
             const char* device_name = get_device_name(event);
             player_index = add_player(event->dev_addr, slot_inst, event->transport, device_name);
             if (player_index >= 0) {
@@ -661,10 +911,48 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
         final_event = event;  // Zero-copy pass-through
     }
 
+    // Mouse and keyboard events are their own report streams (deltas /
+    // kb_keys), not gamepad state — blending or priority-merging them with a
+    // gamepad corrupts both (BLEND drops kb fields entirely). Publish them
+    // straight through; the output drivers dispatch by event type.
+    if (final_event->type == INPUT_TYPE_MOUSE ||
+        final_event->type == INPUT_TYPE_KEYBOARD) {
+        router_publish(&router_outputs[output][0], final_event);
+        if (output_taps[output]) {
+            output_taps[output](output, 0, final_event);
+        }
+        return;
+    }
+
+    // Build the merged result in a local, then publish once (seqlock) so Core 1
+    // never sees a torn frame mid-blend. See output_state_t doc in router.h.
+    input_event_t merged;
+
     switch (router_config.merge_mode) {
         case MERGE_ALL:
-            // Latest active input wins (overwrites previous state)
-            router_outputs[output][0].current_state = *final_event;
+            // Latest active input wins (overwrites previous state).
+            // If the event carries a non-zero valid_fields mask, only
+            // update the fields it owns; fields not owned are preserved
+            // from the current output state. This lets a single Joy-Con
+            // submit events that only touch its physical stick while the
+            // other Joy-Con's data stays live. Reading current_state
+            // here is producer-core-safe (only Core 0 writes via
+            // router_publish), mirroring the MERGE_PRIORITY path below.
+            if (final_event->valid_fields != 0) {
+                merged = router_outputs[output][0].current_state;
+                if (final_event->valid_fields & INPUT_VALID_BUTTONS) {
+                    merged.buttons = final_event->buttons;
+                }
+                for (int j = 0; j < ANALOG_COUNT; j++) {
+                    uint32_t bit = valid_field_bit_for_axis(j);
+                    if (bit != 0 && (final_event->valid_fields & bit)) {
+                        merged.analog[j] = final_event->analog[j];
+                    }
+                }
+            } else {
+                // Legacy: full overwrite (every field treated as valid).
+                merged = *final_event;
+            }
             break;
 
         case MERGE_BLEND: {
@@ -699,8 +987,7 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                 // Update this device's state
                 blend_devices[output][slot].state = *final_event;
 
-                // Now re-blend ALL active devices
-                output_state_t* out = &router_outputs[output][0];
+                // Now re-blend ALL active devices into a local, published below
 
                 // Start with neutral state (all buttons released)
                 // Note: deltas are cleared here but accumulated fresh from blend devices
@@ -720,15 +1007,69 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                     // Keys: OR together (active-high)
                     x_current_state.keys |= dev->keys;
 
+                    // Aux buttons (e.g. Jaguar keypad): OR together. The blend
+                    // path builds a fresh neutral event, so this field must be
+                    // merged explicitly like buttons/keys or it would be lost.
+                    x_current_state.aux_buttons |= dev->aux_buttons;
+
                     // Present-as-gamepad flag (e.g. MouthPad): if ANY blended
                     // device wants gamepad output, the merged event does too.
                     // Without this, blend mode drops the flag and sinput never
                     // emits the gamepad report.
                     x_current_state.as_gamepad |= dev->as_gamepad;
 
+                    // Raw HID keyboard state. The `keys` field above is the
+                    // lossy gamepad-mapped encoding; output paths that need real
+                    // keystrokes (sinput_mode's composite keyboard interface)
+                    // read kb_modifier/kb_keys instead, and those were being
+                    // dropped here. Modifier is a bitmask, so OR it like buttons;
+                    // keycodes are a 6-slot rollover set, so append each distinct
+                    // non-zero key until the slots are full.
+                    x_current_state.kb_modifier |= dev->kb_modifier;
+                    for (int j = 0; j < 6 && dev->kb_keys[j] != 0; j++) {
+                        uint8_t k = dev->kb_keys[j];
+                        bool dup = false;
+                        int free_slot = -1;
+                        for (int s = 0; s < 6; s++) {
+                            if (x_current_state.kb_keys[s] == k) { dup = true; break; }
+                            if (x_current_state.kb_keys[s] == 0) { free_slot = s; break; }
+                        }
+                        if (!dup && free_slot >= 0) {
+                            x_current_state.kb_keys[free_slot] = k;
+                        }
+                    }
+
+                    // Consumer control (media/volume) is a single usage selector,
+                    // not a bitmask — it cannot be OR'd. Use the first device
+                    // reporting one, mirroring the motion/pressure/touch rule.
+                    if (dev->consumer_usage != 0 && x_current_state.consumer_usage == 0) {
+                        x_current_state.consumer_usage = dev->consumer_usage;
+                    }
+
+                    // Chatpad (Xbox 360): first device that has one.
+                    if (dev->has_chatpad && !x_current_state.has_chatpad) {
+                        x_current_state.has_chatpad = true;
+                        x_current_state.chatpad[0] = dev->chatpad[0];
+                        x_current_state.chatpad[1] = dev->chatpad[1];
+                        x_current_state.chatpad[2] = dev->chatpad[2];
+                    }
+
                     // Analog: use furthest from center for sticks, max for triggers
                     // New format: [0]=LX, [1]=LY, [2]=RX, [3]=RY, [4]=L2, [5]=R2
                     for (int j = 0; j < ANALOG_COUNT; j++) {
+                        // Respect per-event field ownership. A single
+                        // Joy-Con L (valid_fields = buttons|LX|LY) must
+                        // not contribute to RX/RY — the Joy-Con reports
+                        // 0/4095 for its non-physical stick, which 12→8
+                        // scaling maps to 1/254 (max deflection), and
+                        // that would otherwise win the "furthest from
+                        // center" rule and pin the partner Joy-Con's
+                        // real stick data to a corner.
+                        uint32_t bit = valid_field_bit_for_axis(j);
+                        if (bit != 0 && dev->valid_fields != 0 &&
+                            !(dev->valid_fields & bit)) {
+                            continue;
+                        }
                         if (j >= ANALOG_L2) {
                             // Triggers (L2, R2): use max value
                             if (dev->analog[j] > x_current_state.analog[j]) {
@@ -750,7 +1091,23 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                     dev->delta_x = 0;
                     dev->delta_y = 0;
 
-                    // Motion: use first device that has motion data
+                    // Scroll wheel is one-shot per event like delta_x/delta_y and
+                    // was the one relative axis this loop did not merge, so every
+                    // consumer (sinput mouse report, BLE mouse, Amiga wheel
+                    // accumulator) saw a permanent zero in blend mode. Clamped
+                    // because the field is int8_t, unlike the int16 deltas above.
+                    {
+                        int wheel = (int)x_current_state.delta_wheel + (int)dev->delta_wheel;
+                        if (wheel >  127) wheel =  127;
+                        if (wheel < -128) wheel = -128;
+                        x_current_state.delta_wheel = (int8_t)wheel;
+                    }
+                    dev->delta_wheel = 0;
+
+                    // Motion: use first device that has motion data. Copy the
+                    // ranges too — without them the device's declared full-scale
+                    // is dropped and outputs mis-scale (masked only because most
+                    // devices default to 2000 dps / 4000 mg).
                     if (dev->has_motion && !x_current_state.has_motion) {
                         x_current_state.has_motion = true;
                         x_current_state.accel[0] = dev->accel[0];
@@ -759,6 +1116,8 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                         x_current_state.gyro[0] = dev->gyro[0];
                         x_current_state.gyro[1] = dev->gyro[1];
                         x_current_state.gyro[2] = dev->gyro[2];
+                        x_current_state.accel_range = dev->accel_range;
+                        x_current_state.gyro_range = dev->gyro_range;
                     }
 
                     // Pressure: use first device that has pressure data
@@ -782,15 +1141,40 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                         x_current_state.battery_charging = dev->battery_charging;
                     }
 
-                    // Use metadata from first active device
+                    // Use metadata from first active device.
+                    // transport/layout belong here too: sinput_mode.c reads both
+                    // off the merged event (update_device_info + cached_layout)
+                    // and INPUT_TRANSPORT_NONE / LAYOUT_UNKNOWN are both 0, so
+                    // omitting them didn't leave the value stale — it reported a
+                    // defined "unknown" for a device the router knew exactly.
                     if (first) {
                         x_current_state.dev_addr = dev->dev_addr;
                         x_current_state.instance = dev->instance;
                         x_current_state.type = dev->type;
+                        x_current_state.transport = dev->transport;
+                        x_current_state.layout = dev->layout;
+                        x_current_state.button_count = dev->button_count;
+                        x_current_state.has_rumble = dev->has_rumble;
+                        x_current_state.has_force_feedback = dev->has_force_feedback;
                         first = false;
                     }
                 }
-                out->current_state = x_current_state;
+                // Onboard battery fallback (see SIMPLE path) — no input device
+                // reported a battery, so use this device's own.
+                if (x_current_state.battery_level == 0 && onboard_batt_pct >= 0) {
+                    x_current_state.battery_level = (uint8_t)onboard_batt_pct;
+                    x_current_state.battery_charging = onboard_batt_charging;
+                }
+                if (!x_current_state.has_motion && onboard_motion.valid) {
+                    for (int mi = 0; mi < 3; mi++) {
+                        x_current_state.accel[mi] = onboard_motion.accel[mi];
+                        x_current_state.gyro[mi] = onboard_motion.gyro[mi];
+                    }
+                    x_current_state.accel_range = onboard_motion.accel_range;
+                    x_current_state.gyro_range = onboard_motion.gyro_range;
+                    x_current_state.has_motion = true;
+                }
+                merged = x_current_state;
             }
             break;
         }
@@ -798,22 +1182,24 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
         case MERGE_PRIORITY:
             // High priority input wins, low priority fallback
             // Used by Super3D0USB (USB priority, SNES fallback)
-            // Check if this source has higher priority than current
+            // Start from the current published state; USB (highest priority)
+            // overwrites it. Reading the slot here is producer-core-safe.
+            merged = router_outputs[output][0].current_state;
             if (router_outputs[output][0].source <= INPUT_SOURCE_USB_HOST) {
                 // USB has highest priority (0), always wins
-                router_outputs[output][0].current_state = *final_event;
+                merged = *final_event;
             }
             // Lower priority sources only update if no USB input active
             // TODO: Track activity timeout for priority fallback
             break;
     }
 
-    router_outputs[output][0].updated = true;
     router_outputs[output][0].source = INPUT_SOURCE_USB_HOST;
+    router_publish(&router_outputs[output][0], &merged);
 
     // Notify tap if registered (for push-based outputs like UART)
     if (output_taps[output]) {
-        output_taps[output](output, 0, &router_outputs[output][0].current_state);
+        output_taps[output](output, 0, &merged);
     }
 }
 
@@ -821,6 +1207,23 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
 // Host-side synthetic button overlay (INPUT.INJECT). OR'd into every real
 // input event before profile/overlay processing. RAM only, never persisted.
 static uint32_t s_inject_buttons = 0;
+// Injected analog, and whether any is being injected at all. The flag is not
+// redundant with an all-neutral array: neutral is a real instruction to hold the
+// sticks centred, and must still override a real stick that is drifting.
+static uint8_t s_inject_analog[ANALOG_COUNT];
+static bool s_inject_analog_set = false;
+// Last time a real controller submitted anything, so the heartbeat below only
+// runs when there is nothing else carrying the injection.
+static uint32_t s_last_real_input_ms = 0;
+static uint32_t s_inject_last_beat_ms = 0;
+
+// Resting position per axis. Sticks sit at centre and triggers at zero, so
+// "further from rest" has to be measured from a different place for each — from
+// centre, a released trigger looks like a large deflection and would beat a real
+// pull every time.
+static uint8_t inject_axis_rest(uint8_t index) {
+    return (index == ANALOG_L2 || index == ANALOG_R2) ? 0 : 128;
+}
 
 void router_set_inject_buttons(uint32_t buttons) {
     s_inject_buttons = buttons;
@@ -830,9 +1233,115 @@ uint32_t router_get_inject_buttons(void) {
     return s_inject_buttons;
 }
 
+void router_set_inject_analog(const uint8_t* analog) {
+    if (!analog) {
+        s_inject_analog_set = false;
+        return;
+    }
+    memcpy(s_inject_analog, analog, ANALOG_COUNT);
+    s_inject_analog_set = true;
+}
+
+bool router_get_inject_analog(uint8_t* out) {
+    if (!s_inject_analog_set) return false;
+    if (out) memcpy(out, s_inject_analog, ANALOG_COUNT);
+    return true;
+}
+
+// Take whichever of the two sits further from the axis's resting position.
+static void inject_merge_analog(input_event_t* event) {
+    for (uint8_t i = 0; i < ANALOG_COUNT; i++) {
+        int rest = inject_axis_rest(i);
+        int real = (int)event->analog[i] - rest;
+        int injected = (int)s_inject_analog[i] - rest;
+        if (abs(injected) > abs(real)) event->analog[i] = s_inject_analog[i];
+    }
+}
+
+void router_announce_virtual_pad(void) {
+    if (find_player_index(ROUTER_INJECT_ADDR, 0) < 0) {
+        add_player(ROUTER_INJECT_ADDR, 0, INPUT_TRANSPORT_NATIVE, "Virtual Pad");
+    }
+    // One neutral frame so the stream (and any change-gated output) carries
+    // the new device immediately.
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_GAMEPAD;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (uint8_t i = 0; i < ANALOG_COUNT; i++) event.analog[i] = inject_axis_rest(i);
+    router_submit_input(&event);
+}
+
+void router_inject_task(void) {
+    // needs_flush: we last published an injected frame that still needs one more
+    // beat to clear once inject goes empty. Without this, releasing the last
+    // injected button leaves it stuck in the output — nothing re-publishes the
+    // cleared state when no real controller is actively feeding events.
+    static bool needs_flush = false;
+    bool active = s_inject_buttons || s_inject_analog_set;
+    if (!active && !needs_flush) return;
+
+    uint32_t now = platform_time_ms();
+    // A real controller's events already carry the injection (and clear it on
+    // release); a second source would press everything twice, so stand down —
+    // the real events also flush any residual inject.
+    if ((uint32_t)(now - s_last_real_input_ms) < 100) { needs_flush = false; return; }
+    // 60Hz is what the outputs consume; faster only adds work.
+    if ((uint32_t)(now - s_inject_last_beat_ms) < 16) return;
+    s_inject_last_beat_ms = now;
+
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_GAMEPAD;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (uint8_t i = 0; i < ANALOG_COUNT; i++) event.analog[i] = inject_axis_rest(i);
+    // router_submit_input OR-s in the current s_inject_buttons (0 while clearing).
+    router_submit_input(&event);
+
+    // While inject is active, keep the flush pending; once it's empty this beat
+    // just published the neutral/cleared frame, so we're done.
+    needs_flush = active;
+}
+
+// Timestamp of the last "active" input across all sources, for idle/sleep
+// detection. Active = any button held or a stick pushed past a noise margin.
+static volatile uint32_t s_last_activity_ms = 0;
+
+uint32_t router_ms_since_activity(void) {
+    return platform_time_ms() - s_last_activity_ms;
+}
+
 void router_submit_input(const input_event_t* event) {
     if (!event) return;
     if (route_count == 0) return;
+
+    // Note real input so the injection heartbeat stands down while a controller
+    // is attached — its events already carry the injected state.
+    if (event->dev_addr != ROUTER_INJECT_ADDR) s_last_real_input_ms = platform_time_ms();
+
+    // Global on-the-fly runtime profile gesture (SELECT-hold → autofire / live
+    // remap). Detected on the raw input; the mapping it builds is applied by
+    // profile_get_active() in the output drivers. Output is frozen while a
+    // mapping is being entered so the buttons you press don't leak through.
+    runtime_profile_check_combo(event->buttons,
+                                event->analog[ANALOG_L2], event->analog[ANALOG_R2]);
+    // Freeze output only while a live remap is being entered; rapid-fire set mode
+    // stays live so you feel each rate as you cycle it.
+    if (runtime_profile_is_mapping()) return;
+
+    // Track activity for idle-sleep: any button, or a stick off-center.
+    if (event->buttons != 0) {
+        s_last_activity_ms = platform_time_ms();
+    } else {
+        for (int i = 0; i < 4; i++) {  // analog[0..3] = LX,LY,RX,RY
+            int d = (int)event->analog[i] - 128;
+            if (d > 24 || d < -24) { s_last_activity_ms = platform_time_ms(); break; }
+        }
+    }
 
     // Stream input to CDC for web config (only when a host is actively
     // consuming the stream). Without this gate the prep work below —
@@ -843,7 +1352,11 @@ void router_submit_input(const input_event_t* event) {
     // the callee returns immediately anyway. Tight per-event loop matters
     // for high-precision input like Melee dash dancing.
 #ifdef CONFIG_USB
-    if (cdc_commands_is_input_streaming()) {
+    // The CDC-injected mouse/keyboard aren't gamepads — keep them out of the
+    // Input Test source list entirely (they're driven FROM that page).
+    if (cdc_commands_is_input_streaming() &&
+        event->dev_addr != ROUTER_INJECT_MOUSE_ADDR &&
+        event->dev_addr != ROUTER_INJECT_KB_ADDR) {
         static const char* transport_names[] = {
             [INPUT_TRANSPORT_NONE]       = "none",
             [INPUT_TRANSPORT_USB]        = "usb",
@@ -861,7 +1374,11 @@ void router_submit_input(const input_event_t* event) {
         int pi = find_player_index(event->dev_addr, player_slot_instance(event));
         const char* name = get_device_name(event);
         (void)pi;  // pi reserved if needed for future per-player decisions
-        const char* src = (event->transport < sizeof(transport_names)/sizeof(transport_names[0]))
+        // The injected Virtual Pad isn't a native-protocol controller —
+        // "native" means console connectors (joybus, SNES, ...) everywhere
+        // else in the UI, so label the synthetic source "serial" instead.
+        const char* src = (event->dev_addr == ROUTER_INJECT_ADDR) ? "serial"
+                        : (event->transport < sizeof(transport_names)/sizeof(transport_names[0]))
                           ? transport_names[event->transport] : "?";
         // In merge mode, all inputs go to output player 0
         int stream_player = (router_config.mode == ROUTING_MODE_MERGE) ? 0
@@ -883,13 +1400,18 @@ void router_submit_input(const input_event_t* event) {
     static input_event_t remapped;
     bool did_remap = false;
 
-    // Host-side synthetic button overlay (INPUT.INJECT) — OR'd into the
-    // real event so chat-driven button presses merge with the streamer's
-    // controller regardless of routing mode (works on SIMPLE, MERGE,
-    // BROADCAST). Buttons-only for now; analog injection lives below.
-    if (s_inject_buttons) {
+    // Host-side synthetic input overlay (INPUT.INJECT) — merged into the real
+    // event so host-driven presses join the streamer's controller regardless of
+    // routing mode (works on SIMPLE, MERGE, BROADCAST). Buttons are OR'd;
+    // analog takes whichever value is further from the axis's resting position.
+    // Gamepad overlay only: on a mouse event `buttons` means click buttons and
+    // on a keyboard event it's unused, so merging gamepad state into either
+    // would fabricate clicks (real mice passing through included).
+    if ((s_inject_buttons || s_inject_analog_set) &&
+        event->type != INPUT_TYPE_MOUSE && event->type != INPUT_TYPE_KEYBOARD) {
         remapped = *event;
         remapped.buttons |= s_inject_buttons;
+        if (s_inject_analog_set) inject_merge_analog(&remapped);
         did_remap = true;
         event = &remapped;
     }
@@ -901,8 +1423,22 @@ void router_submit_input(const input_event_t* event) {
         if (cp) {
             remapped = *event;
 
+            // Turbo/auto-fire: gate held turbo-flagged PHYSICAL buttons with a 50%
+            // duty cycle at the profile's shared rate, BEFORE the remap so the pulse
+            // follows the button's assignment. Free-running phase (now % period) —
+            // stateless, all turbo buttons share one phase (in-sync is desirable).
+            uint32_t in = event->buttons;
+            uint8_t rate_ms = profile_autofire_rate_ms(cp->autofire_rate);
+            if (rate_ms) {
+                bool duty_on = (platform_time_ms() % rate_ms) < (rate_ms / 2u);
+                if (!duty_on) {
+                    for (uint8_t i = 0; i < CUSTOM_PROFILE_BUTTON_COUNT; i++)
+                        if (custom_profile_turbo_get(cp, i)) in &= ~(1u << i);
+                }
+            }
+
             // Button remap (so Fn key remaps are visible to hotkeys below)
-            remapped.buttons = custom_profile_apply_buttons(cp, event->buttons);
+            remapped.buttons = custom_profile_apply_buttons(cp, in);
 
             // Stick sensitivity
             if (cp->left_stick_sens != 100) {
@@ -1049,12 +1585,56 @@ void router_submit_input(const input_event_t* event) {
         if (router_combos[c].required_layout &&
             event->layout != router_combos[c].required_layout) {
             router_combos[c].fired = false;
+            router_combos[c].held_since = 0;   // both halves of the state, or a
+            router_combos[c].held_dev = 0;     // stale timer outlives the filter
             continue;
         }
 
         bool held = (event->buttons & in) == in;
-        if (!held) {
-            router_combos[c].fired = false;
+
+        // Decide whether to run the combo action this pass.
+        //
+        // Default combos require a deliberate ~0.7s hold, so a quick in-game
+        // SELECT/START + D-pad passes straight through instead of switching a
+        // profile. The catch: the USB HID input path is change-gated (a driver
+        // only submits an event when the report *changes* — hid_gamepad.c), so a
+        // static hold produces no events after the press and a timer can't
+        // advance on the input path alone. So fire on WHICHEVER edge arrives:
+        // while still held once the hold has elapsed (streaming controllers), or
+        // on the release edge if it was held long enough (change-gated ones). A
+        // quick tap (< hold) reaches neither and passes through. App-registered
+        // combos stay instant.
+        //
+        // The hold is owned by ONE device. router_combos[] is global while the
+        // router runs up to MAX_PLAYERS_PER_OUTPUT players, so without an owner
+        // every event from a second controller arrives with held == false and
+        // resets the timer — on a 2+ pad adapter player 1 could never accumulate
+        // 0.7s and the default hotkeys would be unreachable.
+        bool process;
+        if (!router_default_combos_active) {
+            process = held;
+        } else {
+            uint32_t key = combo_dev_key(event);
+            if (router_combos[c].held_since != 0 && router_combos[c].held_dev != key) {
+                continue;  // someone else's hold in progress — don't touch it
+            }
+            uint32_t now = platform_time_ms();
+            if (held && router_combos[c].held_since == 0) {
+                router_combos[c].held_since = now ? now : 1;  // 0 = not held
+                router_combos[c].held_dev = key;
+            }
+            bool elapsed = router_combos[c].held_since != 0 &&
+                           (now - router_combos[c].held_since) >= ROUTER_DEFAULT_COMBO_HOLD_MS;
+            process = held ? elapsed                                // streaming: fire while held
+                           : (elapsed && !router_combos[c].fired);  // release: fire on the up-edge
+        }
+
+        if (!process) {
+            if (!held) {  // released (or quick tap): clear state, pass through
+                router_combos[c].fired = false;
+                router_combos[c].held_since = 0;
+                router_combos[c].held_dev = 0;
+            }
             continue;
         }
 
@@ -1082,23 +1662,28 @@ void router_submit_input(const input_event_t* event) {
                 break;
             case 4:  // Cycle D-Pad mode
                 if (!router_combos[c].fired) {
-                    uint8_t new_mode = (global_dpad_mode + 1) % 3;
+                    // Modulo the real mode count, not a literal 3. This action
+                    // predates mode 3 (LSTICK<->RSTICK) and kept cycling 0-1-2
+                    // after the 4th mode landed, so it could never reach 3 —
+                    // and from 3 it wrapped to 1, skipping NORMAL entirely.
+                    uint8_t new_mode =
+                        (global_dpad_mode + 1) % (FLASH_DPAD_MODE_MAX + 1);
                     router_set_dpad_mode(new_mode);
                     flash_set_dpad_mode(new_mode);   // persist across reboot
                     router_combos[c].fired = true;
                 }
                 remapped.buttons &= ~in;
                 break;
-            case 5:  // Next Profile
+            case 5:  // Next Profile (wrap)
                 if (!router_combos[c].fired) {
-                    profile_cycle_next(0);
+                    profile_cycle_next(router_get_primary_output(), true);
                     router_combos[c].fired = true;
                 }
                 remapped.buttons &= ~in;
                 break;
-            case 6:  // Previous Profile
+            case 6:  // Previous Profile (wrap)
                 if (!router_combos[c].fired) {
-                    profile_cycle_prev(0);
+                    profile_cycle_prev(router_get_primary_output(), true);
                     router_combos[c].fired = true;
                 }
                 remapped.buttons &= ~in;
@@ -1111,6 +1696,50 @@ void router_submit_input(const input_event_t* event) {
                 }
                 remapped.buttons &= ~in;
                 break;
+            // D-pad/stick swap as a 4-position slider that clamps at the ends,
+            // left -> right:
+            //   [d-pad<->Lstick] [normal] [d-pad<->Rstick] [Lstick<->Rstick]
+            //   modes:      1        0           2               3
+            case 8:   // slider step LEFT
+            case 9:   // slider step RIGHT
+                if (!router_combos[c].fired) {
+                    static const uint8_t pos_to_mode[4] = {1, 0, 2, 3};
+                    int pos = (global_dpad_mode == 1) ? 0 :
+                              (global_dpad_mode == 0) ? 1 :
+                              (global_dpad_mode == 2) ? 2 : 3;
+                    pos += (action == 9) ? 1 : -1;
+                    if (pos < 0) pos = 0;
+                    if (pos > 3) pos = 3;
+                    uint8_t nm = pos_to_mode[pos];
+                    router_set_dpad_mode(nm);
+                    flash_set_dpad_mode(nm);   // persist across reboot
+                    router_combos[c].fired = true;
+                }
+                remapped.buttons &= ~in;
+                break;
+            case 10:  // Previous Profile (clamp at first)
+                if (!router_combos[c].fired) {
+                    profile_cycle_prev(router_get_primary_output(), false);
+                    router_combos[c].fired = true;
+                }
+                remapped.buttons &= ~in;
+                break;
+            case 11:  // Next Profile (clamp at last)
+                if (!router_combos[c].fired) {
+                    profile_cycle_next(router_get_primary_output(), false);
+                    router_combos[c].fired = true;
+                }
+                remapped.buttons &= ~in;
+                break;
+        }
+
+        // If this was the release-edge fire (change-gated controller went quiet
+        // during the hold), the action just ran via the !fired latch above —
+        // clear the hold so the next press starts fresh.
+        if (!held) {
+            router_combos[c].fired = false;
+            router_combos[c].held_since = 0;
+            router_combos[c].held_dev = 0;
         }
     }
     if (did_remap) event = &remapped;
@@ -1125,24 +1754,44 @@ void router_submit_input(const input_event_t* event) {
         event = &remapped;
     }
 
-    // Apply global d-pad mode remap (d-pad buttons → analog stick)
+    // Apply global d-pad/stick swap. Each mode trades both directions:
+    //   1 = d-pad <-> left stick, 2 = d-pad <-> right stick, 3 = left <-> right stick.
     if (global_dpad_mode > 0) {
         if (!did_remap) { remapped = *event; did_remap = true; }
-        uint32_t dpad_bits = remapped.buttons & (JP_BUTTON_DU | JP_BUTTON_DD | JP_BUTTON_DL | JP_BUTTON_DR);
-        if (dpad_bits) {
+        if (global_dpad_mode == 3) {
+            // Swap the two analog sticks (d-pad untouched).
+            uint8_t tx = remapped.analog[0], ty = remapped.analog[1];
+            remapped.analog[0] = remapped.analog[2];
+            remapped.analog[1] = remapped.analog[3];
+            remapped.analog[2] = tx;
+            remapped.analog[3] = ty;
+        } else {
+            // D-pad <-> one stick, both directions. sx/sy = that stick's axes.
+            const int sx = (global_dpad_mode == 1) ? 0 : 2;
+            const int sy = sx + 1;
+            const uint8_t TH = 60;  // stick->d-pad activation threshold (center 128)
+            uint32_t dpad_bits = remapped.buttons &
+                (JP_BUTTON_DU | JP_BUTTON_DD | JP_BUTTON_DL | JP_BUTTON_DR);
+            uint8_t old_x = remapped.analog[sx], old_y = remapped.analog[sy];
+            // stick -> d-pad
             remapped.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD | JP_BUTTON_DL | JP_BUTTON_DR);
+            if (old_x < 128 - TH)      remapped.buttons |= JP_BUTTON_DL;
+            else if (old_x > 128 + TH) remapped.buttons |= JP_BUTTON_DR;
+            if (old_y < 128 - TH)      remapped.buttons |= JP_BUTTON_DU;
+            else if (old_y > 128 + TH) remapped.buttons |= JP_BUTTON_DD;
+            // d-pad -> stick, with a circular gate: a diagonal lands on the unit
+            // circle (~0.707 per axis, same magnitude as a cardinal) like a real
+            // stick, instead of at the square's corner (255,0).
+            bool x_dir = (dpad_bits & (JP_BUTTON_DL | JP_BUTTON_DR)) != 0;
+            bool y_dir = (dpad_bits & (JP_BUTTON_DU | JP_BUTTON_DD)) != 0;
+            bool diag  = x_dir && y_dir;
+            uint8_t lo = diag ? 38  : 0;    // 128 - ~128*0.707
+            uint8_t hi = diag ? 218 : 255;  // 128 + ~128*0.707
             uint8_t ax = 128, ay = 128;
-            if (dpad_bits & JP_BUTTON_DL) ax = 0;
-            else if (dpad_bits & JP_BUTTON_DR) ax = 255;
-            if (dpad_bits & JP_BUTTON_DU) ay = 0;
-            else if (dpad_bits & JP_BUTTON_DD) ay = 255;
-            if (global_dpad_mode == 1) {
-                remapped.analog[0] = ax;
-                remapped.analog[1] = ay;
-            } else {
-                remapped.analog[2] = ax;
-                remapped.analog[3] = ay;
-            }
+            if (dpad_bits & JP_BUTTON_DL) ax = lo; else if (dpad_bits & JP_BUTTON_DR) ax = hi;
+            if (dpad_bits & JP_BUTTON_DU) ay = lo; else if (dpad_bits & JP_BUTTON_DD) ay = hi;
+            remapped.analog[sx] = ax;
+            remapped.analog[sy] = ay;
         }
         event = &remapped;
     }
@@ -1159,6 +1808,12 @@ void router_submit_input(const input_event_t* event) {
         if (b & JP_BUTTON_L2) swapped |= JP_BUTTON_L1;
         if (b & JP_BUTTON_R2) swapped |= JP_BUTTON_R1;
         remapped.buttons = swapped;
+        // The analog trigger axes must follow the swap: a trigger moved to L1/R1
+        // becomes a digital bumper, so drive the L2/R2 analog axes from the
+        // swapped digital state (0/255) instead of leaving the old trigger
+        // travel firing on them.
+        remapped.analog[ANALOG_L2] = (swapped & JP_BUTTON_L2) ? 255 : 0;
+        remapped.analog[ANALOG_R2] = (swapped & JP_BUTTON_R2) ? 255 : 0;
         event = &remapped;
     }
 
@@ -1230,9 +1885,8 @@ void router_submit_input(const input_event_t* event) {
                             }
 
                             if (!output_tap_exclusive[target]) {
-                                router_outputs[target][target_player].current_state = *final_event;
-                                router_outputs[target][target_player].updated = true;
                                 router_outputs[target][target_player].source = INPUT_SOURCE_USB_HOST;
+                                router_publish(&router_outputs[target][target_player], final_event);
                             }
 
                             if (output_taps[target]) {
@@ -1252,36 +1906,57 @@ void router_submit_input(const input_event_t* event) {
 // OUTPUT RETRIEVAL (Core 1 - Poll or Event Driven)
 // ============================================================================
 
-// Static buffer for returning copies (so we can clear original deltas)
+// Consumer-side (Core 1) private buffers: the returned snapshot, and the last
+// seq we handed out per slot (edge detection — return each published event once,
+// NULL otherwise, matching the old `updated`-flag semantics several consumers
+// rely on). Written only by the consumer, never by the producer.
 static input_event_t router_output_copy[MAX_OUTPUTS][MAX_PLAYERS_PER_OUTPUT];
+static uint32_t router_output_last_seq[MAX_OUTPUTS][MAX_PLAYERS_PER_OUTPUT];
 
 const input_event_t* __not_in_flash_func(router_get_output)(output_target_t output, uint8_t player_id) {
     if (output >= MAX_OUTPUTS || player_id >= MAX_PLAYERS_PER_OUTPUT) {
         return NULL;
     }
 
-    if (router_outputs[output][player_id].updated) {
-        router_outputs[output][player_id].updated = false;  // Mark as read
-        
-        // Copy to static buffer so caller gets the deltas
-        router_output_copy[output][player_id] = router_outputs[output][player_id].current_state;
-        
-        // Clear deltas from original (they've been consumed)
-        router_outputs[output][player_id].current_state.delta_x = 0;
-        router_outputs[output][player_id].current_state.delta_y = 0;
-        
-        return &router_output_copy[output][player_id];
-    }
+    output_state_t* s = &router_outputs[output][player_id];
 
-    // No update - return NULL (don't re-process same deltas)
-    return NULL;
+    // Seqlock read: copy the payload between two matching even seq reads. If the
+    // producer wrote concurrently (seq odd, or changed across the copy), retry —
+    // bounded so the timing-critical console core can't stall (falls back to
+    // "no new data"). Copy straight into the private return buffer; a torn
+    // attempt is simply overwritten by the next try and never returned.
+    uint32_t s1, s2;
+    int tries = 0;
+    do {
+        s1 = s->seq;
+        if (s1 & 1u) {                          // writer mid-update
+            if (++tries > ROUTER_CONSUME_MAX_RETRY) return NULL;
+            continue;
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        router_output_copy[output][player_id] = s->current_state;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        s2 = s->seq;
+    } while (s1 != s2 && ++tries <= ROUTER_CONSUME_MAX_RETRY);
+
+    if ((s1 & 1u) || s1 != s2) return NULL;     // gave up cleanly → reuse last frame
+
+    // Edge detect: only hand out each published version once. seq==0 means "no
+    // data yet". Deltas are one-shot for free (each version returned exactly
+    // once), so no write-back into shared state is needed.
+    if (s1 == 0 || s1 == router_output_last_seq[output][player_id]) {
+        return NULL;
+    }
+    router_output_last_seq[output][player_id] = s1;
+    return &router_output_copy[output][player_id];
 }
 
 bool router_has_updates(output_target_t output) {
     if (output >= MAX_OUTPUTS) return false;
 
     for (uint8_t player = 0; player < MAX_PLAYERS_PER_OUTPUT; player++) {
-        if (router_outputs[output][player].updated) {
+        uint32_t seq = router_outputs[output][player].seq;
+        if ((seq & 1u) == 0 && seq != 0 && seq != router_output_last_seq[output][player]) {
             return true;
         }
     }
@@ -1374,11 +2049,13 @@ output_state_t* router_get_state_ptr(output_target_t output) {
 void router_reset_outputs(void) {
     printf(LOG_TAG "Resetting all outputs to neutral\n");
 
-    // Reset all output states
+    // Reset all output states — publish a neutral event so consumers see the
+    // change (seqlock bump) and drive their outputs to neutral.
+    input_event_t neutral;
+    init_input_event(&neutral);
     for (uint8_t output = 0; output < MAX_OUTPUTS; output++) {
         for (uint8_t player = 0; player < MAX_PLAYERS_PER_OUTPUT; player++) {
-            init_input_event(&router_outputs[output][player].current_state);
-            router_outputs[output][player].updated = true;  // Signal that state changed
+            router_publish(&router_outputs[output][player], &neutral);
         }
 
         // Clear blend device tracking
@@ -1392,8 +2069,41 @@ void router_reset_outputs(void) {
 }
 
 // Clean up router state when a device disconnects
+// Register a device as a player immediately on connect, without waiting for a
+// button press or analog activity. Opt-in (see CONFIG_REGISTER_ON_CONNECT in
+// hid.c): tournament builds (usb2neogeo_te) want a plugged pad to occupy its
+// slot instantly; the default apps keep press-to-join slot assignment.
+// Upstreamed from #175's router_te.c fork so the TE app tracks core router
+// fixes instead of freezing a copy.
+void router_register_device(uint8_t dev_addr, uint8_t instance,
+                            input_transport_t transport, const char* name)
+{
+    int8_t slot_inst = (int8_t)instance;
+    int player_index = find_player_index(dev_addr, slot_inst);
+    if (player_index < 0) {
+        player_index = add_player(dev_addr, slot_inst, transport, name);
+        if (player_index >= 0) {
+            printf(LOG_TAG "Player %d registered on connect: %s (dev_addr=%d)\n",
+                player_index + 1, name ? name : "Unknown", dev_addr);
+        }
+    }
+}
+
 void router_device_disconnected(uint8_t dev_addr, int8_t instance) {
     printf(LOG_TAG "Device disconnected: dev_addr=%d, instance=%d\n", dev_addr, instance);
+
+    // Drop any combo hold this device owned. Unplugging mid-hold produces no
+    // further events from it, so nothing else would ever clear the timer and
+    // the next press would measure against a stale timestamp — firing on frame
+    // one, which is exactly what the hold guard exists to prevent.
+    uint32_t gone = 0x10000u | ((uint32_t)dev_addr << 8) | (uint8_t)instance;
+    for (int c = 0; c < ROUTER_COMBO_MAX; c++) {
+        if (router_combos[c].held_dev == gone) {
+            router_combos[c].held_since = 0;
+            router_combos[c].held_dev = 0;
+            router_combos[c].fired = false;
+        }
+    }
 
     // Find the player index for this device
     int player_index = find_player_index(dev_addr, instance);
@@ -1422,10 +2132,12 @@ void router_device_disconnected(uint8_t dev_addr, int8_t instance) {
         }
     }
 
-    // For MERGE mode, all inputs go to player 0 - re-blend remaining devices
+    // For MERGE mode, all inputs go to player 0 - re-blend remaining devices.
+    // Build into a local and publish once (seqlock) so Core 1 never sees a torn
+    // frame mid-reblend.
     if (router_config.mode == ROUTING_MODE_MERGE) {
-        output_state_t* out_state = &router_outputs[output][0];
-        init_input_event(&out_state->current_state);
+        input_event_t rebuilt;
+        init_input_event(&rebuilt);
 
         if (router_config.merge_mode == MERGE_BLEND) {
             // Re-blend all remaining active devices
@@ -1435,52 +2147,71 @@ void router_device_disconnected(uint8_t dev_addr, int8_t instance) {
                 input_event_t* dev = &blend_devices[output][i].state;
 
                 // Buttons: OR together
-                out_state->current_state.buttons |= dev->buttons;
-                out_state->current_state.keys |= dev->keys;
+                rebuilt.buttons |= dev->buttons;
+                rebuilt.keys |= dev->keys;
 
                 // Analog: use furthest from center for sticks, max for triggers
                 // Format: [0]=LX, [1]=LY, [2]=RX, [3]=RY, [4]=L2, [5]=R2
                 for (int j = 0; j < ANALOG_COUNT; j++) {
                     if (j >= ANALOG_L2) {
                         // Triggers: use max value
-                        if (dev->analog[j] > out_state->current_state.analog[j]) {
-                            out_state->current_state.analog[j] = dev->analog[j];
+                        if (dev->analog[j] > rebuilt.analog[j]) {
+                            rebuilt.analog[j] = dev->analog[j];
                         }
                     } else {
                         // Sticks: use furthest from center
-                        int8_t cur_delta = (int8_t)(out_state->current_state.analog[j] - 128);
+                        int8_t cur_delta = (int8_t)(rebuilt.analog[j] - 128);
                         int8_t dev_delta = (int8_t)(dev->analog[j] - 128);
                         if (abs(dev_delta) > abs(cur_delta)) {
-                            out_state->current_state.analog[j] = dev->analog[j];
+                            rebuilt.analog[j] = dev->analog[j];
                         }
                     }
                 }
 
                 // Battery: use first device that reports battery
-                if (dev->battery_level > 0 && out_state->current_state.battery_level == 0) {
-                    out_state->current_state.battery_level = dev->battery_level;
-                    out_state->current_state.battery_charging = dev->battery_charging;
+                if (dev->battery_level > 0 && rebuilt.battery_level == 0) {
+                    rebuilt.battery_level = dev->battery_level;
+                    rebuilt.battery_charging = dev->battery_charging;
                 }
             }
         }
 
-        out_state->updated = true;
+        // No input controller reported a battery → fall back to this device's
+        // own battery (e.g. universal on a LiPo) so the SInput report
+        // carries real charge_level/plug_status.
+        if (rebuilt.battery_level == 0 && onboard_batt_pct >= 0) {
+            rebuilt.battery_level = (uint8_t)onboard_batt_pct;
+            rebuilt.battery_charging = onboard_batt_charging;
+        }
+        // Onboard IMU motion when no input device supplied any.
+        if (!rebuilt.has_motion && onboard_motion.valid) {
+            for (int mi = 0; mi < 3; mi++) {
+                rebuilt.accel[mi] = onboard_motion.accel[mi];
+                rebuilt.gyro[mi] = onboard_motion.gyro[mi];
+            }
+            rebuilt.accel_range = onboard_motion.accel_range;
+            rebuilt.gyro_range = onboard_motion.gyro_range;
+            rebuilt.has_motion = true;
+        }
+
+        router_publish(&router_outputs[output][0], &rebuilt);
 
         // Always notify tap with current state (zeroed or re-blended)
         if (output_taps[output]) {
-            output_taps[output](output, 0, &out_state->current_state);
+            output_taps[output](output, 0, &rebuilt);
         }
 
         printf(LOG_TAG "Updated merged output (player 0)\n");
     } else {
         // SIMPLE/BROADCAST mode: clear this player's specific output state
         if (player_index >= 0 && player_index < MAX_PLAYERS_PER_OUTPUT) {
-            init_input_event(&router_outputs[output][player_index].current_state);
-            router_outputs[output][player_index].updated = true;
+            input_event_t cleared;
+            init_input_event(&cleared);
+            router_publish(&router_outputs[output][player_index], &cleared);
 
             // Notify tap if registered (sends zeroed state to USB/UART output)
             if (output_taps[output]) {
-                output_taps[output](output, player_index, &router_outputs[output][player_index].current_state);
+                output_taps[output](output, player_index, &cleared);
             }
 
             printf(LOG_TAG "Cleared output state for player %d\n", player_index);
@@ -1490,19 +2221,38 @@ void router_device_disconnected(uint8_t dev_addr, int8_t instance) {
 
 
 void router_set_dpad_mode(uint8_t mode) {
-    if (mode <= 2) {
+    if (mode <= FLASH_DPAD_MODE_MAX) {
         global_dpad_mode = mode;
-        static const char* names[] = {"D-PAD", "LEFT STICK", "RIGHT STICK"};
+        // One name per valid mode — keep in step with FLASH_DPAD_MODE_MAX.
+        static const char* names[FLASH_DPAD_MODE_MAX + 1] = {
+            "NORMAL", "D-PAD<->LSTICK", "D-PAD<->RSTICK", "LSTICK<->RSTICK"
+        };
         printf(LOG_TAG "D-pad mode: %s\n", names[mode]);
     }
 }
 
 void router_set_combo(uint8_t index, uint32_t input_mask, uint32_t output_mask) {
     if (index >= ROUTER_COMBO_MAX) return;
+    // The first app-registered combo takes ownership of the table: wipe the
+    // built-in defaults installed by router_init() so they can't linger in slots
+    // the app leaves unused.
+    if (router_default_combos_active) {
+        router_default_combos_active = false;
+        for (int i = 0; i < ROUTER_COMBO_MAX; i++) {
+            router_combos[i].input_mask = 0;
+            router_combos[i].output_mask = 0;
+            router_combos[i].required_layout = 0;
+            router_combos[i].fired = false;
+            router_combos[i].held_since = 0;
+            router_combos[i].held_dev = 0;
+        }
+    }
     router_combos[index].input_mask = input_mask;
     router_combos[index].output_mask = output_mask;
     router_combos[index].required_layout = 0;  // any layout by default
     router_combos[index].fired = false;
+    router_combos[index].held_since = 0;
+    router_combos[index].held_dev = 0;
 }
 
 void router_set_combo_layout(uint8_t index, uint8_t required_layout) {
@@ -1513,3 +2263,8 @@ void router_set_combo_layout(uint8_t index, uint8_t required_layout) {
 void router_set_shoulder_swap(bool on) {
     global_shoulder_swap = on;
 }
+
+// Live getters — reflect the boot-restored value plus any hotkey/CDC change
+// immediately (unlike the flash record, whose write is debounced ~5s).
+uint8_t router_get_dpad_mode(void) { return global_dpad_mode; }
+bool router_get_shoulder_swap(void) { return global_shoulder_swap; }

@@ -8,7 +8,7 @@ Each app lives in `src/apps/<name>/` and contains:
 - **`app.h`** -- Version, compile-time constants (routing mode, max players, transform flags).
 - **`profiles.h`** -- Button remapping profiles (optional -- apps without this file pass buttons through unchanged).
 
-Building an app produces a standalone firmware binary: `releases/joypad_<commit>_<app>_<board>.uf2`
+Building an app produces a standalone firmware binary: `releases/joypad_os_<commit>_<app>_<board>.uf2`
 
 ## How Apps Work
 
@@ -72,6 +72,7 @@ These apps read retro controllers directly and output as USB HID gamepads.
 | `nes2usb` | NES | SIMPLE | KB2040 | `make nes2usb_kb2040` |
 | `neogeo2usb` | Neo Geo | SIMPLE | KB2040 | `make neogeo2usb_kb2040` |
 | `lodgenet2usb` | LodgeNet | SIMPLE | Pico | `make lodgenet2usb_pico` |
+| `24g2usb` | 24G (SF30 2.4G) | SIMPLE | Pico 2 W/Pico W/Pico/Pico 2 | `make 24g2usb_pico2_w` |
 | `nuon2usb` | Nuon | SIMPLE | KB2040 | `make nuon2usb_kb2040` |
 | `psx2usb` | PSX/PS2 | SIMPLE | QT Py/KB2040/Pico | `make psx2usb_qtpy` (or `_kb2040` / `_pico`) |
 
@@ -95,8 +96,8 @@ These apps read one retro controller and output to a different console.
 | `usb2ble` | USB to BLE peripheral output | KB2040 | `make usb2ble_kb2040` |
 | `nuonserial` | Nuon serial debug tool | KB2040 | `make nuonserial_kb2040` |
 | `controller` | Custom GPIO controller (Fisher Price, Alpakka, etc.) | Various | `make controller_<board>` |
-| `controller_btusb` | Custom GPIO controller with BLE+USB output | Pico W/ESP32-S3/nRF52840 | `make controller_btusb_<board>` |
-| `controller_btusb_rp2040_abb` | ABB GPIO + USB host controller | RP2040 ABB | `make controller_btusb_rp2040_abb` |
+| `universal` | Custom GPIO controller with BLE+USB output | Pico W/ESP32-S3/nRF52840 | `make universal_<board>` |
+| `universal_rp2040_abb` | ABB GPIO + USB host controller | RP2040 ABB | `make universal_rp2040_abb` |
 
 ## Board Variants
 

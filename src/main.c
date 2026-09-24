@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "hardware/clocks.h"   // set_sys_clock_khz (JOYPAD_USB_FAST_CLOCK)
 #include "pico/flash.h"
 
 #include "core/app_registry.h"
@@ -36,6 +37,7 @@ extern void app_task(void);
 extern const OutputInterface** app_get_output_interfaces(uint8_t* count);
 extern const InputInterface** app_get_input_interfaces(uint8_t* count);
 
+
 // Cached interfaces (set once at startup)
 static const OutputInterface** outputs = NULL;
 static uint8_t output_count = 0;
@@ -49,10 +51,24 @@ const OutputInterface* active_output = NULL;
 // native console output set this so the web config can configure pins/modes
 // even when running in CDC config mode (no console plugged in).
 const OutputInterface* native_output = NULL;
+const InputInterface* native_input = NULL;
+
+#ifdef ENABLE_PS4_LOCAL_AUTH
+// mbedTLS RSA-2048 signing on Core 1 needs ~6–8 KB of stack.
+// The default Core 1 stack lives in SCRATCH_X (4 KB total) and overflows,
+// causing a hard fault.  Allocate an 8 KB stack in main SRAM instead.
+static uint32_t s_core1_stack[0x2000 / sizeof(uint32_t)] __attribute__((aligned(8)));
+#endif
 
 // Store core1 task for wrapper - can be set after Core 1 launch
 static volatile void (*core1_actual_task)(void) = NULL;
 static volatile bool core1_task_ready = false;
+
+// Optional hook called from the Core 1 idle loop.
+// Override in an output-mode module to perform background work on Core 1.
+// IMPORTANT: Do NOT call flash_safe_execute() or any flash API from this hook —
+// flash ops must always originate from Core 0 while Core 1 handles lockout.
+__attribute__((weak)) void core1_idle_hook(void) {}
 
 // Core 1 wrapper - initializes flash safety, then waits for and runs actual task
 static void core1_wrapper(void) {
@@ -73,9 +89,12 @@ static void core1_wrapper(void) {
   if (core1_actual_task) {
     core1_actual_task();
   } else {
-    // No task - just idle forever while handling flash lockout requests
+    // No task - idle while handling flash lockout requests and optional hook work.
+    // core1_idle_hook() is a weak no-op by default; output modes may override it
+    // (e.g. PS4 auth offloads RSA signing here to avoid blocking Core 0).
     while (1) {
-      __wfi();  // Wait for interrupt (low power idle)
+      core1_idle_hook();
+      __wfe();  // Wait for event (woken by __sev() or interrupt)
     }
   }
 }
@@ -119,6 +138,18 @@ static void __not_in_flash_func(core0_main)(void)
 
 int main(void)
 {
+#ifdef JOYPAD_USB_FAST_CLOCK
+  // Board clock policy: raise to 200 MHz here, before ANY peripheral init.
+  // The UART/link baud, USB SOF, etc. all derive from the system clock, so it
+  // must be final before those are configured. usbd_init() also sets this, but
+  // only USB-DEVICE apps call usbd_init(); USB-HOST apps (e.g. the dual-RP2040
+  // remapper's host MCU) never do. On the remapper BOTH MCUs must share this
+  // clock or their 4 Mbps inter-MCU UART link computes mismatched bauds and no
+  // input passes through — so set it here on every fast-clock app, host or
+  // device. (200 MHz is the fastest build-supported clock; it keeps PS4
+  // local-auth RSA signing inside the console's challenge window.)
+  set_sys_clock_khz(200000, true);
+#endif
 #ifdef BOARD_LED_PIN
   // Early boot indicator — toggle LED before any PIO init
   gpio_init(BOARD_LED_PIN);
@@ -131,8 +162,14 @@ int main(void)
   // Console probes happen ~100-500ms after power-on. Every ms counts.
   // ========================================================================
 
-  // Launch Core 1 for flash_safe_execute support
+  // Launch Core 1 for flash_safe_execute support.
+  // When PS4 auth is enabled, use a larger stack in main SRAM because
+  // mbedTLS RSA-2048 signing overflows the 4 KB SCRATCH_X default region.
+#ifdef ENABLE_PS4_LOCAL_AUTH
+  multicore_launch_core1_with_stack(core1_wrapper, s_core1_stack, sizeof(s_core1_stack));
+#else
   multicore_launch_core1(core1_wrapper);
+#endif
 
   // PIO/joybus init — no dependency on stdio, flash, or profiles
   outputs = app_get_output_interfaces(&output_count);

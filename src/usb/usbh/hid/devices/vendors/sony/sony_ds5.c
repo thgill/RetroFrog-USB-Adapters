@@ -61,6 +61,24 @@ bool diff_report_ds5(sony_ds5_report_t const* rpt1, sony_ds5_report_t const* rpt
     return true;
   }
 
+  // Check tpad_f2_down and tpad_f2_pos too — without this, releasing the SECOND
+  // finger while the first is unchanged produced no new report, so the second
+  // touch point stayed stuck active (seen releasing a two-finger touch).
+  if (rpt1->tpad_f2_down != rpt2->tpad_f2_down ||
+    memcmp(rpt1->tpad_f2_pos, rpt2->tpad_f2_pos, sizeof(rpt1->tpad_f2_pos)) != 0) {
+    return true;
+  }
+
+  // Motion: a DualSense streams gyro/accel every report. Submit on ANY change
+  // so the output IMU tracks at the full poll rate (matching a direct connection)
+  // — a threshold here makes motion update in coarse steps (jumpy). Sensor noise
+  // means a real controller is essentially never identical frame-to-frame, so
+  // this streams continuously exactly like the real thing.
+  for (int i = 0; i < 3; i++) {
+    if (rpt1->gyro[i]  != rpt2->gyro[i]) return true;
+    if (rpt1->accel[i] != rpt2->accel[i]) return true;
+  }
+
   return false;
 }
 
@@ -220,17 +238,22 @@ void input_sony_ds5(uint8_t dev_addr, uint8_t instance, uint8_t const* report, u
         .analog = {analog_1x, analog_1y, analog_2x, analog_2y, analog_l, analog_r},
         .delta_x = touchpad_delta_x,  // Touchpad horizontal swipe as mouse-like delta
         .keys = 0,
-        // Motion data (DS5 has full 3-axis gyro and accel)
+        // Motion data (DS5 has full 3-axis gyro and accel).
+        // DS5 native frame already matches the canonical SDL frame -> identity.
         .has_motion = true,
         .accel = {ds5_report.accel[0], ds5_report.accel[1], ds5_report.accel[2]},
         .gyro = {ds5_report.gyro[0], ds5_report.gyro[1], ds5_report.gyro[2]},
+        .gyro_range = 2000,   // ±2000 dps, ±32767 full-scale
+        .accel_range = 4000,  // ±4g
         .battery_level = bat_level,
         .battery_charging = bat_charging,
-        // Touchpad (2-finger capacitive)
+        // Touchpad (2-finger capacitive). Normalize the raw DS5 coords (0..1919
+        // wide, 0..1079 tall) into the canonical 0..65535 touch space so output
+        // modes scale them correctly — matching ds5_bt.c.
         .has_touch = true,
         .touch = {
-          { .x = tx,  .y = ty,  .active = !ds5_report.tpad_f1_down },
-          { .x = tx2, .y = ty2, .active = !ds5_report.tpad_f2_down },
+          { .x = touch_norm_from_range(tx,  1919), .y = touch_norm_from_range(ty,  1079), .active = !ds5_report.tpad_f1_down },
+          { .x = touch_norm_from_range(tx2, 1919), .y = touch_norm_from_range(ty2, 1079), .active = !ds5_report.tpad_f2_down },
         },
       };
       router_submit_input(&event);
@@ -345,7 +368,13 @@ void output_sony_ds5(uint8_t dev_addr, uint8_t instance, device_output_config_t*
     ds5_devices[dev_addr].instances[instance].led_r = ds5_fb.lightbar_r;
     ds5_devices[dev_addr].instances[instance].led_g = ds5_fb.lightbar_g;
     ds5_devices[dev_addr].instances[instance].led_b = ds5_fb.lightbar_b;
-    tuh_hid_send_report(dev_addr, instance, 5, &ds5_fb, sizeof(ds5_fb));
+    // DualSense USB output report is 0x02 (report 5 is the DS4 output report and
+    // a silent no-op on a DualSense — this is why rumble/LEDs did nothing). The
+    // body is the 47-byte common block followed by reserved padding, 62 bytes
+    // total (Linux hid-playstation DS_OUTPUT_REPORT_USB_SIZE = 63 incl. id).
+    uint8_t out[62] = {0};
+    memcpy(out, &ds5_fb, sizeof(ds5_fb));
+    tuh_hid_send_report(dev_addr, instance, 0x02, out, sizeof(out));
   }
 }
 

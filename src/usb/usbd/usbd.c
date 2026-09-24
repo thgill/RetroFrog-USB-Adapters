@@ -15,8 +15,8 @@
 
 #include "usbd.h"
 #include "usbd_mode.h"
-#if defined(CONFIG_JOYBUS_BRIDGE)
-#include "hardware/clocks.h"  // set_sys_clock_khz — see joybus clock note in usbd_init
+#if defined(CONFIG_JOYBUS_BRIDGE) || defined(JOYPAD_USB_FAST_CLOCK)
+#include "hardware/clocks.h"  // set_sys_clock_khz — see clock policy in usbd_init
 #endif
 #include "descriptors/hid_descriptors.h"
 #include "descriptors/sinput_descriptors.h"
@@ -26,6 +26,8 @@
 #include "descriptors/ps3_descriptors.h"
 #include "descriptors/psclassic_descriptors.h"
 #include "descriptors/ps4_descriptors.h"
+#include "descriptors/dualsense_descriptors.h"
+#include "descriptors/p5general_descriptors.h"
 #include "descriptors/xbone_descriptors.h"
 #include "descriptors/xac_descriptors.h"
 #include "descriptors/kbmouse_descriptors.h"
@@ -48,6 +50,9 @@
 #include "core/services/profiles/profile.h"
 #ifndef DISABLE_USB_HOST
 #include "usb/usbh/hid/devices/vendors/sony/sony_ds4.h"
+#endif
+#ifdef ENABLE_PS4_LOCAL_AUTH
+#include "usb/usbd/modes/ps4_local_auth.h"
 #endif
 #include "tusb.h"
 #include "device/usbd_pvt.h"
@@ -91,20 +96,15 @@ static bool pending_flags[USB_MAX_PLAYERS] = {false};
 #define USB_SERIAL_LEN 12
 static char usb_serial_str[USB_SERIAL_LEN + 1];
 
-// Current output mode (persisted to flash)
-#if defined(CONFIG_USB2BLE) || defined(CONFIG_NGC)
+// Current output mode — override per-app via -DUSBD_DEFAULT_MODE=USB_OUTPUT_MODE_xxx
 #ifndef USBD_DEFAULT_MODE
-#define USBD_DEFAULT_MODE USB_OUTPUT_MODE_CDC
+#  if defined(CONFIG_USB2BLE) || defined(CONFIG_NGC) || defined(CONFIG_USB2WIFI)
+#    define USBD_DEFAULT_MODE USB_OUTPUT_MODE_CDC
+#  else
+#    define USBD_DEFAULT_MODE USB_OUTPUT_MODE_SINPUT
+#  endif
 #endif
 static usb_output_mode_t output_mode = USBD_DEFAULT_MODE;
-#else
-// Default to SInput, but allow a build to override (e.g. CH32 wch/ uses DInput so
-// the gamepad presents as a standard class-3 HID device for hosts/testers).
-#ifndef USBD_DEFAULT_MODE
-#define USBD_DEFAULT_MODE USB_OUTPUT_MODE_SINPUT
-#endif
-static usb_output_mode_t output_mode = USBD_DEFAULT_MODE;
-#endif
 
 // Forward declaration (defined in CONFIGURATION DESCRIPTOR section)
 static void build_config_descriptors(void);
@@ -126,6 +126,8 @@ static const char* mode_names[] = {
     [USB_OUTPUT_MODE_PCEMINI] = "PCE Mini",
     [USB_OUTPUT_MODE_CDC] = "CDC Config",
     [USB_OUTPUT_MODE_GBA_LINK] = "GBA Link (Dolphin)",
+    [USB_OUTPUT_MODE_DUALSENSE] = "DualSense",
+    [USB_OUTPUT_MODE_PS5] = "PlayStation 5",
 };
 
 // ============================================================================
@@ -150,6 +152,8 @@ void usbd_register_modes(void)
     usbd_modes[USB_OUTPUT_MODE_PS3] = &ps3_mode;
     usbd_modes[USB_OUTPUT_MODE_PSCLASSIC] = &psclassic_mode;
     usbd_modes[USB_OUTPUT_MODE_PS4] = &ps4_mode;
+    usbd_modes[USB_OUTPUT_MODE_DUALSENSE] = &dualsense_mode;
+    usbd_modes[USB_OUTPUT_MODE_PS5] = &p5general_mode;
     usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL] = &xid_mode;
     usbd_modes[USB_OUTPUT_MODE_XBONE] = &xbone_mode;
     usbd_modes[USB_OUTPUT_MODE_XAC] = &xac_mode;
@@ -361,6 +365,8 @@ bool usbd_set_mode(usb_output_mode_t mode)
         mode != USB_OUTPUT_MODE_XINPUT &&
         mode != USB_OUTPUT_MODE_PS3 &&
         mode != USB_OUTPUT_MODE_PS4 &&
+        mode != USB_OUTPUT_MODE_DUALSENSE &&
+        mode != USB_OUTPUT_MODE_PS5 &&
         mode != USB_OUTPUT_MODE_SWITCH &&
         mode != USB_OUTPUT_MODE_PSCLASSIC &&
         mode != USB_OUTPUT_MODE_XBONE &&
@@ -431,6 +437,17 @@ bool usbd_set_mode(usb_output_mode_t mode)
     // CH32 settings buffer lives in a .noinit section (see flash_wch.c).
     printf("[usbd] Resetting device for re-enumeration...\n");
     flush_debug_output();
+
+    // Detach and dwell before resetting so the host fully tears down the old
+    // USB personality. macOS 26 otherwise keeps stale state for the previous
+    // device at this port and refuses to configure the new descriptor set
+    // (observed switching into CDC-only mode: it read every descriptor but
+    // never sent SET_CONFIGURATION; a cold plug worked). ~600 ms detached
+    // reads as a real unplug.
+#ifndef PLATFORM_CH32
+    tud_disconnect();
+    platform_sleep_ms(600);
+#endif
     platform_reboot();
 
     return true;  // Never reached
@@ -520,6 +537,11 @@ bool usbd_reset_to_hid(void)
 // ============================================================================
 
 // Called by router immediately when input arrives (push-based notification)
+// Wireless-policy hook: strong impl in ble_output.c returns true under
+// WIRELESS_POLICY_BLE while a BLE host is subscribed; weak false everywhere
+// else so USB-only apps are unaffected.
+__attribute__((weak)) bool ble_output_suppresses_usb(void) { return false; }
+
 static void usbd_on_input(output_target_t output, uint8_t player_index, const input_event_t* event)
 {
     (void)output;  // Always USB_DEVICE
@@ -528,10 +550,10 @@ static void usbd_on_input(output_target_t output, uint8_t player_index, const in
         return;
     }
 
-    // Check for profile switch combo (SELECT + D-pad Up/Down after 2s hold)
-    // This enables hotkey profile cycling for both built-in and custom profiles
-    if (player_index == 0) {
-        profile_check_switch_combo(event->buttons);
+    // BLE-dominant policy: drop USB input reports while BLE owns the output.
+    // (USB stays enumerated and CDC config keeps working.)
+    if (ble_output_suppresses_usb()) {
+        return;
     }
 
     // Queue the event for sending when USB is ready
@@ -556,6 +578,16 @@ void usbd_init(void)
     // and GBA replies never decode (rx=000000 timeouts).
     bool clk_ok = set_sys_clock_khz(130000, true);
     printf("[usbd] sys_clock=130MHz set: %s\n", clk_ok ? "OK" : "FAIL");
+#elif defined(JOYPAD_USB_FAST_CLOCK)
+    // USB-output controller-emulation apps run at 200 MHz — the fastest
+    // build-supported clock, same value GP2040-CE uses — so PS4 local-auth
+    // RSA signing completes inside the console's ~challenge window (~1.7 s vs
+    // ~3.4 s at 125 MHz). Set here, once, before the USB stack starts: this is
+    // a board-level clock policy, not a per-driver runtime hack. Console-output
+    // and native-input apps never call usbd_init(), so they keep their own
+    // tuned clocks. Scoped in CMake (JOYPAD_USB_FAST_CLOCK) to wired RP2 apps.
+    bool clk_ok = set_sys_clock_khz(200000, true);
+    printf("[usbd] sys_clock=200MHz set: %s\n", clk_ok ? "OK" : "FAIL");
 #endif
     printf("[usbd] Initializing USB device output\n");
 
@@ -564,6 +596,10 @@ void usbd_init(void)
 
     // Initialize and load settings from flash
     flash_init();
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Load PS4 auth key material from flash (requires flash_init to have run first)
+    ps4_local_auth_init();
+#endif
     // Load saved mode from flash (runtime_settings holds the canonical state)
     flash_t* settings = flash_get_settings();
     if (settings) {
@@ -577,6 +613,8 @@ void usbd_init(void)
                 settings->usb_output_mode == USB_OUTPUT_MODE_XINPUT ||
                 settings->usb_output_mode == USB_OUTPUT_MODE_PS3 ||
                 settings->usb_output_mode == USB_OUTPUT_MODE_PS4 ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_DUALSENSE ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_PS5 ||
                 settings->usb_output_mode == USB_OUTPUT_MODE_SWITCH ||
                 settings->usb_output_mode == USB_OUTPUT_MODE_PSCLASSIC ||
                 settings->usb_output_mode == USB_OUTPUT_MODE_XBONE ||
@@ -672,6 +710,20 @@ void usbd_init(void)
             }
             break;
 
+        case USB_OUTPUT_MODE_DUALSENSE:
+            // PS5 DualSense passthrough: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_DUALSENSE] && usbd_modes[USB_OUTPUT_MODE_DUALSENSE]->init) {
+                usbd_modes[USB_OUTPUT_MODE_DUALSENSE]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_PS5:
+            // PS5 native (P5General dongle): delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_PS5] && usbd_modes[USB_OUTPUT_MODE_PS5]->init) {
+                usbd_modes[USB_OUTPUT_MODE_PS5]->init();
+            }
+            break;
+
         case USB_OUTPUT_MODE_XBONE:
             // Xbox One mode: delegate to mode interface
             if (usbd_modes[USB_OUTPUT_MODE_XBONE] && usbd_modes[USB_OUTPUT_MODE_XBONE]->init) {
@@ -755,6 +807,55 @@ void usbd_init(void)
     printf("[usbd] Initialization complete\n");
 }
 
+// ============================================================================
+// REMOTE WAKEUP
+// ============================================================================
+
+// Wake a suspended host on real user input.
+//
+// This has to live above the per-mode dispatch in usbd_task(), because every
+// gate below it bottoms out in tud_ready() — which TinyUSB defines as
+// tud_mounted() && !tud_suspended(), i.e. false exactly when the host is
+// asleep. Both the mode->is_ready() checks here and the TU_VERIFY(tud_*_ready())
+// at the top of each driver's send_report() therefore return early while
+// suspended, so a tud_remote_wakeup() placed anywhere inside those paths is
+// unreachable. Three drivers used to carry exactly that dead branch.
+//
+// Firing on router activity rather than on every task tick matters twice over:
+// router_ms_since_activity() is only stamped by a held button or a stick pushed
+// past a +/-24 noise margin, so a controller resting on a desk cannot wake the
+// host, and dcd_remote_wakeup() drives resume signalling on the bus, so it must
+// not be issued on idle polls. Retried on an interval because a single resume
+// can be missed by the host.
+#define USBD_WAKE_ACTIVITY_WINDOW_MS 500  // how recent input must be to count
+#define USBD_WAKE_RETRY_MS           250  // min gap between resume attempts
+
+static uint32_t usbd_wake_last_attempt_ms = 0;
+static bool     usbd_wake_armed = true;   // first attempt of a suspend is immediate
+
+static void usbd_try_remote_wakeup(void)
+{
+    if (!tud_suspended()) {
+        usbd_wake_armed = true;  // re-arm for the next suspend
+        return;
+    }
+
+    // Only genuine user input wakes the host.
+    if (router_ms_since_activity() > USBD_WAKE_ACTIVITY_WINDOW_MS) return;
+
+    uint32_t now = platform_time_ms();
+    if (!usbd_wake_armed && (now - usbd_wake_last_attempt_ms) < USBD_WAKE_RETRY_MS) {
+        return;
+    }
+
+    usbd_wake_last_attempt_ms = now;
+    usbd_wake_armed = false;
+
+    // No-op unless the host enabled DEVICE_REMOTE_WAKEUP during suspend, which
+    // is the correct behaviour for hosts that opted out.
+    tud_remote_wakeup();
+}
+
 void usbd_task(void)
 {
     // TinyUSB device task - runs from core0 main loop
@@ -765,6 +866,10 @@ void usbd_task(void)
 #else
     tud_task();
 #endif
+
+    // Must precede the dispatch below — nothing past this point runs while the
+    // host is suspended. See usbd_try_remote_wakeup().
+    usbd_try_remote_wakeup();
 
     switch (output_mode) {
         case USB_OUTPUT_MODE_XBOX_ORIGINAL: {
@@ -834,16 +939,44 @@ void usbd_task(void)
             break;
         }
 
-        case USB_OUTPUT_MODE_PS4:
-            // PS4 mode: send HID report (no CDC)
+        case USB_OUTPUT_MODE_PS4: {
+            // PS4 mode: process CDC tasks, run mode task (RSA signing), then send HID report
+            cdc_task();
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->task) mode->task();
             if (tud_hid_ready()) {
                 usbd_send_report(0);
             }
             break;
+        }
 
         case USB_OUTPUT_MODE_XBONE: {
             // Xbox One mode: delegate to mode interface
             const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBONE];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_DUALSENSE: {
+            // PS5 DualSense passthrough: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_PS5: {
+            // PS5 native (P5General dongle): delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS5];
             if (mode) {
                 if (mode->task) mode->task();
                 if (mode->is_ready && mode->is_ready()) {
@@ -1175,6 +1308,36 @@ static bool usbd_send_ps4_report(uint8_t player_index)
     return mode->send_report(player_index, event, &profile_out, processed_buttons);
 }
 
+// Send DualSense (PS5) report - delegates to mode interface
+static bool usbd_send_ds5_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) return false;
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send PS5 (P5General) report - delegates to mode interface. Unlike DualSense,
+// each report is signed by the dongle before it goes to the PS5; the mode's
+// send_report drives that pipeline (build -> dongle -> forward signed report).
+static bool usbd_send_p5general_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS5];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) return false;
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
 // Send Xbox One report - delegates to mode interface
 static bool usbd_send_xbone_report(uint8_t player_index)
 {
@@ -1287,6 +1450,10 @@ bool usbd_send_report(uint8_t player_index)
             return usbd_send_pcemini_report(player_index);
         case USB_OUTPUT_MODE_PS4:
             return usbd_send_ps4_report(player_index);
+        case USB_OUTPUT_MODE_DUALSENSE:
+            return usbd_send_ds5_report(player_index);
+        case USB_OUTPUT_MODE_PS5:
+            return usbd_send_p5general_report(player_index);
         case USB_OUTPUT_MODE_XBONE:
             return usbd_send_xbone_report(player_index);
         case USB_OUTPUT_MODE_XAC:
@@ -1339,6 +1506,14 @@ static uint8_t usbd_get_rumble(void)
         case USB_OUTPUT_MODE_PS4: {
             // PS4: delegate to mode interface
             const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+        case USB_OUTPUT_MODE_DUALSENSE: {
+            // PS5 DualSense: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
             if (mode && mode->get_rumble) {
                 return mode->get_rumble();
             }
@@ -1416,6 +1591,15 @@ static bool usbd_get_feedback(output_feedback_t* fb)
         case USB_OUTPUT_MODE_PS4: {
             // PS4: delegate to mode interface
             const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+
+        case USB_OUTPUT_MODE_DUALSENSE: {
+            // PS5 DualSense: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
             if (mode && mode->get_feedback) {
                 return mode->get_feedback(fb);
             }
@@ -1544,6 +1728,7 @@ static const tusb_desc_device_t desc_device_cdc = {
     .bDeviceClass       = TUSB_CLASS_MISC,
     .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
     .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+    .bDescriptorType    = TUSB_DESC_DEVICE,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_CDC_VID,
     .idProduct          = USB_CDC_PID,
@@ -1600,6 +1785,10 @@ uint8_t const *tud_descriptor_device_cb(void)
             return (uint8_t const *)&pcemini_device_descriptor;
         case USB_OUTPUT_MODE_PS4:
             return (uint8_t const *)&ps4_device_descriptor;
+        case USB_OUTPUT_MODE_DUALSENSE:
+            return (uint8_t const *)&ds5_device_descriptor;
+        case USB_OUTPUT_MODE_PS5:
+            return (uint8_t const *)&p5general_device_descriptor;
         case USB_OUTPUT_MODE_XBONE:
             return (uint8_t const *)&xbone_device_descriptor;
         case USB_OUTPUT_MODE_XAC:
@@ -1656,10 +1845,16 @@ static const uint8_t desc_frag_cdc0[] = {
 #endif
 };
 
-// CDC-only fragment (no HID interfaces — CDC starts at interface 0)
-#define EPNUM_CDC_ONLY_NOTIF  0x81
-#define EPNUM_CDC_ONLY_OUT    0x01
-#define EPNUM_CDC_ONLY_IN     0x82
+// CDC-only fragment (no HID interfaces — CDC starts at interface 0).
+// KNOWN BUG (open): on ESP32-S3 this mode enumerates far enough for the host
+// to read strings but never configures (macOS: device stuck !matched, no
+// serial port; invisible to libusb). Not the EP numbers — 0x81/0x01/0x82 and
+// the composite's proven 0x82/0x03/0x83 both fail identically. Works on
+// RP2040 (gc2eth/CONFIG_NGC). Until root-caused, don't ship ESP32 boards
+// defaulted to this mode; NUS.MODE via a paired dongle is the escape hatch.
+#define EPNUM_CDC_ONLY_NOTIF  0x82
+#define EPNUM_CDC_ONLY_OUT    0x03
+#define EPNUM_CDC_ONLY_IN     0x83
 static const uint8_t desc_frag_cdc_only[] = {
     TUD_CDC_DESCRIPTOR(0, 4, EPNUM_CDC_ONLY_NOTIF, 8, EPNUM_CDC_ONLY_OUT, EPNUM_CDC_ONLY_IN, 64),
 };
@@ -1736,11 +1931,26 @@ static void build_config_descriptors(void)
     memcpy(runtime_desc_cdc, cdc_header, TUD_CONFIG_DESC_LEN);
 }
 
+// Diagnostic stage marker — strong impl on nRF (noinit ring in nrf/src/main.c),
+// weak no-op elsewhere (apps that don't link ble_output.c still need a symbol).
+__attribute__((weak)) void bt_diag_mark(uint32_t code) { (void)code; }
+
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
     (void)index;
     switch (output_mode) {
         case USB_OUTPUT_MODE_CDC:
+            // Reset-surviving breadcrumb (BT.TRACE on nRF): when a fast
+            // persona-switch reboot leaves the host holding stale state,
+            // macOS 26 reads the config twice and never sends
+            // SET_CONFIGURATION (fixed by the detach-dwell in
+            // usbd_set_mode). The mark keeps that diagnosis repeatable:
+            // 0xCFxx00LL = xx-th request this boot, LL = wTotalLength low.
+            {
+                static uint8_t cfg_req_count;
+                bt_diag_mark(0xCF000000u | ((uint32_t)cfg_req_count++ << 16) |
+                             runtime_desc_cdc[2]);
+            }
             return runtime_desc_cdc;
         case USB_OUTPUT_MODE_SINPUT:
             return runtime_desc_sinput;
@@ -1758,6 +1968,10 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
             return pcemini_config_descriptor;
         case USB_OUTPUT_MODE_PS4:
             return ps4_config_descriptor;
+        case USB_OUTPUT_MODE_DUALSENSE:
+            return ds5_config_descriptor;
+        case USB_OUTPUT_MODE_PS5:
+            return p5general_config_descriptor;
         case USB_OUTPUT_MODE_XBONE:
             return xbone_config_descriptor;
         case USB_OUTPUT_MODE_XAC:
@@ -1943,6 +2157,10 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
                 str = PCEMINI_MANUFACTURER;
             } else if (output_mode == USB_OUTPUT_MODE_PS4) {
                 str = PS4_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_DUALSENSE) {
+                str = DS5_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_PS5) {
+                str = P5GENERAL_MANUFACTURER;
             } else if (output_mode == USB_OUTPUT_MODE_XAC) {
                 str = XAC_MANUFACTURER;
             } else if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
@@ -1974,6 +2192,10 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
                 str = PCEMINI_PRODUCT;
             } else if (output_mode == USB_OUTPUT_MODE_PS4) {
                 str = PS4_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_DUALSENSE) {
+                str = DS5_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_PS5) {
+                str = P5GENERAL_PRODUCT;
             } else if (output_mode == USB_OUTPUT_MODE_XAC) {
                 str = XAC_PRODUCT;
             } else if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
@@ -1993,7 +2215,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
             break;
 #if CFG_TUD_CDC >= 1
         case STRID_CDC_DATA:
-            str = "Joypad Data";
+            str = "JoypadOS Data";
             break;
 #endif
         default:
@@ -2043,6 +2265,12 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf)
     if (output_mode == USB_OUTPUT_MODE_PS4) {
         return ps4_report_descriptor;
     }
+    if (output_mode == USB_OUTPUT_MODE_DUALSENSE) {
+        return ds5_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_PS5) {
+        return p5general_report_descriptor;
+    }
     if (output_mode == USB_OUTPUT_MODE_XAC) {
         const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XAC];
         if (mode && mode->get_report_descriptor) {
@@ -2088,6 +2316,25 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
         }
     }
 
+    // PS5 DualSense auth feature reports: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_DUALSENSE) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
+        if (mode && mode->get_report) {
+            uint16_t result = mode->get_report(report_id, report_type, buffer, reqlen);
+            if (result > 0) return result;
+        }
+    }
+
+    // PS5 native (P5General) definition + auth feature reports (0x03/F1/F2)
+    if (output_mode == USB_OUTPUT_MODE_PS5) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS5];
+        if (mode && mode->get_report) {
+            uint16_t result = mode->get_report(report_id, report_type, buffer, reqlen);
+            if (result > 0) return result;
+        }
+        if (report_type == HID_REPORT_TYPE_FEATURE) return 0;  // STALL unknown features
+    }
+
     // Default: return current input report
     (void)report_id;
     (void)report_type;
@@ -2106,8 +2353,9 @@ __attribute__((weak)) void app_on_console_shutdown(void)
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
-    printf("[usbd] set_report_cb: itf=%d report_id=0x%02x type=%d len=%d mode=%d\n",
-           itf, report_id, report_type, bufsize, output_mode);
+    // NOTE: no per-call logging here. This runs on every host SET_REPORT, and a
+    // host that streams output reports (e.g. macOS/PS5 pushing DualSense LED/haptics)
+    // would turn a blocking UART printf into a Core0-starving storm → USB timeouts.
 
     // SInput/KB/Mouse composite: route by interface
     if (output_mode == USB_OUTPUT_MODE_SINPUT ||
@@ -2154,6 +2402,33 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
         // Also handle feature reports for auth
         if (report_type == HID_REPORT_TYPE_FEATURE) {
             ps4_mode_set_feature_report(report_id, buffer, bufsize);
+        }
+        return;
+    }
+
+    // PS5 DualSense output/auth feature reports: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_DUALSENSE) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_DUALSENSE];
+        if (mode && mode->handle_output) {
+            mode->handle_output(report_id, buffer, bufsize);
+        }
+        if (report_type == HID_REPORT_TYPE_FEATURE) {
+            ds5_mode_set_feature_report(report_id, buffer, bufsize);
+        }
+        return;
+    }
+
+    // PS5 native (P5General): auth feature reports (F0 challenge from the console)
+    // + DualSense-style output reports (rumble / player LED / lightbar) on the OUT
+    // endpoint, relayed to the connected pad via handle_output → get_feedback.
+    if (output_mode == USB_OUTPUT_MODE_PS5) {
+        if (report_type == HID_REPORT_TYPE_FEATURE) {
+            p5general_mode_set_feature_report(report_id, buffer, bufsize);
+        } else {
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS5];
+            if (mode && mode->handle_output) {
+                mode->handle_output(report_id, buffer, bufsize);
+            }
         }
         return;
     }

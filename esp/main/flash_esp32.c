@@ -79,6 +79,12 @@ bool flash_load(flash_t* settings)
     }
 
     current_sequence = settings->sequence;
+
+    unsigned fixed = flash_sanitize_record(settings);
+    if (fixed) {
+        printf("[flash] %u incoherent field(s) in stored record reset to defaults\n", fixed);
+    }
+
     return true;
 }
 
@@ -91,10 +97,16 @@ void flash_save(const flash_t* settings)
     last_change_ms = platform_time_ms();
 }
 
+// Diagnostic: committed NVS writes since boot (see flash.h). A climbing count
+// while idle means something persists settings in a hot path.
+volatile uint32_t g_flash_write_count = 0;
+uint32_t flash_get_write_count(void) { return g_flash_write_count; }
+
 void flash_save_now(const flash_t* settings)
 {
     if (!nvs_opened) return;
 
+    g_flash_write_count++;
     static flash_t write_settings;
     memcpy(&write_settings, settings, sizeof(flash_t));
     write_settings.magic = SETTINGS_MAGIC;
@@ -270,7 +282,7 @@ void flash_factory_reset(void)
 // survives a reboot, mirroring the RP2040 flash_set_dpad_mode contract.
 void flash_set_dpad_mode(uint8_t mode)
 {
-    if (mode > 2) return;
+    if (mode > 3) return;   // 0-3; mode 3 = LSTICK<->RSTICK (see flash.c)
     if (!runtime_settings_loaded) return;
     if (runtime_settings.dpad_mode == mode && runtime_settings.router_saved) return;
     runtime_settings.dpad_mode  = mode;
@@ -288,6 +300,20 @@ void flash_set_shoulder_swap(uint8_t on)
     if (runtime_settings.shoulder_swap == on && runtime_settings.router_saved) return;
     runtime_settings.shoulder_swap = on;
     runtime_settings.router_saved = 1;
+    flash_save(&runtime_settings);
+}
+
+uint8_t flash_get_builtin_disabled_mask(void)
+{
+    if (!runtime_settings_loaded) return 0;
+    return runtime_settings.builtin_disabled_mask;
+}
+
+void flash_set_builtin_disabled_mask(uint8_t mask)
+{
+    if (!runtime_settings_loaded) return;
+    if (runtime_settings.builtin_disabled_mask == mask) return;
+    runtime_settings.builtin_disabled_mask = mask;
     flash_save(&runtime_settings);
 }
 

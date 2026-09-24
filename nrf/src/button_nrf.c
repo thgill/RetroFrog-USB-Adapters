@@ -2,8 +2,9 @@
 //
 // Implements button.h using Zephyr GPIO. Active low with internal pull-up.
 //
-// XIAO nRF52840:   D1 = P0.03 on gpio0
+// XIAO nRF52840:    D1 = P0.03 on gpio0
 // Feather nRF52840: User switch = P1.02 on gpio1
+// Makerdiary MDK:   USER button = P0.18 on gpio0 (overlay drops gpio-as-nreset)
 
 #include "core/services/button/button.h"
 #include "platform/platform.h"
@@ -14,6 +15,10 @@
 #define BUTTON_PORT_LABEL DT_NODELABEL(gpio1)
 #define BUTTON_PIN 2   // P1.02 (User switch)
 #define BUTTON_PIN_STR "P1.02"
+#elif defined(BOARD_MAKERDIARY_NRF52840)
+#define BUTTON_PORT_LABEL DT_NODELABEL(gpio0)
+#define BUTTON_PIN 18  // P0.18 (onboard USER button)
+#define BUTTON_PIN_STR "P0.18"
 #else
 #define BUTTON_PORT_LABEL DT_NODELABEL(gpio0)
 #define BUTTON_PIN 3   // P0.03 (D1)
@@ -89,6 +94,14 @@ static button_event_t fire_event(button_event_t event)
 
 void button_init(void)
 {
+#ifdef DISABLE_USER_BUTTON
+    // No dedicated user button on this board, and its default pin collides
+    // with a pad/gamepad GPIO (e.g. XIAO D1/P0.03). Leave button_port NULL so
+    // button_task() never fires events — frees the pin for pad input.
+    button_port = NULL;
+    printf("[button] User button disabled (pin reserved for pad input)\n");
+    return;
+#else
     button_port = DEVICE_DT_GET(BUTTON_PORT_LABEL);
     if (!device_is_ready(button_port)) {
         printf("[button] GPIO port not ready\n");
@@ -105,6 +118,7 @@ void button_init(void)
     click_count = 0;
 
     printf("[button] Initialized on %s\n", BUTTON_PIN_STR);
+#endif // DISABLE_USER_BUTTON
 }
 
 button_event_t button_task(void)

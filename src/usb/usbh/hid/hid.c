@@ -2,6 +2,7 @@
 #include "tusb.h"
 #include <stdio.h>
 #include "core/buttons.h"
+#include "core/router/router.h"   // router_register_device (CONFIG_REGISTER_ON_CONNECT)
 #include "core/output_interface.h"
 #include "core/services/players/manager.h"
 #include "core/services/players/feedback.h"
@@ -10,6 +11,8 @@
 #include "usb/usbh/hid/hid_utils.h"
 #include "usb/usbh/hid/hid_registry.h"
 #include "usb/usbh/hid/devices/vendors/sony/sony_ds4.h"
+#include "usb/usbh/hid/devices/vendors/sony/ds5_auth.h"
+#include "usb/usbh/hid/devices/vendors/sony/p5general_host.h"
 
 #define LANGUAGE_ID 0x0409
 #define MAX_REPORTS 5
@@ -52,6 +55,10 @@ void hid_task(void)
 {
   // Process DS4 auth passthrough
   ds4_auth_task();
+  // Process DS5 (DualSense) auth passthrough — see ds5_auth.h (sniff-gated)
+  ds5_auth_task();
+  // Process P5General dongle relay (PS5 native output) — see p5general_host.h
+  p5general_host_task();
 
   // Get test mode counter (for LED test patterns)
   uint8_t test_counter = codes_get_test_counter();
@@ -73,6 +80,7 @@ void hid_task(void)
       case CONTROLLER_SWITCH: // send Switch Pro init, LED and rumble commands
       case CONTROLLER_SWITCH2: // send Switch 2 Pro init, LED and rumble commands
       case CONTROLLER_SINPUT: // send SInput rumble, player LED, and RGB LED
+      case CONTROLLER_STEAM_2: // send SC2 lizard-disable heartbeat + rumble
       case CONTROLLER_SIDEWINDER_COMMANDER: // send Strategic Commander LEDs
         {
           // Get per-player feedback state
@@ -190,15 +198,25 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
   case CONTROLLER_SINPUT:
   case CONTROLLER_SIDEWINDER_COMMANDER:
   case CONTROLLER_STEAM_2:
+  case CONTROLLER_STEAM_1:
     device_interfaces[dev_type]->init(dev_addr, instance);
     break;
   case CONTROLLER_DUALSHOCK4:
     // Register DS4 for auth passthrough
     ds4_auth_register(dev_addr, instance);
     break;
+  case CONTROLLER_DUALSENSE:
+    // Register DualSense for PS5 auth passthrough (sniff-gated, see ds5_auth.h)
+    ds5_auth_register(dev_addr, instance);
+    break;
   default:
     break;
   }
+
+  // A P5General auth dongle (VID 0x2B81) may enumerate as a generic HID gamepad;
+  // claim it for the PS5-native relay (self-gates on VID/PID) so its reports are
+  // routed to the dongle relay instead of the input pipeline.
+  p5general_host_mount(dev_addr, instance);
 
   if (dev_type == CONTROLLER_UNKNOWN)
   {
@@ -234,6 +252,17 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
     }
   }
 
+#ifdef CONFIG_REGISTER_ON_CONNECT
+  // Tournament builds (usb2neogeo_te): register the device as a player
+  // immediately on connect — no button press needed, works for all
+  // controller types including digital-only sticks. Default apps keep
+  // press-to-join slot assignment.
+  router_register_device(dev_addr, instance, INPUT_TRANSPORT_USB,
+                         devices[dev_addr].product_name[0]
+                             ? devices[dev_addr].product_name
+                             : "USB Controller");
+#endif
+
   // request to receive report
   // tuh_hid_report_received_cb() will be invoked when report is available
   if ( !tuh_hid_receive_report(dev_addr, instance) )
@@ -247,6 +276,9 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
   printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
 
+  // Release the P5General dongle if this was it (self-gates on dev_addr).
+  p5general_host_unmount(dev_addr);
+
   // Reset device states
   dev_type_t dev_type = devices[dev_addr].instances[instance].type;
   switch (dev_type)
@@ -259,6 +291,9 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     // Unregister DS4 from auth passthrough
     if (dev_type == CONTROLLER_DUALSHOCK4) {
       ds4_auth_unregister(dev_addr, instance);
+    }
+    if (dev_type == CONTROLLER_DUALSENSE) {
+      ds5_auth_unregister(dev_addr, instance);
     }
     break;
   case CONTROLLER_KEYBOARD:
@@ -278,6 +313,14 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
 {
+  // P5General dongle: its interrupt-IN report IS the signed controller report.
+  // Route it to the relay (NOT the input pipeline) and re-arm.
+  if (p5general_host_is_dongle(dev_addr)) {
+    p5general_host_report_received(dev_addr, instance, report, len);
+    tuh_hid_receive_report(dev_addr, instance);
+    return;
+  }
+
   dev_type_t dev_type = devices[dev_addr].instances[instance].type;
   if (dev_type == CONTROLLER_UNKNOWN)
   {
@@ -413,4 +456,9 @@ void hid_set_product_name(uint8_t dev_addr, const char* name)
   if (dev_addr >= MAX_DEVICES || !name) return;
   strncpy(devices[dev_addr].product_name, name, PRODUCT_NAME_LEN - 1);
   devices[dev_addr].product_name[PRODUCT_NAME_LEN - 1] = '\0';
+#ifdef CONFIG_REGISTER_ON_CONNECT
+  // XInput controllers arrive through here rather than the HID mount path;
+  // register immediately so they don't need a button press either.
+  router_register_device(dev_addr, 0, INPUT_TRANSPORT_USB, name);
+#endif
 }

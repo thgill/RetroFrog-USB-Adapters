@@ -3,7 +3,7 @@
 //
 // Supports two modes:
 //   - Central (bt2usb): scans/connects BLE controllers via btstack_host
-//   - Peripheral (controller_btusb): advertises as BLE gamepad via ble_output
+//   - Peripheral (universal): advertises as BLE gamepad via ble_output
 // Mode is selected via bt_esp32_set_post_init() callback before bt_init().
 
 #include "bt_transport.h"
@@ -148,7 +148,7 @@ static void esp32_transport_init(void)
     // All BTstack initialization happens in the dedicated task (same pattern
     // as BTstack ESP32 template). This ensures BT controller init, HCI, and
     // run loop all execute in the same FreeRTOS task context.
-    xTaskCreate(btstack_run_loop_task, "btstack", 8192, NULL,
+    xTaskCreate(btstack_run_loop_task, "btstack", 12288, NULL,
                 configMAX_PRIORITIES - 2, NULL);
 }
 

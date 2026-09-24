@@ -45,6 +45,9 @@ endif
 # Use external TinyUSB (keeps pico-sdk clean)
 export PICO_TINYUSB_PATH := $(CURDIR)/src/lib/tinyusb
 
+# Cache picotool outside build dir so rm -rf build doesn't re-trigger download
+export PICOTOOL_FETCH_FROM_GIT_PATH := $(HOME)/.picotool
+
 # Board-specific build scripts
 BOARD_SCRIPT_pico := boards/build_rpi_pico.sh
 BOARD_SCRIPT_pico_w := boards/build_pico_w.sh
@@ -58,6 +61,7 @@ BOARD_SCRIPT_feather_usbhost := boards/build_ada_feather_usbhost.sh
 BOARD_SCRIPT_feather := boards/build_ada_feather.sh
 BOARD_SCRIPT_macropad := boards/build_ada_macropad.sh
 BOARD_SCRIPT_rp2350usba := boards/build_waveshare_rp2350_usb_a.sh
+BOARD_SCRIPT_rp2350zero := boards/build_waveshare_rp2350_zero.sh
 BOARD_SCRIPT_rp2040_eth := boards/build_waveshare_rp2040_eth.sh
 BOARD_SCRIPT_waveshare_rp2350b_plus_w := boards/build_waveshare_rp2350b_plus_w.sh
 
@@ -85,6 +89,10 @@ CONSOLE_neogeo := joypad_neogeo
 CONSOLE_neogeo_pico := joypad_neogeo_pico
 CONSOLE_neogeo_rp2040zero := joypad_neogeo_rp2040zero
 CONSOLE_neogeo_retrofrog := joypad_neogeo_retrofrog
+CONSOLE_neogeo_te := joypad_neogeo_te
+CONSOLE_neogeo_te_pico := joypad_neogeo_te_pico
+CONSOLE_neogeo_te_rp2040zero := joypad_neogeo_te_rp2040zero
+CONSOLE_neogeo_te_pico2p := joypad_neogeo_te_pico2p
 CONSOLE_n642dc := joypad_n642dc
 CONSOLE_n642dc_pico2_w := joypad_n642dc_pico2_w
 CONSOLE_n642nuon := joypad_n642nuon
@@ -110,10 +118,12 @@ CONSOLE_btusb2usb := joypad_btusb2usb
 CONSOLE_usb2ble := joypad_usb2ble
 CONSOLE_n64 := joypad_n64
 CONSOLE_wifi2usb := joypad_wifi2usb
+CONSOLE_usb2wifi := joypad_usb2wifi
 CONSOLE_snes2usb := joypad_snes2usb
 CONSOLE_psx2usb := joypad_psx2usb
 CONSOLE_nes2usb := joypad_nes2usb
 CONSOLE_pce2usb := joypad_pce2usb
+CONSOLE_jag2usb := joypad_jag2usb
 CONSOLE_n642usb := joypad_n642usb
 CONSOLE_nuon2usb := joypad_nuon2usb
 CONSOLE_gc2usb := joypad_gc2usb
@@ -124,6 +134,7 @@ CONSOLE_gc2eth_feather := joypad_gc2eth_feather
 CONSOLE_wii2usb := joypad_wii2usb
 CONSOLE_wii2gc := joypad_wii2gc
 CONSOLE_wii2n64 := joypad_wii2n64
+CONSOLE_24g2usb := joypad_24g2usb
 CONSOLE_lodgenet2usb := joypad_lodgenet2usb
 CONSOLE_lodgenet2n64 := joypad_lodgenet2n64
 CONSOLE_lodgenet2gc := joypad_lodgenet2gc
@@ -136,13 +147,14 @@ CONSOLE_controller_alpakka := joypad_controller_alpakka
 CONSOLE_controller_macropad := joypad_controller_macropad
 CONSOLE_bt2gc := joypad_bt2gc
 CONSOLE_bt2wiiext := joypad_bt2wiiext
-CONSOLE_controller_btusb := joypad_controller_btusb
-CONSOLE_controller_btusb_rp2040_abb := joypad_controller_btusb_rp2040_abb
-CONSOLE_controller_btusb_feather_rp2040 := joypad_controller_btusb_feather_rp2040
-CONSOLE_controller_btusb_feather_rp2040_usb_host := joypad_controller_btusb_feather_rp2040_usb_host
-CONSOLE_controller_btusb_fisherprice_v1 := joypad_controller_btusb_fisherprice_v1
-CONSOLE_controller_btusb_fisherprice_v2 := joypad_controller_btusb_fisherprice_v2
-CONSOLE_controller_btusb_alpakka := joypad_controller_btusb_alpakka
+CONSOLE_universal := joypad_universal
+CONSOLE_universal_rp2040_abb := joypad_universal_rp2040_abb
+CONSOLE_universal_feather_rp2040 := joypad_universal_feather_rp2040
+CONSOLE_universal_feather_rp2040_usb_host := joypad_universal_feather_rp2040_usb_host
+CONSOLE_universal_fisherprice_v1 := joypad_universal_fisherprice_v1
+CONSOLE_universal_fisherprice_v2 := joypad_universal_fisherprice_v2
+CONSOLE_universal_alpakka := joypad_universal_alpakka
+CONSOLE_universal_rp2040zero := joypad_universal_rp2040zero
 
 
 # App definitions: APP_name = board target output_name input output
@@ -165,6 +177,10 @@ APP_usb2neogeo_kb2040 := kb2040 neogeo usb2neogeo_kb2040 USB/BT NEOGEO
 APP_usb2neogeo_pico := pico neogeo_pico usb2neogeo_pico USB/BT NEOGEO
 APP_usb2neogeo_rp2040zero := rp2040zero neogeo_rp2040zero usb2neogeo_rp2040zero USB/BT NEOGEO
 APP_usb2neogeo_retrofrog := rp2040zero neogeo_retrofrog usb2neogeo_retrofrog USB/BT NEOGEO
+APP_usb2neogeo_te_kb2040 := kb2040 neogeo_te usb2neogeo_te_kb2040 USB/BT NEOGEO
+APP_usb2neogeo_te_pico := pico neogeo_te_pico usb2neogeo_te_pico USB/BT NEOGEO
+APP_usb2neogeo_te_rp2040zero := rp2040zero neogeo_te_rp2040zero usb2neogeo_te_rp2040zero USB/BT NEOGEO
+APP_usb2neogeo_te_pico2p := pico neogeo_te_pico2p usb2neogeo_te_pico2p USB/BT NEOGEO
 APP_n642dc_kb2040 := kb2040 n642dc n642dc_kb2040 N64 Dreamcast
 APP_n642dc_pico2_w := pico2_w n642dc_pico2_w n642dc_pico2_w N64 Dreamcast
 APP_gc2dc_kb2040 := kb2040 gc2dc gc2dc_kb2040 GameCube Dreamcast
@@ -173,6 +189,8 @@ APP_nes2usb_pico_w := pico_w nes2usb nes2usb_pico_w NES USB
 APP_pce2usb_kb2040 := kb2040 pce2usb pce2usb_kb2040 PCEngine USB
 APP_pce2usb_pico := pico pce2usb pce2usb_pico PCEngine USB
 APP_pce2usb_pico_w := pico_w pce2usb pce2usb_pico_w PCEngine USB
+APP_jag2usb_pico := pico jag2usb jag2usb_pico Jaguar USB
+APP_jag2usb_pico_w := pico_w jag2usb jag2usb_pico_w Jaguar USB
 APP_n642nuon_pico := pico n642nuon n642nuon_pico N64 Nuon
 APP_n642nuon_aries64 := pico n642nuon_aries64 n642nuon_aries64 N64 Nuon
 APP_usb23do_rp2040zero := rp2040zero 3do usb23do_rp2040zero USB/BT 3DO
@@ -213,6 +231,8 @@ APP_usb2ble_pico2_w := pico2_w usb2ble usb2ble_pico2_w USB BLE
 APP_usb2n64_kb2040 := kb2040 n64 usb2n64_kb2040 USB/BT N64
 APP_wifi2usb_pico_w := pico_w wifi2usb wifi2usb_pico_w WiFi USB
 APP_wifi2usb_pico2_w := pico2_w wifi2usb wifi2usb_pico2_w WiFi USB
+APP_usb2wifi_pico_w := pico_w usb2wifi usb2wifi_pico_w USB RemotePlay
+APP_usb2wifi_pico2_w := pico2_w usb2wifi usb2wifi_pico2_w USB RemotePlay
 APP_snes2usb_kb2040 := kb2040 snes2usb snes2usb_kb2040 SNES USB
 APP_psx2usb_qtpy := qtpy psx2usb psx2usb_qtpy PS1/PS2 USB
 APP_psx2usb_kb2040 := kb2040 psx2usb psx2usb_kb2040 PS1/PS2 USB
@@ -229,6 +249,11 @@ APP_gc2usb_feather_usbhost := feather_usbhost gc2usb_feather_usbhost gc2usb_feat
 APP_wii2usb_kb2040 := kb2040 wii2usb wii2usb_kb2040 Wii USB
 APP_wii2gc_kb2040 := kb2040 wii2gc wii2gc_kb2040 Wii GameCube
 APP_wii2n64_pico := pico wii2n64 wii2n64_pico Wii N64
+APP_24g2usb_pico2_w := pico2_w 24g2usb 24g2usb_pico2_w 24G USB
+APP_24g2usb_pico_w := pico_w 24g2usb 24g2usb_pico_w 24G USB
+APP_24g2usb_pico := pico 24g2usb 24g2usb_pico 24G USB
+APP_24g2usb_pico2 := pico2 24g2usb 24g2usb_pico2 24G USB
+APP_24g2usb_rp2350zero := rp2350zero 24g2usb 24g2usb_rp2350zero 24G USB
 APP_lodgenet2usb_pico := pico lodgenet2usb lodgenet2usb_pico LodgeNet USB
 APP_lodgenet2usb_pico2 := pico2 lodgenet2usb lodgenet2usb_pico2 LodgeNet USB
 APP_lodgenet2n64_pico := pico lodgenet2n64 lodgenet2n64_pico LodgeNet N64
@@ -240,23 +265,109 @@ APP_controller_fisherprice_v1_kb2040 := kb2040 controller_fisherprice_v1 control
 APP_controller_fisherprice_v2_kb2040 := kb2040 controller_fisherprice_v2 controller_fisherprice_v2_kb2040 GPIO/ADC USB
 APP_controller_alpakka_pico := pico controller_alpakka controller_alpakka_pico GPIO/I2C USB
 APP_controller_macropad := macropad controller_macropad controller_macropad GPIO USB
-APP_controller_btusb_fisherprice_v1_kb2040 := kb2040 controller_btusb_fisherprice_v1 controller_btusb_fisherprice_v1_kb2040 GPIO USB
-APP_controller_btusb_fisherprice_v2_kb2040 := kb2040 controller_btusb_fisherprice_v2 controller_btusb_fisherprice_v2_kb2040 GPIO/ADC USB
-APP_controller_btusb_alpakka_pico := pico controller_btusb_alpakka controller_btusb_alpakka_pico GPIO/I2C USB
-APP_controller_btusb_pico_w := pico_w controller_btusb controller_btusb_pico_w JoyWing BLE/USB
-APP_controller_btusb_pico2_w := pico2_w controller_btusb controller_btusb_pico2_w JoyWing BLE/USB
-APP_controller_btusb_rp2040_abb := pico controller_btusb_rp2040_abb controller_btusb_rp2040_abb ABB USB
-APP_controller_btusb_feather_rp2040 := feather controller_btusb_feather_rp2040 controller_btusb_feather_rp2040 JoyWing USB
-APP_controller_btusb_feather_rp2040_usb_host := feather_usbhost controller_btusb_feather_rp2040_usb_host controller_btusb_feather_rp2040_usb_host JoyWing USB
+APP_universal_fisherprice_v1_kb2040 := kb2040 universal_fisherprice_v1 universal_fisherprice_v1_kb2040 GPIO USB
+APP_universal_fisherprice_v2_kb2040 := kb2040 universal_fisherprice_v2 universal_fisherprice_v2_kb2040 GPIO/ADC USB
+APP_universal_alpakka_pico := pico universal_alpakka universal_alpakka_pico GPIO/I2C USB
+APP_universal_pico_w := pico_w universal universal_pico_w JoyWing BLE/USB
+APP_universal_pico2_w := pico2_w universal universal_pico2_w JoyWing BLE/USB
+APP_universal_rp2040_abb := pico universal_rp2040_abb universal_rp2040_abb ABB USB
+APP_universal_feather_rp2040 := feather universal_feather_rp2040 universal_feather_rp2040 JoyWing USB
+APP_universal_feather_rp2040_usb_host := feather_usbhost universal_feather_rp2040_usb_host universal_feather_rp2040_usb_host JoyWing USB
+APP_universal_rp2040zero := rp2040zero universal_rp2040zero universal_rp2040zero GPIO USB
 
 
 # All apps (note: controller_macropad not included - build explicitly with 'make controller_macropad')
 # Note: usb2loopy_kb2040, snes23do_rp2040zero excluded until more mature
+
 APPS := usb2pce_kb2040 usb2gc_kb2040 usb2gc_rp2040zero usb2nuon_kb2040 usb2n64_kb2040 usb2dc_kb2040 usb2dc_rp2040zero usb2neogeo_kb2040 usb2neogeo_pico usb2neogeo_rp2040zero usb2neogeo_retrofrog n642dc_kb2040 n642dc_pico2_w n642nuon_pico usb23do_rp2040zero usb2uart_kb2040 usb2usb_pico usb2usb_pico_w usb2usb_pico2_w usb2usb_feather_rp2040 usb2usb_feather_rp2040_usb_host usb2usb_feather_rp2040_max3421 usb2usb_feather_rp2040_usb_host_max3421 usb2usb_rp2040zero usb2usb_rp2350usba bt2usb_pico_w bt2usb_pico2_w btusb2usb_pico_w btusb2usb_pico2_w usb2ble_pico_w usb2ble_pico2_w bt2nuon_pico_w bt2nuon_pico2_w bt2n64_pico_w bt2n64_pico2_w snes2usb_kb2040 n642usb_kb2040 gc2usb_kb2040 gc2usb_rp2040zero gc2usb_feather_usbhost gc2eth_rp2040_eth gc2eth_feather_usbhost nes2usb_kb2040 nes2usb_pico_w pce2usb_kb2040 pce2usb_pico pce2usb_pico_w controller_fisherprice_v1_kb2040 controller_fisherprice_v2_kb2040 controller_alpakka_pico usb2ami_rp2040zero usb2ami_xiao usb2ami_retrofrog usb2ami_beetle_rp2350 usb2jag_rp2040zero
+
+# One target per line: a shared single-line list conflicts on every
+# concurrent app addition. Add new targets above the $(strip) anchor.
+APPS :=
+APPS += usb2pce_kb2040
+APPS += usb2gc_kb2040
+APPS += usb2gc_rp2040zero
+APPS += usb2nuon_kb2040
+APPS += usb2n64_kb2040
+APPS += usb2dc_kb2040
+APPS += usb2dc_rp2040zero
+APPS += usb2neogeo_kb2040
+APPS += usb2neogeo_pico
+APPS += usb2neogeo_rp2040zero
+APPS += usb2neogeo_retrofrog
+APPS += usb2neogeo_te_kb2040
+APPS += usb2neogeo_te_pico
+APPS += usb2neogeo_te_rp2040zero
+APPS += usb2neogeo_te_pico2p
+APPS += n642dc_kb2040
+APPS += n642dc_pico2_w
+APPS += n642nuon_pico
+APPS += usb23do_rp2040zero
+APPS += usb2uart_kb2040
+APPS += usb2usb_pico
+APPS += usb2usb_pico_w
+APPS += usb2usb_pico2_w
+APPS += usb2usb_feather_rp2040
+APPS += usb2usb_feather_rp2040_usb_host
+APPS += usb2usb_feather_rp2040_max3421
+APPS += usb2usb_feather_rp2040_usb_host_max3421
+APPS += usb2usb_rp2040zero
+APPS += usb2usb_rp2350usba
+APPS += bt2usb_pico_w
+APPS += bt2usb_pico2_w
+APPS += btusb2usb_pico_w
+APPS += btusb2usb_pico2_w
+APPS += usb2ble_pico_w
+APPS += usb2ble_pico2_w
+APPS += bt2nuon_pico_w
+APPS += bt2nuon_pico2_w
+APPS += bt2n64_pico_w
+APPS += bt2n64_pico2_w
+APPS += snes2usb_kb2040
+APPS += n642usb_kb2040
+APPS += gc2usb_kb2040
+APPS += gc2usb_rp2040zero
+APPS += gc2usb_feather_usbhost
+APPS += gc2eth_rp2040_eth
+APPS += gc2eth_feather_usbhost
+APPS += nes2usb_kb2040
+APPS += nes2usb_pico_w
+APPS += pce2usb_kb2040
+APPS += pce2usb_pico
+APPS += pce2usb_pico_w
+APPS += jag2usb_pico_w
+APPS += controller_fisherprice_v1_kb2040
+APPS += controller_fisherprice_v2_kb2040
+APPS += controller_alpakka_pico
+APPS += usb2ami_rp2040zero
+APPS += usb2ami_xiao
+APPS += usb2ami_retrofrog
+APPS += usb2ami_beetle_rp2350
+APPS += usb2jag_rp2040zero
+APPS += 24g2usb_pico2_w
+APPS += 24g2usb_pico_w
+APPS += 24g2usb_pico
+APPS += 24g2usb_pico2
+APPS += 24g2usb_rp2350zero
+APPS := $(strip $(APPS))
+
 
 # Stable apps for release
 # Note: usb2loopy_kb2040, snes23do_rp2040zero excluded until more mature
-RELEASE_APPS := usb2pce_kb2040 usb2gc_kb2040 usb2gc_rp2040zero usb2nuon_kb2040 usb23do_rp2040zero usb2usb_feather_rp2040 usb2usb_feather_rp2040_usb_host usb2usb_rp2040zero bt2usb_pico_w snes2usb_kb2040
+# One target per line: a shared single-line list conflicts on every
+# concurrent app addition. Add new targets above the $(strip) anchor.
+RELEASE_APPS :=
+RELEASE_APPS += usb2pce_kb2040
+RELEASE_APPS += usb2gc_kb2040
+RELEASE_APPS += usb2gc_rp2040zero
+RELEASE_APPS += usb2nuon_kb2040
+RELEASE_APPS += usb23do_rp2040zero
+RELEASE_APPS += usb2usb_feather_rp2040
+RELEASE_APPS += usb2usb_feather_rp2040_usb_host
+RELEASE_APPS += usb2usb_rp2040zero
+RELEASE_APPS += bt2usb_pico_w
+RELEASE_APPS += snes2usb_kb2040
+RELEASE_APPS := $(strip $(RELEASE_APPS))
 
 # Release directory
 RELEASE_DIR := releases
@@ -305,6 +416,7 @@ help:
 	@echo "  make usb2neogeo_pico    - USB/BT -> NEOGEO (Pi Pico)"
 	@echo "  make usb2neogeo_rp2040zero - USB/BT -> NEOGEO (RP2040-Zero)"
 	@echo "  make usb2neogeo_retrofrog  - USB/BT -> NEOGEO (Retro Frog USB4NeoGeo)"
+	@echo "  make usb2neogeo_te_rp2040zero - USB/BT -> NEOGEO tournament edition (RP2040-Zero/Augie)"
 	@echo "  make n642dc_kb2040      - N64 -> Dreamcast (KB2040)"
 	@echo "  make n642dc_pico2_w     - N64 -> Dreamcast (Pi Pico 2 W)"
 	@echo "  make n642nuon_pico    - N64 -> Nuon (KB2040)"
@@ -338,8 +450,14 @@ help:
 	@echo "  make flash-usb2usb_feather_nrf52840 - Flash Feather nRF52840 + MAX3421E via UF2"
 	@echo "  make btusb2usb_feather_nrf52840 - USB/BT -> USB HID (Feather nRF52840 + MAX3421E + BLE)"
 	@echo "  make flash-btusb2usb_feather_nrf52840 - Flash Feather nRF52840 btusb2usb via UF2"
-	@echo "  make controller_btusb_feather_nrf52840 - Sensor/BLE -> USB HID (Feather nRF52840 + JoyWing)"
-	@echo "  make flash-controller_btusb_feather_nrf52840 - Flash Feather nRF52840 controller_btusb via UF2"
+	@echo "  make universal_feather_nrf52840 - Sensor/BLE -> USB HID (Feather nRF52840 + JoyWing)"
+	@echo "  make flash-universal_feather_nrf52840 - Flash Feather nRF52840 universal via UF2"
+	@echo "  make universal_seeed_xiao_nrf52840 - Sensor/BLE -> USB HID (Seeed XIAO nRF52840 + JoyWing)"
+	@echo "  make flash-universal_seeed_xiao_nrf52840 - Flash Seeed XIAO nRF52840 universal via UF2"
+	@echo "  make bt2usb_makerdiary_nrf52840    - Bluetooth -> USB HID (Makerdiary MDK USB Dongle, requires NCS)"
+	@echo "  make flash-bt2usb_makerdiary_nrf52840 - Flash Makerdiary MDK dongle via UF2 bootloader"
+	@echo "  make universal_makerdiary_nrf52840 - GPIO/BLE -> USB HID (Makerdiary MDK USB Dongle)"
+	@echo "  make flash-universal_makerdiary_nrf52840 - Flash Makerdiary MDK universal via UF2"
 	@echo "  make bt2loopy_pico_w    - Bluetooth -> Loopy (Pico W)"
 	@echo "  make bt2nuon_pico_w     - Bluetooth -> Nuon (Pico W)"
 	@echo "  make bt2n64_pico_w      - Bluetooth -> N64 (Pico W)"
@@ -356,14 +474,22 @@ help:
 	@echo "  make controller_fisherprice_v2_kb2040 - Fisher Price V2 (analog+shoulders) -> USB HID (KB2040)"
 	@echo "  make controller_alpakka_pico - GPIO/I2C -> USB HID (Pico)"
 	@echo "  make controller_macropad - 12 keys -> USB HID (MacroPad RP2040)"
-	@echo "  make controller_btusb_pico_w - GPIO+JoyWing -> BLE+USB HID (Pico W)"
-	@echo "  make controller_btusb_rp2040_abb - GPIO+USB Host -> USB HID (ABB Passthrough)"
+	@echo "  make universal_pico_w - GPIO+JoyWing -> BLE+USB HID (Pico W)"
+	@echo "  make universal_rp2040_abb - GPIO+USB Host -> USB HID (ABB Passthrough)"
+	@echo "  make universal_rp2040zero - hand-wired GPIO pad -> USB HID (RP2040-Zero, pins set in browser)"
 
 	@echo "  make nes2usb_kb2040     - NES -> USB HID (KB2040)"
 	@echo "  make nes2usb_pico_w     - NES -> USB HID (Pico W)"
 	@echo "  make pce2usb_kb2040     - PCEngine -> USB HID (KB2040)"
 	@echo "  make pce2usb_pico       - PCEngine -> USB HID (Pico)"
 	@echo "  make pce2usb_pico_w     - PCEngine -> USB HID (Pico W)"
+	@echo "  make jag2usb_pico       - Atari Jaguar -> USB HID (Pico)"
+	@echo "  make jag2usb_pico_w     - Atari Jaguar -> USB HID (Pico W)"
+	@echo "  make 24g2usb_pico2_w     - SF30 2.4G -> USB HID (Pico 2 W)"
+	@echo "  make 24g2usb_pico_w      - SF30 2.4G -> USB HID (Pico W)"
+	@echo "  make 24g2usb_pico        - SF30 2.4G -> USB HID (Pico)"
+	@echo "  make 24g2usb_pico2       - SF30 2.4G -> USB HID (Pico 2)"
+	@echo "  make 24g2usb_rp2350zero  - SF30 2.4G -> USB HID (Waveshare RP2350-Zero)"
 	@echo "  make lodgenet2usb_pico   - LodgeNet -> USB HID (Pico)"
 	@echo "  make lodgenet2usb_pico2  - LodgeNet -> USB HID (Pico 2)"
 	@echo "  make lodgenet2n64_pico   - LodgeNet -> N64 (Pico)"
@@ -485,8 +611,20 @@ init-wch:
 .PHONY: build
 build: all
 
+# Package the most recent nRF build into a BLE DFU .zip for wireless (OTA)
+# update via nRF Connect (Adafruit bootloader OTA). Send the `OTA` command over
+# BLE (NUS) or USB CDC first — the device reboots advertising "AdafruitDFU" —
+# then push this .zip from nRF Connect's DFU. Needs: pip install --user adafruit-nrfutil
+.PHONY: ota-zip
+ota-zip:
+	@command -v adafruit-nrfutil >/dev/null 2>&1 || { echo "adafruit-nrfutil not found — run: pip install --user adafruit-nrfutil"; exit 1; }
+	@test -f nrf/build/nrf/zephyr/zephyr.hex || { echo "no nRF build at nrf/build/nrf/zephyr/zephyr.hex — build an nRF app first"; exit 1; }
+	@mkdir -p $(RELEASE_DIR)
+	adafruit-nrfutil dfu genpkg --dev-type 0x0052 --application nrf/build/nrf/zephyr/zephyr.hex $(RELEASE_DIR)/joypad_ota.zip
+	@echo "$(GREEN)OTA package: $(RELEASE_DIR)/joypad_ota.zip$(NC)  → push via nRF Connect (DFU) to 'AdafruitDFU'"
+
 # Generic app build function
-# Output naming: joypad_<version|commit>_<app>.uf2
+# Output naming: joypad_os_<version|commit>_<app>.uf2
 define build_app
 	@echo "$(YELLOW)Building $1...$(NC)"
 	@echo "  Board:   $(word 1,$(APP_$1))"
@@ -498,9 +636,9 @@ define build_app
 	@cd src/build && $(MAKE) --no-print-directory $(CONSOLE_$(word 2,$(APP_$1))) -j$(JOBS)
 	@mkdir -p $(RELEASE_DIR)
 	@cp src/build/$(CONSOLE_$(word 2,$(APP_$1))).uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_$(word 3,$(APP_$1)).uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_$(word 3,$(APP_$1)).uf2
 	@echo "$(GREEN)✓ $1 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_$(word 3,$(APP_$1)).uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_$(word 3,$(APP_$1)).uf2"
 	@echo ""
 endef
 
@@ -568,6 +706,22 @@ usb4jag_rp2354a:
 .PHONY: usb2neogeo_kb2040
 usb2neogeo_kb2040:
 	$(call build_app,usb2neogeo_kb2040)
+
+.PHONY: usb2neogeo_te_kb2040
+usb2neogeo_te_kb2040:
+	$(call build_app,usb2neogeo_te_kb2040)
+
+.PHONY: usb2neogeo_te_pico
+usb2neogeo_te_pico:
+	$(call build_app,usb2neogeo_te_pico)
+
+.PHONY: usb2neogeo_te_rp2040zero
+usb2neogeo_te_rp2040zero:
+	$(call build_app,usb2neogeo_te_rp2040zero)
+
+.PHONY: usb2neogeo_te_pico2p
+usb2neogeo_te_pico2p:
+	$(call build_app,usb2neogeo_te_pico2p)
 
 .PHONY: usb2neogeo_pico
 usb2neogeo_pico:
@@ -754,6 +908,22 @@ flash-bt2usb_xiao_esp32s3:
 monitor-bt2usb_xiao_esp32s3:
 	@cd esp && $(MAKE) monitor
 
+# --- ESP32-S3 bt2usb on LilyGo T-Display S3 AMOLED Plus (requires ESP-IDF) ---
+# 1.91" RM67162 AMOLED shows animated companion eyes. No TinyUF2 bootloader:
+# to flash, hold BOOT + tap RST to enter ROM download, then
+#   cd esp && idf.py -DCONFIG_BOARD=lilygo_tdisplay_s3_amoled flash
+# (board config sets ESPTOOLPY_BEFORE_NORESET so esptool won't fight the reset).
+.PHONY: bt2usb_lilygo_tdisplay_s3_amoled
+bt2usb_lilygo_tdisplay_s3_amoled:
+	@echo "$(YELLOW)Building bt2usb for LilyGo T-Display S3 AMOLED Plus...$(NC)"
+	@cd esp && $(MAKE) build BOARD=lilygo_tdisplay_s3_amoled
+	@echo "$(GREEN)✓ bt2usb_lilygo_tdisplay_s3_amoled built successfully$(NC)"
+	@echo ""
+
+.PHONY: monitor-bt2usb_lilygo_tdisplay_s3_amoled
+monitor-bt2usb_lilygo_tdisplay_s3_amoled:
+	@cd esp && $(MAKE) monitor
+
 # --- ESP32-S3 bt2usb on Feather ESP32-S3 (requires ESP-IDF) ---
 .PHONY: bt2usb_feather_esp32s3
 bt2usb_feather_esp32s3:
@@ -768,8 +938,8 @@ uf2-bt2usb_feather_esp32s3:
 	@cd esp && $(MAKE) uf2 BOARD=feather_esp32s3
 	@mkdir -p $(RELEASE_DIR)
 	@cp esp/build/joypad_bt2usb.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_feather_esp32s3.uf2
-	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_feather_esp32s3.uf2$(NC)"
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_feather_esp32s3.uf2
+	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_feather_esp32s3.uf2$(NC)"
 	@echo ""
 
 .PHONY: flash-bt2usb_feather_esp32s3
@@ -783,33 +953,33 @@ flash-bt2usb_feather_esp32s3:
 monitor-bt2usb_feather_esp32s3:
 	@cd esp && $(MAKE) monitor
 
-# --- ESP32-S3 controller_btusb (requires ESP-IDF) ---
-.PHONY: controller_btusb_feather_esp32s3
-controller_btusb_feather_esp32s3:
-	@echo "$(YELLOW)Building controller_btusb for Feather ESP32-S3...$(NC)"
-	@cd esp && $(MAKE) build CONFIG_APP=controller_btusb BOARD=feather_esp32s3
-	@echo "$(GREEN)✓ controller_btusb_feather_esp32s3 built successfully$(NC)"
+# --- ESP32-S3 universal (requires ESP-IDF) ---
+.PHONY: universal_feather_esp32s3
+universal_feather_esp32s3:
+	@echo "$(YELLOW)Building universal for Feather ESP32-S3...$(NC)"
+	@cd esp && $(MAKE) build CONFIG_APP=universal BOARD=feather_esp32s3
+	@echo "$(GREEN)✓ universal_feather_esp32s3 built successfully$(NC)"
 	@echo ""
 
-.PHONY: uf2-controller_btusb_feather_esp32s3
-uf2-controller_btusb_feather_esp32s3:
-	@echo "$(YELLOW)Building controller_btusb UF2 for Feather ESP32-S3...$(NC)"
-	@cd esp && $(MAKE) uf2 CONFIG_APP=controller_btusb BOARD=feather_esp32s3
+.PHONY: uf2-universal_feather_esp32s3
+uf2-universal_feather_esp32s3:
+	@echo "$(YELLOW)Building universal UF2 for Feather ESP32-S3...$(NC)"
+	@cd esp && $(MAKE) uf2 CONFIG_APP=universal BOARD=feather_esp32s3
 	@mkdir -p $(RELEASE_DIR)
-	@cp esp/build/joypad_controller_btusb.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_controller_btusb_feather_esp32s3.uf2
-	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_$(VERSION_ID)_controller_btusb_feather_esp32s3.uf2$(NC)"
+	@cp esp/build/joypad_universal.uf2 \
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_feather_esp32s3.uf2
+	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_feather_esp32s3.uf2$(NC)"
 	@echo ""
 
-.PHONY: flash-controller_btusb_feather_esp32s3
-flash-controller_btusb_feather_esp32s3:
-	@echo "$(YELLOW)Flashing controller_btusb to Feather ESP32-S3...$(NC)"
-	@cd esp && $(MAKE) flash CONFIG_APP=controller_btusb BOARD=feather_esp32s3
-	@echo "$(GREEN)✓ controller_btusb_feather_esp32s3 flashed successfully$(NC)"
+.PHONY: flash-universal_feather_esp32s3
+flash-universal_feather_esp32s3:
+	@echo "$(YELLOW)Flashing universal to Feather ESP32-S3...$(NC)"
+	@cd esp && $(MAKE) flash CONFIG_APP=universal BOARD=feather_esp32s3
+	@echo "$(GREEN)✓ universal_feather_esp32s3 flashed successfully$(NC)"
 	@echo ""
 
-.PHONY: monitor-controller_btusb_feather_esp32s3
-monitor-controller_btusb_feather_esp32s3:
+.PHONY: monitor-universal_feather_esp32s3
+monitor-universal_feather_esp32s3:
 	@cd esp && $(MAKE) monitor
 
 # --- ESP32-S3 usb2usb on Feather ESP32-S3 (MAX3421E FeatherWing, requires ESP-IDF) ---
@@ -826,8 +996,8 @@ uf2-usb2usb_feather_esp32s3:
 	@cd esp && $(MAKE) uf2 CONFIG_APP=usb2usb BOARD=feather_esp32s3
 	@mkdir -p $(RELEASE_DIR)
 	@cp esp/build/joypad_usb2usb.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_usb2usb_feather_esp32s3.uf2
-	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_$(VERSION_ID)_usb2usb_feather_esp32s3.uf2$(NC)"
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_usb2usb_feather_esp32s3.uf2
+	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_usb2usb_feather_esp32s3.uf2$(NC)"
 	@echo ""
 
 .PHONY: flash-usb2usb_feather_esp32s3
@@ -855,8 +1025,8 @@ uf2-btusb2usb_feather_esp32s3:
 	@cd esp && $(MAKE) uf2 CONFIG_APP=btusb2usb BOARD=feather_esp32s3
 	@mkdir -p $(RELEASE_DIR)
 	@cp esp/build/joypad_btusb2usb.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_btusb2usb_feather_esp32s3.uf2
-	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_$(VERSION_ID)_btusb2usb_feather_esp32s3.uf2$(NC)"
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_btusb2usb_feather_esp32s3.uf2
+	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_btusb2usb_feather_esp32s3.uf2$(NC)"
 	@echo ""
 
 .PHONY: flash-btusb2usb_feather_esp32s3
@@ -877,8 +1047,8 @@ uf2-bt2usb_xiao_esp32s3:
 	@cd esp && $(MAKE) uf2
 	@mkdir -p $(RELEASE_DIR)
 	@cp esp/build/joypad_bt2usb.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2
-	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2$(NC)"
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2
+	@echo "$(GREEN)✓ UF2 built: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2$(NC)"
 	@echo ""
 
 .PHONY: flash-uf2-bt2usb_xiao_esp32s3
@@ -891,7 +1061,7 @@ flash-uf2-bt2usb_xiao_esp32s3: uf2-bt2usb_xiao_esp32s3
 		exit 1; \
 	fi
 	@echo "$(YELLOW)Flashing UF2 to TinyUF2 drive...$(NC)"
-	@cp $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2 /Volumes/XIAOS3BOOT/
+	@cp $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_xiao_esp32s3.uf2 /Volumes/XIAOS3BOOT/
 	@echo "$(GREEN)✓ Firmware flashed, device will reboot$(NC)"
 	@echo ""
 
@@ -902,9 +1072,9 @@ bt2usb_seeed_xiao_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=xiao_ble
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_seeed_xiao_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_seeed_xiao_nrf52840.uf2
 	@echo "$(GREEN)✓ bt2usb_seeed_xiao_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_seeed_xiao_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_seeed_xiao_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-bt2usb_seeed_xiao_nrf52840
@@ -923,9 +1093,9 @@ bt2usb_feather_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=adafruit_feather_nrf52840
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_feather_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_feather_nrf52840.uf2
 	@echo "$(GREEN)✓ bt2usb_feather_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_feather_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_feather_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-bt2usb_feather_nrf52840
@@ -947,9 +1117,9 @@ bt2usb_aprbrother_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=aprbrother_nrf52840
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2
 	@echo "$(GREEN)✓ bt2usb_aprbrother_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_aprbrother_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-bt2usb_aprbrother_nrf52840
@@ -961,6 +1131,49 @@ flash-bt2usb_aprbrother_nrf52840: bt2usb_aprbrother_nrf52840
 monitor-bt2usb_aprbrother_nrf52840:
 	@cd nrf && $(MAKE) monitor
 
+# --- Makerdiary nRF52840 MDK USB Dongle bt2usb (requires nRF Connect SDK) ---
+# Compact RGB-LED dongle with a real USER button (P0.18). Ships a UF2
+# bootloader (UF2BOOT or MDK-DONGLE drive depending on bootloader build).
+.PHONY: bt2usb_makerdiary_nrf52840
+bt2usb_makerdiary_nrf52840:
+	@echo "$(YELLOW)Building bt2usb for Makerdiary nRF52840 MDK USB Dongle...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=makerdiary_nrf52840
+	@mkdir -p $(RELEASE_DIR)
+	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_makerdiary_nrf52840.uf2
+	@echo "$(GREEN)✓ bt2usb_makerdiary_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_bt2usb_makerdiary_nrf52840.uf2"
+	@echo ""
+
+.PHONY: flash-bt2usb_makerdiary_nrf52840
+flash-bt2usb_makerdiary_nrf52840: bt2usb_makerdiary_nrf52840
+	@cd nrf && $(MAKE) flash-uf2
+	@echo ""
+
+.PHONY: monitor-bt2usb_makerdiary_nrf52840
+monitor-bt2usb_makerdiary_nrf52840:
+	@cd nrf && $(MAKE) monitor
+
+# --- Makerdiary nRF52840 MDK USB Dongle universal (GPIO pad + BLE + USB) ---
+.PHONY: universal_makerdiary_nrf52840
+universal_makerdiary_nrf52840:
+	@echo "$(YELLOW)Building universal for Makerdiary nRF52840 MDK USB Dongle...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=makerdiary_nrf52840 APP_TYPE=universal
+	@mkdir -p $(RELEASE_DIR)
+	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_makerdiary_nrf52840.uf2
+	@echo "$(GREEN)✓ universal_makerdiary_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_makerdiary_nrf52840.uf2"
+	@echo ""
+
+.PHONY: flash-universal_makerdiary_nrf52840
+flash-universal_makerdiary_nrf52840: universal_makerdiary_nrf52840
+	@cd nrf && $(MAKE) flash-uf2
+
+.PHONY: monitor-universal_makerdiary_nrf52840
+monitor-universal_makerdiary_nrf52840:
+	@cd nrf && $(MAKE) monitor
+
 # --- April Brother nRF52840 Dongle MouthPad app (HID + NUS relay) ---
 .PHONY: mouthpad_aprbrother_nrf52840
 mouthpad_aprbrother_nrf52840:
@@ -968,9 +1181,9 @@ mouthpad_aprbrother_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=aprbrother_nrf52840 APP_TYPE=mouthpad
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2
 	@echo "$(GREEN)✓ mouthpad_aprbrother_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_mouthpad_aprbrother_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-mouthpad_aprbrother_nrf52840
@@ -985,9 +1198,9 @@ usb2usb_feather_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=adafruit_feather_nrf52840 APP_TYPE=usb2usb
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_usb2usb_feather_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_usb2usb_feather_nrf52840.uf2
 	@echo "$(GREEN)✓ usb2usb_feather_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_usb2usb_feather_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_usb2usb_feather_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-usb2usb_feather_nrf52840
@@ -1006,9 +1219,9 @@ btusb2usb_feather_nrf52840:
 	@cd nrf && $(MAKE) build BOARD=adafruit_feather_nrf52840 APP_TYPE=btusb2usb
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_btusb2usb_feather_nrf52840.uf2
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_btusb2usb_feather_nrf52840.uf2
 	@echo "$(GREEN)✓ btusb2usb_feather_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_btusb2usb_feather_nrf52840.uf2"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_btusb2usb_feather_nrf52840.uf2"
 	@echo ""
 
 .PHONY: flash-btusb2usb_feather_nrf52840
@@ -1020,24 +1233,44 @@ flash-btusb2usb_feather_nrf52840: btusb2usb_feather_nrf52840
 monitor-btusb2usb_feather_nrf52840:
 	@cd nrf && $(MAKE) monitor
 
-# --- nRF52840 controller_btusb on Feather nRF52840 (sensor + BLE peripheral + USB) ---
-.PHONY: controller_btusb_feather_nrf52840
-controller_btusb_feather_nrf52840:
-	@echo "$(YELLOW)Building controller_btusb for Feather nRF52840...$(NC)"
-	@cd nrf && $(MAKE) build BOARD=adafruit_feather_nrf52840 APP_TYPE=controller_btusb
+# --- nRF52840 universal on Feather nRF52840 (sensor + BLE peripheral + USB) ---
+.PHONY: universal_feather_nrf52840
+universal_feather_nrf52840:
+	@echo "$(YELLOW)Building universal for Feather nRF52840...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=adafruit_feather_nrf52840 APP_TYPE=universal
 	@mkdir -p $(RELEASE_DIR)
 	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
-	    $(RELEASE_DIR)/joypad_$(VERSION_ID)_controller_btusb_feather_nrf52840.uf2
-	@echo "$(GREEN)✓ controller_btusb_feather_nrf52840 built successfully$(NC)"
-	@echo "  File: $(RELEASE_DIR)/joypad_$(VERSION_ID)_controller_btusb_feather_nrf52840.uf2"
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_feather_nrf52840.uf2
+	@echo "$(GREEN)✓ universal_feather_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_feather_nrf52840.uf2"
 	@echo ""
 
-.PHONY: flash-controller_btusb_feather_nrf52840
-flash-controller_btusb_feather_nrf52840: controller_btusb_feather_nrf52840
+.PHONY: flash-universal_feather_nrf52840
+flash-universal_feather_nrf52840: universal_feather_nrf52840
 	@cd nrf && $(MAKE) flash-uf2
 
-.PHONY: monitor-controller_btusb_feather_nrf52840
-monitor-controller_btusb_feather_nrf52840:
+.PHONY: monitor-universal_feather_nrf52840
+monitor-universal_feather_nrf52840:
+	@cd nrf && $(MAKE) monitor
+
+# --- nRF52840 universal on Seeed XIAO nRF52840 (sensor + BLE peripheral + USB) ---
+.PHONY: universal_seeed_xiao_nrf52840
+universal_seeed_xiao_nrf52840:
+	@echo "$(YELLOW)Building universal for Seeed XIAO nRF52840...$(NC)"
+	@cd nrf && $(MAKE) build BOARD=xiao_ble APP_TYPE=universal
+	@mkdir -p $(RELEASE_DIR)
+	@cp nrf/build/nrf/zephyr/zephyr.uf2 \
+	    $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_seeed_xiao_nrf52840.uf2
+	@echo "$(GREEN)✓ universal_seeed_xiao_nrf52840 built successfully$(NC)"
+	@echo "  File: $(RELEASE_DIR)/joypad_os_$(VERSION_ID)_universal_seeed_xiao_nrf52840.uf2"
+	@echo ""
+
+.PHONY: flash-universal_seeed_xiao_nrf52840
+flash-universal_seeed_xiao_nrf52840: universal_seeed_xiao_nrf52840
+	@cd nrf && $(MAKE) flash-uf2
+
+.PHONY: monitor-universal_seeed_xiao_nrf52840
+monitor-universal_seeed_xiao_nrf52840:
 	@cd nrf && $(MAKE) monitor
 
 .PHONY: wifi2usb_pico_w
@@ -1047,6 +1280,14 @@ wifi2usb_pico_w:
 .PHONY: wifi2usb_pico2_w
 wifi2usb_pico2_w:
 	$(call build_app,wifi2usb_pico2_w)
+
+.PHONY: usb2wifi_pico_w
+usb2wifi_pico_w:
+	$(call build_app,usb2wifi_pico_w)
+
+.PHONY: usb2wifi_pico2_w
+usb2wifi_pico2_w:
+	$(call build_app,usb2wifi_pico2_w)
 
 .PHONY: snes2usb_kb2040
 snes2usb_kb2040:
@@ -1140,37 +1381,41 @@ controller_alpakka_pico:
 controller_macropad:
 	$(call build_app,controller_macropad)
 
-.PHONY: controller_btusb_fisherprice_v1_kb2040
-controller_btusb_fisherprice_v1_kb2040:
-	$(call build_app,controller_btusb_fisherprice_v1_kb2040)
+.PHONY: universal_fisherprice_v1_kb2040
+universal_fisherprice_v1_kb2040:
+	$(call build_app,universal_fisherprice_v1_kb2040)
 
-.PHONY: controller_btusb_fisherprice_v2_kb2040
-controller_btusb_fisherprice_v2_kb2040:
-	$(call build_app,controller_btusb_fisherprice_v2_kb2040)
+.PHONY: universal_fisherprice_v2_kb2040
+universal_fisherprice_v2_kb2040:
+	$(call build_app,universal_fisherprice_v2_kb2040)
 
-.PHONY: controller_btusb_alpakka_pico
-controller_btusb_alpakka_pico:
-	$(call build_app,controller_btusb_alpakka_pico)
+.PHONY: universal_alpakka_pico
+universal_alpakka_pico:
+	$(call build_app,universal_alpakka_pico)
 
-.PHONY: controller_btusb_pico_w
-controller_btusb_pico_w:
-	$(call build_app,controller_btusb_pico_w)
+.PHONY: universal_pico_w
+universal_pico_w:
+	$(call build_app,universal_pico_w)
 
-.PHONY: controller_btusb_pico2_w
-controller_btusb_pico2_w:
-	$(call build_app,controller_btusb_pico2_w)
+.PHONY: universal_pico2_w
+universal_pico2_w:
+	$(call build_app,universal_pico2_w)
 
-.PHONY: controller_btusb_rp2040_abb
-controller_btusb_rp2040_abb:
-	$(call build_app,controller_btusb_rp2040_abb)
+.PHONY: universal_rp2040_abb
+universal_rp2040_abb:
+	$(call build_app,universal_rp2040_abb)
 
-.PHONY: controller_btusb_feather_rp2040
-controller_btusb_feather_rp2040:
-	$(call build_app,controller_btusb_feather_rp2040)
+.PHONY: universal_feather_rp2040
+universal_feather_rp2040:
+	$(call build_app,universal_feather_rp2040)
 
-.PHONY: controller_btusb_feather_rp2040_usb_host
-controller_btusb_feather_rp2040_usb_host:
-	$(call build_app,controller_btusb_feather_rp2040_usb_host)
+.PHONY: universal_feather_rp2040_usb_host
+universal_feather_rp2040_usb_host:
+	$(call build_app,universal_feather_rp2040_usb_host)
+
+.PHONY: universal_rp2040zero
+universal_rp2040zero:
+	$(call build_app,universal_rp2040zero)
 
 
 .PHONY: nes2usb_kb2040
@@ -1192,6 +1437,34 @@ pce2usb_pico:
 .PHONY: pce2usb_pico_w
 pce2usb_pico_w:
 	$(call build_app,pce2usb_pico_w)
+
+.PHONY: jag2usb_pico
+jag2usb_pico:
+	$(call build_app,jag2usb_pico)
+
+.PHONY: jag2usb_pico_w
+jag2usb_pico_w:
+	$(call build_app,jag2usb_pico_w)
+
+.PHONY: 24g2usb_pico2_w
+24g2usb_pico2_w:
+	$(call build_app,24g2usb_pico2_w)
+
+.PHONY: 24g2usb_pico_w
+24g2usb_pico_w:
+	$(call build_app,24g2usb_pico_w)
+
+.PHONY: 24g2usb_pico
+24g2usb_pico:
+	$(call build_app,24g2usb_pico)
+
+.PHONY: 24g2usb_pico2
+24g2usb_pico2:
+	$(call build_app,24g2usb_pico2)
+
+.PHONY: 24g2usb_rp2350zero
+24g2usb_rp2350zero:
+	$(call build_app,24g2usb_rp2350zero)
 
 .PHONY: lodgenet2usb_pico
 lodgenet2usb_pico:
@@ -1333,6 +1606,22 @@ flash-usb2gc_rp2040zero:
 .PHONY: flash-usb2neogeo_kb2040
 flash-usb2neogeo_kb2040:
 	@$(MAKE) --no-print-directory _flash_app APP_NAME=usb2neogeo_kb2040
+
+.PHONY: flash-usb2neogeo_te_kb2040
+flash-usb2neogeo_te_kb2040:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=usb2neogeo_te_kb2040
+
+.PHONY: flash-usb2neogeo_te_pico
+flash-usb2neogeo_te_pico:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=usb2neogeo_te_pico
+
+.PHONY: flash-usb2neogeo_te_rp2040zero
+flash-usb2neogeo_te_rp2040zero:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=usb2neogeo_te_rp2040zero
+
+.PHONY: flash-usb2neogeo_te_pico2p
+flash-usb2neogeo_te_pico2p:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=usb2neogeo_te_pico2p
 
 .PHONY: flash-usb2neogeo_pico
 flash-usb2neogeo_pico:
@@ -1594,25 +1883,29 @@ flash-controller_alpakka_pico:
 flash-controller_macropad:
 	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_macropad
 
-.PHONY: flash-controller_btusb_pico_w
-flash-controller_btusb_pico_w:
-	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_btusb_pico_w
+.PHONY: flash-universal_pico_w
+flash-universal_pico_w:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_pico_w
 
-.PHONY: flash-controller_btusb_pico2_w
-flash-controller_btusb_pico2_w:
-	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_btusb_pico2_w
+.PHONY: flash-universal_pico2_w
+flash-universal_pico2_w:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_pico2_w
 
-.PHONY: flash-controller_btusb_rp2040_abb
-flash-controller_btusb_rp2040_abb:
-	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_btusb_rp2040_abb
+.PHONY: flash-universal_rp2040_abb
+flash-universal_rp2040_abb:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_rp2040_abb
 
-.PHONY: flash-controller_btusb_feather_rp2040
-flash-controller_btusb_feather_rp2040:
-	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_btusb_feather_rp2040
+.PHONY: flash-universal_feather_rp2040
+flash-universal_feather_rp2040:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_feather_rp2040
 
-.PHONY: flash-controller_btusb_feather_rp2040_usb_host
-flash-controller_btusb_feather_rp2040_usb_host:
-	@$(MAKE) --no-print-directory _flash_app APP_NAME=controller_btusb_feather_rp2040_usb_host
+.PHONY: flash-universal_feather_rp2040_usb_host
+flash-universal_feather_rp2040_usb_host:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_feather_rp2040_usb_host
+
+.PHONY: flash-universal_rp2040zero
+flash-universal_rp2040zero:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=universal_rp2040zero
 
 
 .PHONY: flash-nes2usb_kb2040
@@ -1634,6 +1927,26 @@ flash-pce2usb_pico:
 .PHONY: flash-pce2usb_pico_w
 flash-pce2usb_pico_w:
 	@$(MAKE) --no-print-directory _flash_app APP_NAME=pce2usb_pico_w
+
+.PHONY: flash-24g2usb_pico2_w
+flash-24g2usb_pico2_w:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=24g2usb_pico2_w
+
+.PHONY: flash-24g2usb_pico_w
+flash-24g2usb_pico_w:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=24g2usb_pico_w
+
+.PHONY: flash-24g2usb_pico
+flash-24g2usb_pico:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=24g2usb_pico
+
+.PHONY: flash-24g2usb_pico2
+flash-24g2usb_pico2:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=24g2usb_pico2
+
+.PHONY: flash-24g2usb_rp2350zero
+flash-24g2usb_rp2350zero:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=24g2usb_rp2350zero
 
 .PHONY: flash-lodgenet2usb_pico
 flash-lodgenet2usb_pico:
@@ -1700,7 +2013,7 @@ fullclean:
 	@rm -rf $(RELEASE_DIR)
 	@git clean -fdx
 	@git submodule deinit -f --all
-	@echo "$(GREEN)✓ Full clean complete - repository reset to fresh clone state$(NC)"
+	@echo "$(GREEN)✓ full clean complete - repository reset to fresh clone state$(NC)"
 	@echo "$(GREEN)  Run 'make init' to initialize submodules and start building$(NC)"
 	@echo ""
 

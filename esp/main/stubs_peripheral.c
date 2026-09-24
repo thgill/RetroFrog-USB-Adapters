@@ -1,6 +1,6 @@
 // stubs_peripheral.c - Weak stubs for peripheral-only ESP32 builds
 //
-// When building in peripheral mode (controller_btusb), btstack_host.c and
+// When building in peripheral mode (universal), btstack_host.c and
 // bthid are not linked. Shared code (router.c, cdc_commands.c, sinput_mode.c)
 // references symbols from those modules. These weak stubs satisfy the linker.
 
@@ -30,6 +30,11 @@ __attribute__((weak)) bool btstack_host_get_last_connected(uint8_t bd_addr_out[6
 {
     (void)bd_addr_out; (void)name_out;
     return false;
+}
+__attribute__((weak)) int btstack_host_list_classic_bonds(uint8_t addrs_out[][6], int max_count)
+{
+    (void)addrs_out; (void)max_count;
+    return 0;
 }
 __attribute__((weak)) void btstack_host_forget_device(const uint8_t bd_addr[6]) { (void)bd_addr; }
 __attribute__((weak)) void btstack_host_suppress_scan(bool suppress) { (void)suppress; }

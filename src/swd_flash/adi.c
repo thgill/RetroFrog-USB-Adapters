@@ -987,17 +987,30 @@ int rp2040_call_function(uint32_t addr, uint32_t args[], int argc) {
 
 
     rc = core_is_halted();
-    if (rc == -1) panic("aaarg!");
-    if (!rc) panic("core not halted");
+    // Return errors rather than panic() — this routine now also runs from A's
+    // app (not just the boot relay), where a panic would take the whole device
+    // down. The caller retries / reports instead.
+    if (rc == -1) return SWD_ERROR;
+    if (!rc) return SWD_ERROR;
 
     // Now can we continue and just wait for a halt?
 //    core_unhalt();
     core_unhalt_with_masked_ints();
-    while(1) {
-        busy_wait_ms(2);
-        rc = core_is_halted();
-        if (rc == -1) panic("here");
-        if (rc) break;
+    // Wait for B's function to run to completion (halt), but NEVER spin forever:
+    // a faulting flash routine on B would otherwise hang this whole stage, so A
+    // never reboots and the board goes dark. A 64K erase+program finishes well
+    // under a second; cap the wait at ~10s and return an error so the caller can
+    // retry / give up gracefully and reboot A.
+    {
+        int waited_ms = 0;
+        while (1) {
+            busy_wait_ms(2);
+            waited_ms += 2;
+            rc = core_is_halted();
+            if (rc == -1) return SWD_ERROR;   // SWD read failed — bail, don't panic
+            if (rc) break;                    // B halted → function done
+            if (waited_ms >= 10000) return SWD_ERROR;  // timeout → B's routine hung
+        }
     }
 
 

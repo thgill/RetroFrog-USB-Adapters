@@ -198,31 +198,48 @@ class WebBluetoothTransport {
     get name() { return 'BLE'; }
 
     async connect() {
-        // Try previously authorized devices first (already connected, no scan needed)
+        // Try previously authorized devices first — no chooser, no advertising
+        // needed, and works while the controller is connected to macOS as a
+        // gamepad. Requires getDevices() to persist grants, which needs
+        // chrome://flags/#enable-web-bluetooth-new-permissions-backend enabled.
         if (navigator.bluetooth.getDevices) {
             try {
                 const devices = await navigator.bluetooth.getDevices();
-                for (const device of devices) {
-                    if (device.gatt) {
-                        try {
-                            console.log('[BLE] Trying cached device:', device.name);
-                            const server = await device.gatt.connect();
-                            this.device = device;
-                            this.server = server;
-                            this._setupDisconnectHandler();
-                            await this._setupNUS();
-                            return;
-                        } catch (e) {
-                            console.log('[BLE] Reconnect failed for', device.name, ':', e.message);
-                        }
+                // Prefer our controller by name so we don't waste time (or
+                // connect to) unrelated previously-paired BLE devices.
+                const ours = devices.filter(d => (d.name || '').startsWith('Joypad'));
+                const list = ours.length ? ours : devices;
+                console.log(`[BLE] getDevices(): ${devices.length} known, ${ours.length} Joypad`);
+                for (const device of list) {
+                    if (!device.gatt) continue;
+                    try {
+                        console.log('[BLE] Reconnecting to', device.name, '(connected:', device.gatt.connected + ')');
+                        const server = device.gatt.connected ? device.gatt : await device.gatt.connect();
+                        // Verify NUS is actually reachable before committing — a
+                        // bare gatt.connect() can succeed on a device we can't
+                        // read services from (macOS holding it as HID).
+                        await server.getPrimaryService(NUS_SERVICE_UUID);
+                        this.device = device;
+                        this.server = server;
+                        this._setupDisconnectHandler();
+                        await this._setupNUS();
+                        console.log('[BLE] Reconnected without scan ✓');
+                        return;
+                    } catch (e) {
+                        console.log('[BLE] Reconnect failed for', device.name, ':', e.message);
                     }
+                }
+                if (!devices.length) {
+                    console.log('[BLE] getDevices() returned nothing — enable ' +
+                        'chrome://flags/#enable-web-bluetooth-new-permissions-backend, then pair once.');
                 }
             } catch (e) {
                 console.log('[BLE] getDevices() failed:', e.message);
             }
         }
 
-        // Fall back to scanning — filter by name prefix, NUS as optional service
+        // Fall back to the chooser — needs the device advertising (disconnected
+        // from macOS). First-time pairing always comes through here.
         console.log('[BLE] Falling through to requestDevice()...');
         this.device = await navigator.bluetooth.requestDevice({
             filters: [{ namePrefix: 'Joypad' }],
@@ -646,6 +663,14 @@ class CDCProtocol {
         return this.sendCommand('BLE.MODE.LIST');
     }
 
+    async getWirelessPolicy() {
+        return this.sendCommand('WIRELESS.POLICY.GET');
+    }
+
+    async setWirelessPolicy(policy) {
+        return this.sendCommand('WIRELESS.POLICY.SET', { policy });
+    }
+
     // Unified Profile methods (supports both built-in and custom profiles)
     async listProfiles() {
         return this.sendCommand('PROFILE.LIST');
@@ -665,6 +690,14 @@ class CDCProtocol {
 
     async deleteProfile(index) {
         return this.sendCommand('PROFILE.DELETE', { index });
+    }
+
+    async disableProfile(index, disabled) {
+        return this.sendCommand('PROFILE.DISABLE', { index, disabled });
+    }
+
+    async getProfileModes() {
+        return this.sendCommand('PROFILE.MODES');
     }
 
     async cloneProfile(index, name) {
@@ -743,6 +776,10 @@ class CDCProtocol {
 
     async setDpadMode(mode) {
         return this.sendCommand('ROUTER.DPAD.SET', { mode });
+    }
+
+    async setShoulderSwap(enable) {
+        return this.sendCommand('ROUTER.SHOULDER.SET', { enable });
     }
 
     // Pad GPIO Config

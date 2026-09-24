@@ -154,7 +154,11 @@ static const uint8_t font_6x8[] = {
 static bool initialized = false;
 static uint8_t col_offset = 2;  // SH1106 default
 static bool rotated_panel = false;  // SH1107: 64x128 native panel rotated 90° to 128x64
-static bool async_mode = false;
+// Async by default: display_update() marks the framebuffer dirty and returns;
+// the platform main loop's display_task() pumps the transfer one page at a
+// time, so no single loop iteration blocks on a full-frame I2C/SPI transfer
+// (~tens of ms — long enough to visibly stall input polling).
+static bool async_mode = true;
 static volatile bool dirty = false;
 
 // Transport function pointers (set by display_spi_init or display_i2c_init)
@@ -330,7 +334,7 @@ bool display_is_initialized(void) {
 // DISPLAY CONTROL
 // ============================================================================
 
-void display_clear(void) {
+__attribute__((weak)) void display_clear(void) {
     memset(framebuffer, 0, sizeof(framebuffer));
 }
 
@@ -445,6 +449,14 @@ void display_set_async(bool async) {
     async_mode = async;
 }
 
+// App-loop pump: advances any pending incremental flush by one page per
+// call. No-op when the display is uninitialized or nothing is dirty.
+// Called from each display-using app's task, inside its OLED guard (see
+// display.h for why it must not be called from the platform main loops).
+void display_task(void) {
+    display_flush_step();
+}
+
 bool display_is_dirty(void) {
     return dirty;
 }
@@ -464,8 +476,15 @@ void display_set_contrast(uint8_t contrast) {
 // DRAWING PRIMITIVES
 // ============================================================================
 
-void display_pixel(uint8_t x, uint8_t y, bool on) {
-    if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) return;
+// Weak: boards with a color face backend (AMOLED) provide their own
+// display_clear/display_pixel/display_set_color; this mono OLED backend
+// yields to those strong definitions at link time.
+__attribute__((weak)) void display_set_color(uint8_t color_index) {
+    (void)color_index;   // mono OLED: no color classes
+}
+
+__attribute__((weak)) void display_pixel(int16_t x, int16_t y, bool on) {
+    if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
 
     uint8_t page = y / 8;
     uint8_t bit = y % 8;

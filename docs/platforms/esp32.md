@@ -129,7 +129,7 @@ make flash-bt2usb_esp32s3
 
 ```bash
 make uf2-bt2usb_esp32s3
-# Output: releases/joypad_<version>_bt2usb_esp32s3.uf2
+# Output: releases/joypad_os_<version>_bt2usb_esp32s3.uf2
 ```
 
 ## Build & Flash
@@ -202,7 +202,16 @@ cd esp && make BOARD=myboard build
 
 ### USB Output Modes
 
-Double-click the button to cycle through output modes: XInput, DInput, Switch, PS3, PS4/PS5.
+Double-click the button to cycle through output modes:
+
+```
+SInput -> XInput -> PS3 -> PS4 -> Switch -> Keyboard/Mouse -> SInput
+```
+
+Triple-click resets to SInput. **DInput is not in the cycle** — `usbd_get_next_mode()`
+(`src/usb/usbd/usbd.c`) deliberately skips DInput, PS Classic, Xbox Original, Xbox One and XAC as
+less common; reach those over the CDC config interface instead. Each mode change re-enumerates the
+board on the USB bus.
 
 ### CDC Serial Commands
 

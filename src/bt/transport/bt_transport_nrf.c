@@ -3,7 +3,7 @@
 //
 // Supports two modes:
 //   - Central (bt2usb): scans/connects BLE controllers via btstack_host
-//   - Peripheral (controller_btusb): advertises as BLE gamepad via ble_output
+//   - Peripheral (universal): advertises as BLE gamepad via ble_output
 // Mode is selected via bt_nrf_set_post_init() callback before bt_init().
 //
 // Based on btstack/port/zephyr/src/main.c HCI transport + run loop.
@@ -168,8 +168,21 @@ static void deliver_controller_packet(struct net_buf *buf)
     uint16_t size = buf->len;
     uint8_t *packet = buf->data;
 
+    // Diagnostic stage marker (noinit ring in main.c, weak no-op elsewhere):
+    // record every HCI event (and ACL traffic coarsely) so after a silent
+    // hardware reset the last controller traffic is readable.
+    extern void bt_diag_mark(uint32_t code);
+
     switch (h4_type) {
         case BT_HCI_H4_EVT:  // 0x04
+            // 0xE0EEss00|evcode: ss=subevent for LE meta (0x3E). Skip
+            // Number-of-Completed-Packets (0x13): per-packet chatter floods
+            // the small diagnostic ring and evicts the interesting marks.
+            if (size >= 2 && packet[0] == 0x3E) {
+                bt_diag_mark(0xE03E0000u | (size >= 3 ? packet[2] : 0xFF));
+            } else if (size >= 1 && packet[0] != 0x13) {
+                bt_diag_mark(0xE0000000u | packet[0]);
+            }
             hci_packet_handler(HCI_EVENT_PACKET, packet, size);
             break;
         case BT_HCI_H4_ACL:  // 0x02
@@ -198,7 +211,17 @@ static void run_loop_set_timer(btstack_timer_source_t *ts, uint32_t timeout_in_m
 
 static void run_loop_execute_on_main_thread(btstack_context_callback_registration_t *callback_registration)
 {
+    // Called from the app main thread while the BTstack thread walks the same
+    // callback linked list. The BTstack thread is COOPERATIVE: it preempts
+    // main the instant it wakes, so an unguarded add can be interrupted
+    // mid-mutation — corrupted (circular) list, execute_callbacks spins
+    // forever in a coop thread, every other thread starves, USB drops off the
+    // bus with no fault. Reproduced reliably with 30Hz MOUSE.INJECT while a
+    // BLE host was subscribed. irq_lock blocks the context switch for the few
+    // instructions of the list insert.
+    unsigned int key = irq_lock();
     btstack_run_loop_base_add_callback(callback_registration);
+    irq_unlock(key);
 }
 
 static void run_loop_execute(void)
@@ -269,26 +292,47 @@ static void btstack_event_handler(uint8_t packet_type, uint16_t channel, uint8_t
                         case BLUETOOTH_COMPANY_ID_NORDIC_SEMICONDUCTOR_ASA:
                         case BLUETOOTH_COMPANY_ID_THE_LINUX_FOUNDATION:
                             hci_set_chipset(btstack_chipset_zephyr_instance());
+                            // The zephyr chipset's static-address read returns
+                            // 00:00:00:00:00:00 here, so advertising would go
+                            // out with an all-zero address and never be
+                            // discoverable. Use the FICR factory static-random
+                            // address directly and enable random static
+                            // addressing so the BLE peripheral is on air.
+                            nrf_get_static_random_addr(local_addr);
+                            gap_random_address_set(local_addr);
+                            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+                            printf("[BT_NRF] FICR static random addr %s\n",
+                                   bd_addr_to_str(local_addr));
                             break;
                         default:
                             nrf_get_static_random_addr(local_addr);
                             gap_random_address_set(local_addr);
+                            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+                            printf("[BT_NRF] FICR static random addr %s\n",
+                                   bd_addr_to_str(local_addr));
                             break;
                     }
                     break;
                 }
                 case HCI_OPCODE_HCI_READ_BD_ADDR: {
-                    const uint8_t *params = hci_event_command_complete_get_return_parameters(packet);
-                    if (params[0] == 0 && size >= 12) {
-                        reverse_48(&params[1], local_addr);
-                    }
+                    // Public BD_ADDR is 00:00:00:00:00:00 on the nRF SoftDevice.
+                    // Do NOT let it clobber the FICR random static address we
+                    // set above (used for advertising + logging).
                     break;
                 }
                 case HCI_OPCODE_HCI_ZEPHYR_READ_STATIC_ADDRESS: {
                     const uint8_t *params = hci_event_command_complete_get_return_parameters(packet);
                     if (params[0] == 0 && size >= 13) {
-                        reverse_48(&params[2], local_addr);
-                        gap_random_address_set(local_addr);
+                        bd_addr_t a;
+                        reverse_48(&params[2], a);
+                        // Only apply a non-zero static address; the controller
+                        // returns all-zeros here, which would clobber FICR.
+                        static const uint8_t zero[6] = {0};
+                        if (memcmp(a, zero, 6) != 0) {
+                            memcpy(local_addr, a, 6);
+                            gap_random_address_set(local_addr);
+                            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+                        }
                     }
                     break;
                 }

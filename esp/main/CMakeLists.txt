@@ -3,7 +3,7 @@
 # Compiles shared sources from ../../src/ alongside ESP32-specific code.
 # BTstack from pico-sdk submodule, TinyUSB device-only (our own copy, not esp_tinyusb).
 #
-# App selection: pass -DCONFIG_APP=controller_btusb (default: bt2usb)
+# App selection: pass -DCONFIG_APP=universal (default: bt2usb)
 
 set(SHARED_SRC "${CMAKE_CURRENT_LIST_DIR}/../../src")
 set(BTSTACK_PATH "${SHARED_SRC}/lib/pico-sdk/lib/btstack")
@@ -24,19 +24,21 @@ endif()
 set(ESP32_COMMON_SRCS
     "main.c"
     "flash_esp32.c"
+    "ps4_auth_stubs.c"
     "ws2812_esp32.c"
     "button_esp32.c"
+    "rm67162_amoled.c"
     "${SHARED_SRC}/platform/esp32/platform_esp32.c"
 )
 
 # App-specific sources and config
-if(CONFIG_APP STREQUAL "controller_btusb")
+if(CONFIG_APP STREQUAL "universal")
     set(APP_SRCS
         "btstack_hal_esp32.c"
         "stubs_peripheral.c"
         "pad_config_storage_esp32.c"
         "platform_gpio_esp32.c"
-        "${SHARED_SRC}/apps/controller_btusb/app.c"
+        "${SHARED_SRC}/apps/universal/app.c"
         # Pad input + config (runtime GPIO pin config via web config)
         "${SHARED_SRC}/pad/pad_input.c"
         "${SHARED_SRC}/pad/pad_config_flash.c"
@@ -63,7 +65,7 @@ if(CONFIG_APP STREQUAL "controller_btusb")
         # Battery monitoring (I2C fuel gauge)
         "battery_esp32.c"
     )
-    set(APP_INCLUDE_DIR "${SHARED_SRC}/apps/controller_btusb")
+    set(APP_INCLUDE_DIR "${SHARED_SRC}/apps/universal")
     set(APP_NEEDS_BTSTACK ON)
     set(APP_BTSTACK_MODE "peripheral")
 
@@ -86,6 +88,7 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -102,6 +105,7 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
@@ -118,9 +122,13 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
 
         # --- XInput host driver (tusb_xinput library) ---
         "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
@@ -156,6 +164,7 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -172,6 +181,7 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
@@ -188,9 +198,13 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
 
         # --- XInput host driver (tusb_xinput library) ---
         "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
@@ -236,6 +250,7 @@ set(SRCS
     "${SHARED_SRC}/core/services/players/feedback.c"
     "${SHARED_SRC}/core/services/profiles/profile.c"
     "${SHARED_SRC}/core/services/profiles/profile_indicator.c"
+    "${SHARED_SRC}/core/services/profiles/runtime_profile.c"
 
     # --- USB Device ---
     "${SHARED_SRC}/usb/usbd/usbd.c"
@@ -247,6 +262,8 @@ set(SRCS
     "${SHARED_SRC}/usb/usbd/modes/psclassic_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/pcemini_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/ps4_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/dualsense_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/p5general_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xid_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xbone_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xac_mode.c"
@@ -277,6 +294,15 @@ set(SRCS
     "${TINYUSB_PATH}/src/portable/synopsys/dwc2/dwc2_common.c"
 )
 
+# Procedural face on the LilyGo AMOLED (shared engine + ESP backend/task)
+if(CONFIG_BOARD STREQUAL "lilygo_tdisplay_s3_amoled")
+    list(APPEND SRCS
+        "${SHARED_SRC}/core/services/display/face_anim.c"
+        "eyes_esp32.c"
+        "pmu_esp32.c"
+    )
+endif()
+
 # Add BTstack sources when needed
 if(APP_NEEDS_BTSTACK)
     # --- BTstack core (shared by all BTstack modes) ---
@@ -306,7 +332,10 @@ if(APP_NEEDS_BTSTACK)
         "${BTSTACK_PATH}/src/ble/att_db.c"
         "${BTSTACK_PATH}/src/ble/att_db_util.c"
         "${BTSTACK_PATH}/src/ble/att_server.c"
-        "${BTSTACK_PATH}/src/ble/le_device_db_memory.c"
+        # le_device_db_tlv ONLY — compiling le_device_db_memory.c alongside it
+        # silently wins the static-archive link and bonds live in RAM, so the
+        # device forgets every pairing at reboot (macOS keeps its side and the
+        # reconnect fails encryption). NVS-backed TLV persists bonds + SM IR/ER.
         "${BTSTACK_PATH}/src/ble/le_device_db_tlv.c"
 
         # --- BTstack 3rd-party ---
@@ -340,6 +369,11 @@ if(APP_NEEDS_BTSTACK)
             "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_bt.c"
             "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
             "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
+            "${SHARED_SRC}/bt/bthid/devices/generic/sinput_ble.c"
+            "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+            "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_2_ble.c"
+            "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_ble.c"
+            "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
             # BTstack host + transport
             "${SHARED_SRC}/bt/btstack/btstack_host.c"
@@ -365,7 +399,7 @@ if(APP_NEEDS_BTSTACK)
         )
     endif()
 
-    # --- Peripheral mode (controller_btusb): GATT server + HID device ---
+    # --- Peripheral mode (universal): GATT server + HID device ---
     if(APP_BTSTACK_MODE STREQUAL "peripheral")
         list(APPEND SRCS
             # BTstack GATT server (att_server.c is in the BLE common block)
@@ -377,6 +411,9 @@ if(APP_NEEDS_BTSTACK)
             "${BTSTACK_PATH}/src/btstack_hid_parser.c"
             # BTstack Classic link key DB (needed by btstack_port_esp32.c)
             "${BTSTACK_PATH}/src/classic/btstack_link_key_db_tlv.c"
+            # Stub btstack_host_nus_send: cdc_commands.c's FACE.* NUS relay
+            # references it, but the real impl (btstack_host.c) is central-only.
+            "btstack_host_nus_stub.c"
         )
     endif()
 endif()
@@ -385,6 +422,7 @@ set(INCLUDE_DIRS
     "."
     "${SHARED_SRC}"
     "${APP_INCLUDE_DIR}"
+    "${SHARED_SRC}/core/services/display"
     "${SHARED_SRC}/usb/usbd"
     "${SHARED_SRC}/pad"
     "${SHARED_SRC}/lib/libxsm3"
@@ -429,11 +467,13 @@ endif()
 # Component requirements
 set(ESP_REQUIRES
     nvs_flash
+    espcoredump
     esp_driver_gpio
     esp_adc
     esp_driver_i2c
     esp_driver_rmt
     esp_driver_spi
+    esp_lcd
     esp_driver_uart
     esp_timer
     esp_hw_support
@@ -503,6 +543,15 @@ if(NOT APP_NEEDS_USB_HOST)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC DISABLE_USB_HOST=1)
 endif()
 
+# BTHID host registry — derived from the source list rather than set by hand, so
+# it can never drift out of sync with whether bthid_registry.c is actually
+# compiled. bt_transport.c gates its bthid_registry_init() call on this; it used
+# to rely on a weak stub, which --gc-sections quietly resolved to an empty
+# function, leaving ESP32-S3 bt2usb builds with zero BT HID drivers registered.
+if("${SRCS}" MATCHES "bthid_registry\\.c")
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC CONFIG_BT_HOST=1)
+endif()
+
 # Board-specific definitions
 if(NOT DEFINED CONFIG_BOARD)
     set(CONFIG_BOARD "devkit")
@@ -510,11 +559,17 @@ endif()
 if(CONFIG_BOARD STREQUAL "feather_esp32s3")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC BOARD_FEATHER_ESP32S3=1)
 endif()
+if(CONFIG_BOARD STREQUAL "lilygo_tdisplay_s3_amoled")
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC
+        BOARD_LILYGO_TDISPLAY_S3_AMOLED=1
+        EYES_SCALE=6
+        CONFIG_BLE_USB_COEXIST=1)
+endif()
 
 # App-specific definitions
-if(CONFIG_APP STREQUAL "controller_btusb")
+if(CONFIG_APP STREQUAL "universal")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC
-        CONFIG_CONTROLLER_BTUSB=1
+        CONFIG_UNIVERSAL=1
         CONFIG_PAD_INPUT=1
         SENSOR_PAD=1
         BTSTACK_USE_ESP32=1
@@ -574,14 +629,18 @@ else()
     set(JOYPAD_BCD_DEVICE 256)
 endif()
 
-# Get git commit hash
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# Get git commit hash — see src/CMakeLists.txt for why the environment wins.
+if(DEFINED ENV{GIT_COMMIT} AND NOT "$ENV{GIT_COMMIT}" STREQUAL "")
+    set(GIT_COMMIT "$ENV{GIT_COMMIT}")
+else()
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT GIT_COMMIT)
     set(GIT_COMMIT "unknown")
 endif()

@@ -4,6 +4,7 @@
 
 #include "cdc_protocol.h"
 #include "cdc.h"
+#include "platform/platform.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -52,13 +53,65 @@ bool cdc_protocol_rx_byte(cdc_protocol_t* ctx, uint8_t byte)
 {
     cdc_receiver_t* rx = &ctx->rx;
 
+    // Mid-frame timeout: a frame torn by a killed writer or a USB drop leaves
+    // the parser waiting inside a phantom frame — worse, hunting resync can
+    // land on the '{' INSIDE a binary frame's JSON payload and drop into text
+    // mode, waiting for a newline that framed traffic never contains. That
+    // wedged the command channel permanently ("commands ignored until fresh
+    // boot"). Frames arrive as contiguous bursts, so any mid-frame gap this
+    // long means the frame is dead: resync.
+    uint32_t rx_now = platform_time_ms();
+    if (rx->state != CDC_RX_SYNC && (uint32_t)(rx_now - rx->last_rx_ms) > 300) {
+        rx->state = CDC_RX_SYNC;
+        rx->payload_pos = 0;
+        ctx->text_mode = false;
+    }
+    rx->last_rx_ms = rx_now;
+
     switch (rx->state) {
         case CDC_RX_SYNC:
             if (byte == CDC_SYNC_BYTE) {
                 rx->state = CDC_RX_LEN_LO;
                 rx->payload_pos = 0;
+            } else if (byte == '{') {
+                // Text-command mode: a bare newline-delimited JSON object, for
+                // humans and tools whose serial send is text rather than our
+                // binary framing (e.g. COMrade's send_serial, a plain terminal).
+                // Response goes back as text too (see cdc_protocol_send_response).
+                ctx->text_mode = true;
+                rx->state = CDC_RX_TEXT;
+                rx->payload_pos = 0;
+                rx->packet.payload[rx->payload_pos++] = byte;  // keep the '{'
             }
             // Else: keep scanning for sync
+            break;
+
+        case CDC_RX_TEXT:
+            if (byte == '\n' || byte == '\r') {
+                // End of line → dispatch the accumulated JSON as a command.
+                if (rx->payload_pos > 1) {
+                    if (rx->payload_pos < CDC_MAX_PAYLOAD) {
+                        rx->packet.payload[rx->payload_pos] = 0;  // null-terminate
+                    }
+                    rx->packet.type = CDC_MSG_CMD;
+                    rx->packet.seq = 0;
+                    rx->packet.length = rx->payload_pos;
+                    ctx->cmd_seq = 0;
+                    if (ctx->handler) {
+                        ctx->handler(&rx->packet);
+                    }
+                }
+                rx->state = CDC_RX_SYNC;
+                rx->payload_pos = 0;
+                return true;
+            } else if (rx->payload_pos < CDC_MAX_PAYLOAD) {
+                rx->packet.payload[rx->payload_pos++] = byte;
+            } else {
+                // Line too long — abandon and resync.
+                rx->state = CDC_RX_SYNC;
+                rx->payload_pos = 0;
+                ctx->text_mode = false;
+            }
             break;
 
         case CDC_RX_LEN_LO:
@@ -118,6 +171,7 @@ bool cdc_protocol_rx_byte(cdc_protocol_t* ctx, uint8_t byte)
                 // Valid packet - save seq for response and call handler
                 if (rx->packet.type == CDC_MSG_CMD) {
                     ctx->cmd_seq = rx->packet.seq;
+                    ctx->text_mode = false;  // binary in → binary response
                 }
                 if (ctx->handler) {
                     ctx->handler(&rx->packet);
@@ -146,8 +200,13 @@ uint16_t cdc_protocol_send(cdc_protocol_t* ctx, cdc_msg_type_t type,
         return 0;
     }
 
-    // Build packet
-    uint8_t packet[CDC_MAX_PACKET];
+    // Build packet. Static, not stack: packet[] is ~1.5 kB and this runs on
+    // the main thread whose Zephyr stack is a few kB — as locals (plus the
+    // former separate crc_buf copy) a single framed response overflowed the
+    // main stack on nRF52840 and smashed a neighboring frame (CPU returned
+    // into the JSON text). CDC sends are serialized through the main loop,
+    // so one shared buffer is safe.
+    static uint8_t packet[CDC_MAX_PACKET];
     uint16_t pos = 0;
 
     // Header
@@ -163,14 +222,8 @@ uint16_t cdc_protocol_send(cdc_protocol_t* ctx, cdc_msg_type_t type,
         pos += len;
     }
 
-    // CRC over type + seq + payload
-    uint8_t crc_buf[2 + CDC_MAX_PAYLOAD];
-    crc_buf[0] = type;
-    crc_buf[1] = seq;
-    if (len > 0 && payload) {
-        memcpy(&crc_buf[2], payload, len);
-    }
-    uint16_t crc = cdc_crc16(crc_buf, 2 + len);
+    // CRC over type + seq + payload — contiguous at packet[3], no copy needed
+    uint16_t crc = cdc_crc16(&packet[3], 2 + len);
     packet[pos++] = crc & 0xFF;
     packet[pos++] = (crc >> 8) & 0xFF;
 
@@ -183,6 +236,22 @@ uint16_t cdc_protocol_send(cdc_protocol_t* ctx, cdc_msg_type_t type,
 
 uint16_t cdc_protocol_send_response(cdc_protocol_t* ctx, const char* json)
 {
+    // Text-mode command → reply as plain JSON + newline so a serial terminal /
+    // COMrade shows a readable line instead of a binary frame. Uses the same
+    // transport selection as cdc_protocol_send (custom write or USB CDC default).
+    if (ctx->text_mode) {
+        uint16_t n = (uint16_t)strlen(json);
+        if (n > CDC_MAX_PAYLOAD) n = CDC_MAX_PAYLOAD;
+        // Static for the same stack-overflow reason as packet[] above.
+        static uint8_t line[CDC_MAX_PAYLOAD + 2];
+        memcpy(line, json, n);
+        line[n++] = '\r';
+        line[n++] = '\n';
+        if (ctx->write) {
+            return ctx->write(line, n);
+        }
+        return cdc_data_write(line, n);
+    }
     return cdc_protocol_send(ctx, CDC_MSG_RSP, ctx->cmd_seq,
                              (const uint8_t*)json, strlen(json));
 }

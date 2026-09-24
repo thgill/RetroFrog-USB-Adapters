@@ -76,6 +76,13 @@ static uint8_t cached_face_style = SINPUT_FACE_XBOX;
 static uint8_t cached_gamepad_type = SINPUT_TYPE_STANDARD;
 static bool cached_has_motion = false;
 static bool cached_has_touch = false;
+// Touchpad geometry advertised in the SInput capability report (byte 16/17). SDL
+// gates how many touchpads it exposes on touchpad_count — a device with two
+// separate pads (Steam Controller 2: left+right) MUST advertise 2, or SDL reads
+// only touchpad1 and drops the second pad. Default is the DualSense shape
+// (1 pad, 2 fingers); per-device overrides set below in update_cached_device_info().
+static uint8_t cached_touch_count = 1;
+static uint8_t cached_finger_count = 2;
 static controller_layout_t cached_layout = LAYOUT_UNKNOWN;  // last native layout (for feature refresh)
 static int16_t last_dev_addr = -1;  // Track connected device for auto feature report
 
@@ -130,10 +137,51 @@ static uint32_t convert_buttons(uint32_t buttons)
     if (buttons & JP_BUTTON_A3) sinput_buttons |= SINPUT_MASK_MISC4;  // Mute/Assistant
     if (buttons & JP_BUTTON_A4) sinput_buttons |= SINPUT_MASK_MISC5;  // Misc 5
 
-    // Extended buttons (paddles) - map L4/R4 if available
+    // Extended buttons (paddles). Upper pair -> paddle 1, lower pair -> paddle 2
+    // (controllers with four back paddles, e.g. Steam Controller 2).
     if (buttons & JP_BUTTON_L4) sinput_buttons |= SINPUT_MASK_L_PADDLE1;
     if (buttons & JP_BUTTON_R4) sinput_buttons |= SINPUT_MASK_R_PADDLE1;
+    if (buttons & JP_BUTTON_L5) sinput_buttons |= SINPUT_MASK_L_PADDLE2;
+    if (buttons & JP_BUTTON_R5) sinput_buttons |= SINPUT_MASK_R_PADDLE2;
 
+    return sinput_buttons;
+}
+
+// Map generic aux buttons (input_event.aux_buttons) onto SInput's spare button
+// slots. Used by inputs with more buttons than JP_BUTTON_* covers — e.g. the
+// Atari Jaguar keypad's 12 keys. The chosen slots avoid every slot a Jaguar
+// pad already uses (face/d-pad/shoulders/Start/Back) plus Guide (Steam grabs
+// it) and Power, so all 12 land on distinct, bindable buttons. aux bit index
+// i -> SInput button number below:
+//   0:15  1:16  2:21  3:22  4:20  5:26  6:27  7:28  8:29  9:30  10:31  11:32
+//
+// NOTE: aux0..aux3 deliberately share SInput's four paddle slots with the
+// JP_BUTTON_L4/R4/L5/R5 paddles mapped in convert_buttons() above. That is safe
+// only because no device drives both: paddle controllers (Steam Controller 2,
+// Xbox Elite) report no aux buttons, and aux-button devices (Jaguar keypad)
+// have no paddles. If a future device has both, these four slots collide and
+// the aux keys need remapping onto MISC slots instead.
+static const uint32_t sinput_aux_slot[12] = {
+    SINPUT_MASK_L_PADDLE1,  // aux0  -> Button 15
+    SINPUT_MASK_R_PADDLE1,  // aux1  -> Button 16
+    SINPUT_MASK_L_PADDLE2,  // aux2  -> Button 21
+    SINPUT_MASK_R_PADDLE2,  // aux3  -> Button 22
+    SINPUT_MASK_CAPTURE,    // aux4  -> Button 20
+    SINPUT_MASK_MISC4,      // aux5  -> Button 26
+    SINPUT_MASK_MISC5,      // aux6  -> Button 27
+    SINPUT_MASK_MISC6,      // aux7  -> Button 28
+    SINPUT_MASK_MISC7,      // aux8  -> Button 29
+    SINPUT_MASK_MISC8,      // aux9  -> Button 30
+    SINPUT_MASK_MISC9,      // aux10 -> Button 31
+    SINPUT_MASK_MISC10,     // aux11 -> Button 32
+};
+
+static uint32_t convert_aux_buttons(uint32_t aux)
+{
+    uint32_t sinput_buttons = 0;
+    for (int i = 0; i < 12; i++) {
+        if (aux & (1u << i)) sinput_buttons |= sinput_aux_slot[i];
+    }
     return sinput_buttons;
 }
 
@@ -145,6 +193,12 @@ static uint32_t convert_buttons(uint32_t buttons)
 static void update_device_info(uint8_t dev_addr, int8_t instance, input_transport_t transport,
                                controller_layout_t layout)
 {
+    // Default touchpad geometry (DualSense: 1 pad, 2 fingers). Devices with a
+    // different pad layout (e.g. Steam Controller 2 = 2 pads) override below.
+    // Reset every call so a prior 2-pad device doesn't leak into the next one.
+    cached_touch_count = 1;
+    cached_finger_count = 2;
+
     // Native controllers: determine face style from layout
     if (transport == INPUT_TRANSPORT_NATIVE && layout != LAYOUT_UNKNOWN) {
         if (layout == LAYOUT_GAMECUBE) {
@@ -213,9 +267,17 @@ static void update_device_info(uint8_t dev_addr, int8_t instance, input_transpor
                 cached_face_style = SINPUT_FACE_GAMECUBE;
                 cached_gamepad_type = SINPUT_TYPE_GAMECUBE;
                 return;
+            case CONTROLLER_STEAM_2:  // touchpad + gyro → PS5/DualSense SInput type
+                cached_face_style = SINPUT_FACE_SONY;
+                cached_gamepad_type = SINPUT_TYPE_PS5;
+                cached_touch_count = 2;   // two separate pads (left + right)
+                cached_finger_count = 1;  // one finger each
+                return;
             default:
                 cached_face_style = SINPUT_FACE_XBOX;
                 cached_gamepad_type = SINPUT_TYPE_STANDARD;
+                cached_touch_count = 1;
+                cached_finger_count = 2;
                 return;
         }
     }
@@ -252,9 +314,19 @@ static void update_device_info(uint8_t dev_addr, int8_t instance, input_transpor
                     cached_face_style = SINPUT_FACE_XBOX;
                     cached_gamepad_type = SINPUT_TYPE_XBOXONE;
                     return;
+                case 0x28DE:  // Valve — Steam Controller 2. Report as PS5/DualSense
+                    // type: it's the closest canonical SInput type with a touchpad
+                    // (+ gyro), so testers render the touchpad visual.
+                    cached_face_style = SINPUT_FACE_SONY;
+                    cached_gamepad_type = SINPUT_TYPE_PS5;
+                    cached_touch_count = 2;   // two separate pads (left + right)
+                    cached_finger_count = 1;  // one finger each
+                    return;
                 default:
                     cached_face_style = SINPUT_FACE_XBOX;
                     cached_gamepad_type = SINPUT_TYPE_STANDARD;
+                    cached_touch_count = 1;
+                    cached_finger_count = 2;
                     return;
             }
         }
@@ -334,6 +406,15 @@ static bool sinput_mode_send_report(uint8_t player_index,
 {
     (void)player_index;
 
+    // Typing-only device (real keyboard or KEY.INJECT): keyboard/consumer
+    // report on the keyboard interface, nothing for the gamepad. Without this
+    // branch a pure KEYBOARD event fell through to the gamepad build and its
+    // keys never reached the host.
+    if (event->type == INPUT_TYPE_KEYBOARD) {
+        sinput_send_kbd_consumer(event);
+        return true;
+    }
+
     // Relative pointers (e.g. PlayStation Mouse) go out the SInput composite's
     // mouse interface, not the gamepad report.
     if (event->type == INPUT_TYPE_MOUSE) {
@@ -398,8 +479,9 @@ static bool sinput_mode_send_report(uint8_t player_index,
         feature_request_pending = true;
     }
 
-    // Convert buttons to SInput format (32-bit across 4 bytes)
-    uint32_t sinput_buttons = convert_buttons(buttons);
+    // Convert buttons to SInput format (32-bit across 4 bytes). Aux buttons
+    // (e.g. Jaguar keypad) land on SInput's spare paddle/misc slots.
+    uint32_t sinput_buttons = convert_buttons(buttons) | convert_aux_buttons(event->aux_buttons);
     sinput_report.buttons[0] = (sinput_buttons >>  0) & 0xFF;
     sinput_report.buttons[1] = (sinput_buttons >>  8) & 0xFF;
     sinput_report.buttons[2] = (sinput_buttons >> 16) & 0xFF;
@@ -420,12 +502,15 @@ static bool sinput_mode_send_report(uint8_t player_index,
 
     // IMU data - passthrough from input controller if available
     if (event->has_motion) {
-        sinput_report.accel_x = event->accel[0];
-        sinput_report.accel_y = event->accel[1];
-        sinput_report.accel_z = event->accel[2];
-        sinput_report.gyro_x = event->gyro[0];
-        sinput_report.gyro_y = event->gyro[1];
-        sinput_report.gyro_z = event->gyro[2];
+        // Canonical SDL frame -> SInput device frame: inverse of the input
+        // transform (-x,+z,-y), i.e. native = (-sx, -sz, +sy). Round-trips to
+        // identity for SInput->SInput; makes DS5/DS4->SInput axes correct.
+        sinput_report.accel_x = imu_negate_s16(event->accel[0]);
+        sinput_report.accel_y = imu_negate_s16(event->accel[2]);
+        sinput_report.accel_z = event->accel[1];
+        sinput_report.gyro_x = imu_negate_s16(event->gyro[0]);
+        sinput_report.gyro_y = imu_negate_s16(event->gyro[2]);
+        sinput_report.gyro_z = event->gyro[1];
     } else {
         sinput_report.accel_x = 0;
         sinput_report.accel_y = 0;
@@ -438,15 +523,15 @@ static bool sinput_mode_send_report(uint8_t player_index,
     // Touchpad data — SDL3 reads pressure as Uint16 and divides by 32768.0f to
     // normalize to [0,1]. 0xFFFF would saturate to 2.0; cap at 0x7FFF (32767).
     if (event->has_touch) {
-        int16_t t1x = event->touch[0].active ? (int16_t)event->touch[0].x : 0;
-        int16_t t1y = event->touch[0].active ? (int16_t)event->touch[0].y : 0;
+        int16_t t1x = event->touch[0].active ? touch_norm_to_s16(event->touch[0].x) : 0;
+        int16_t t1y = event->touch[0].active ? touch_norm_to_s16(event->touch[0].y) : 0;
         uint16_t t1p = event->touch[0].active ? 0x7FFF : 0;
         memcpy(sinput_report.touchpad1, &t1x, 2);
         memcpy(sinput_report.touchpad1 + 2, &t1y, 2);
         memcpy(sinput_report.touchpad1 + 4, &t1p, 2);
 
-        int16_t t2x = event->touch[1].active ? (int16_t)event->touch[1].x : 0;
-        int16_t t2y = event->touch[1].active ? (int16_t)event->touch[1].y : 0;
+        int16_t t2x = event->touch[1].active ? touch_norm_to_s16(event->touch[1].x) : 0;
+        int16_t t2y = event->touch[1].active ? touch_norm_to_s16(event->touch[1].y) : 0;
         uint16_t t2p = event->touch[1].active ? 0x7FFF : 0;
         memcpy(sinput_report.touchpad2, &t2x, 2);
         memcpy(sinput_report.touchpad2 + 2, &t2y, 2);
@@ -592,14 +677,38 @@ static const uint8_t* sinput_mode_get_report_descriptor(void)
     return sinput_report_descriptor;
 }
 
-// Send feature response when pending
-static void sinput_mode_task(void)
+// Build the 63-byte SInput feature-response payload (command echo + 24-byte
+// capability struct + zero pad), refreshing device info from player 0 first so
+// the caps reflect the connected controller. Transport-neutral: the caller
+// sends it (USB input report ID 2, or BLE input report ID 2).
+// Diagnostic: feature responses built since boot. A climbing count while a
+// controller is steadily connected means feature_request_pending is flapping
+// (feature reports interleave into the input stream → visible stream hiccups).
+volatile uint32_t g_sinput_feature_count = 0;
+uint32_t sinput_get_feature_count(void) { return g_sinput_feature_count; }
+
+// Diagnostic: report the values that drive the SInput identity SDL reads, so we
+// can see over CDC (not UART printf) why a device resolves to a given type.
+void sinput_get_debug_info(char* buf, int len)
 {
-    if (!feature_request_pending) return;
-    if (!tud_hid_n_ready(ITF_NUM_HID_GAMEPAD)) return;
+    int p0_dev = (playersCount > 0) ? players[0].dev_addr : -1;
+    int p0_inst = (playersCount > 0) ? players[0].instance : -1;
+    int p0_tr = (playersCount > 0) ? (int)players[0].transport : -1;
+    int ctrl = -1, steam2 = -1;
+#if (defined(CONFIG_USB_HOST) || defined(CONFIG_USB)) && !defined(DISABLE_USB_HOST)
+    if (p0_dev >= 0) ctrl = hid_get_ctrl_type((uint8_t)p0_dev, (uint8_t)p0_inst);
+    steam2 = CONTROLLER_STEAM_2;  // registry enum only exists in USB-host builds
+#endif
+    snprintf(buf, len,
+        "players=%d p0.dev=%d inst=%d transport=%d ctrl_type=%d STEAM2=%d "
+        "cached: type=%d face=%d touch=%d tpcount=%d",
+        playersCount, p0_dev, p0_inst, p0_tr, ctrl, steam2,
+        cached_gamepad_type, cached_face_style, cached_has_touch, cached_touch_count);
+}
 
-    feature_request_pending = false;
-
+uint16_t sinput_build_feature_response(uint8_t feature_response[63])
+{
+    g_sinput_feature_count++;
     // Refresh device info from player 0 before building response
     if (playersCount > 0 && players[0].dev_addr >= 0) {
         update_device_info((uint8_t)players[0].dev_addr,
@@ -635,7 +744,7 @@ static void sinput_mode_task(void)
     // Byte 16:     Touchpad count
     // Byte 17:     Touchpad finger count
     // Bytes 18-23: Serial number (6 bytes)
-    uint8_t feature_response[63] = {0};
+    memset(feature_response, 0, 63);
     feature_response[0] = SINPUT_CMD_FEATURES;  // command echo → host data[1]
     uint8_t* f = &feature_response[1];          // 24-byte struct → host data[2]+
 
@@ -697,10 +806,12 @@ static void sinput_mode_task(void)
     // Byte 3: MISC4 (mute/assistant) + MISC5
     f[15] = 0x06;
 
-    // Touchpad
+    // Touchpad — count is device-driven: SC2 has two separate pads (left+right),
+    // DualSense has one pad with two fingers. SDL exposes exactly touchpad_count
+    // pads, so a wrong "1" here would drop the SC2's right pad.
     if (cached_has_touch) {
-        f[16] = 1;  // 1 touchpad
-        f[17] = 2;  // 2 fingers max
+        f[16] = cached_touch_count;
+        f[17] = cached_finger_count;
     } else {
         f[16] = 0;  // no touchpads
         f[17] = 0;
@@ -716,8 +827,116 @@ static void sinput_mode_task(void)
     f[22] = board_id[6];
     f[23] = board_id[7];
 
+    return 63;
+}
+
+// Send the pending feature response over USB (input report ID 2).
+static void sinput_mode_task(void)
+{
+    if (!feature_request_pending) return;
+    if (!tud_hid_n_ready(ITF_NUM_HID_GAMEPAD)) return;
+    feature_request_pending = false;
+
+    uint8_t feature_response[63];
+    sinput_build_feature_response(feature_response);
     tud_hid_n_report(ITF_NUM_HID_GAMEPAD, SINPUT_REPORT_ID_FEATURES,
-                     feature_response, sizeof(feature_response));
+                     feature_response, 63);
+}
+
+// Take a pending feature response for a non-USB transport (BLE SInput mode).
+// Fills out[63]/len and clears the pending flag; returns false if none pending.
+bool sinput_feature_response_take(uint8_t out[63], uint16_t* len)
+{
+    if (!feature_request_pending) return false;
+    feature_request_pending = false;
+    *len = sinput_build_feature_response(out);
+    return true;
+}
+
+// Build a full 64-byte SInput input report from a router output event, for the
+// BLE SInput device mode (which polls router_get_output instead of using the
+// USB push/profile pipeline). Mirrors the field mapping in
+// sinput_mode_send_report(). Shared device-info/feature state is fine because
+// only one transport (USB or BLE) is the active SInput output at a time.
+void sinput_report_build_from_event(sinput_report_t* out, const input_event_t* event)
+{
+    memset(out, 0, sizeof(*out));
+    out->report_id = SINPUT_REPORT_ID_INPUT;
+
+    uint8_t prev_type = cached_gamepad_type;
+    bool prev_motion = cached_has_motion;
+    bool prev_touch = cached_has_touch;
+    cached_layout = event->layout;
+    update_device_info(event->dev_addr, event->instance, event->transport, event->layout);
+    cached_has_motion = event->has_motion;
+    cached_has_touch = event->has_touch;
+    if (event->dev_addr != last_dev_addr || cached_gamepad_type != prev_type ||
+        cached_has_motion != prev_motion || cached_has_touch != prev_touch) {
+        last_dev_addr = event->dev_addr;
+        feature_request_pending = true;
+    }
+
+    uint32_t sinput_buttons = convert_buttons(event->buttons);
+    out->buttons[0] = (sinput_buttons >>  0) & 0xFF;
+    out->buttons[1] = (sinput_buttons >>  8) & 0xFF;
+    out->buttons[2] = (sinput_buttons >> 16) & 0xFF;
+    out->buttons[3] = (sinput_buttons >> 24) & 0xFF;
+
+    out->lx = convert_axis_to_s16(event->analog[ANALOG_LX]);
+    out->ly = convert_axis_to_s16(event->analog[ANALOG_LY]);
+    out->rx = convert_axis_to_s16(event->analog[ANALOG_RX]);
+    out->ry = convert_axis_to_s16(event->analog[ANALOG_RY]);
+    out->lt = convert_trigger_to_s16(event->analog[ANALOG_L2]);
+    out->rt = convert_trigger_to_s16(event->analog[ANALOG_R2]);
+
+    out->imu_timestamp = platform_time_us();
+    if (event->has_motion) {
+        out->accel_x = event->accel[0];
+        out->accel_y = event->accel[1];
+        out->accel_z = event->accel[2];
+        out->gyro_x = event->gyro[0];
+        out->gyro_y = event->gyro[1];
+        out->gyro_z = event->gyro[2];
+    }
+
+    if (event->has_touch) {
+        int16_t t1x = event->touch[0].active ? touch_norm_to_s16(event->touch[0].x) : 0;
+        int16_t t1y = event->touch[0].active ? touch_norm_to_s16(event->touch[0].y) : 0;
+        uint16_t t1p = event->touch[0].active ? 0x7FFF : 0;
+        memcpy(out->touchpad1, &t1x, 2);
+        memcpy(out->touchpad1 + 2, &t1y, 2);
+        memcpy(out->touchpad1 + 4, &t1p, 2);
+        int16_t t2x = event->touch[1].active ? touch_norm_to_s16(event->touch[1].x) : 0;
+        int16_t t2y = event->touch[1].active ? touch_norm_to_s16(event->touch[1].y) : 0;
+        uint16_t t2p = event->touch[1].active ? 0x7FFF : 0;
+        memcpy(out->touchpad2, &t2x, 2);
+        memcpy(out->touchpad2 + 2, &t2y, 2);
+        memcpy(out->touchpad2 + 4, &t2p, 2);
+    }
+
+    out->charge_level = event->battery_level;
+    if (event->battery_charging) {
+        out->plug_status = (event->battery_level >= 100) ? 3 : 2;
+    } else if (event->battery_level > 0) {
+        out->plug_status = 4;
+    } else {
+        out->plug_status = 0;   // unknown -> SDL/Steam shows no battery
+    }
+}
+
+// Feed a received SInput output report (ID 3: haptic/LED/features request) from
+// a non-USB transport (BLE). Reuses the USB output handler.
+void sinput_output_received(const uint8_t* data, uint16_t len)
+{
+    sinput_mode_handle_output(SINPUT_REPORT_ID_OUTPUT, data, len);
+}
+
+// Rumble amplitudes from the last haptic output report (for the BLE path to
+// forward to the connected input controller).
+void sinput_get_rumble_lr(uint8_t* left, uint8_t* right)
+{
+    if (left)  *left  = rumble_left;
+    if (right) *right = rumble_right;
 }
 
 // ============================================================================

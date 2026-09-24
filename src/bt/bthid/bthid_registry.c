@@ -15,7 +15,11 @@
 #include "devices/vendors/nintendo/wiimote_bt.h"
 // xbox_bt.h and xbox_ble.h no longer registered — generic driver handles all Xbox
 #include "devices/vendors/google/stadia_bt.h"
+#include "devices/vendors/valve/steam_controller_2_ble.h"
+#include "devices/vendors/valve/steam_controller_ble.h"
 #include "devices/vendors/augmental/mouthpad_ble.h"
+#include "devices/vendors/ipega/ipega_bt.h"
+#include "devices/generic/sinput_ble.h"
 
 void bthid_registry_init(void)
 {
@@ -42,8 +46,27 @@ void bthid_registry_init(void)
     // Google controllers
     stadia_bt_register();
 
+    // Valve Steam Controller 1 (original) over BLE. Registered BEFORE the SC2 so its
+    // specific VID/PID (28DE:1101) match wins — the SC2 driver's "Steam" name fallback
+    // would otherwise also grab "SteamController".
+    steam_controller_ble_register();
+
+    // Valve Steam Controller 2 over BLE (Valve proprietary GATT service).
+    // Matches by synthetic VID/PID 28DE:1303 or "Steam" name.
+    steam_controller_2_ble_register();
+
     // Augmental MouthPad (BLE mouse/keyboard/consumer — matches by name)
     mouthpad_ble_register();
+
+    // iPega PG-9021 (classic BT gamepad, VID 0x1949 / PID 0x0404 BT).
+    // Registered before the generic fallback so its 11-byte RID-7 report is
+    // decoded deterministically instead of relying on HID descriptor parsing.
+    ipega_bt_register();
+
+    // JoypadOS SInput controller over BLE (matches by VID/PID 2E8A:10C6 or name).
+    // Must register before the generic fallback so SInput's report ID 1 is parsed
+    // properly instead of by the generic gamepad driver.
+    sinput_ble_register();
 
     // Generic gamepad driver (fallback, lowest priority)
     bthid_gamepad_register();

@@ -246,6 +246,11 @@ bool flash_load(flash_t* settings)
     memcpy(settings, slot, sizeof(flash_t));
     current_sequence = slot->sequence;
 
+    unsigned fixed = flash_sanitize_record(settings);
+    if (fixed) {
+        printf("[flash] %u incoherent field(s) in stored record reset to defaults\n", fixed);
+    }
+
     return true;
 }
 
@@ -339,8 +344,14 @@ static void flash_erase_sector(uint8_t sector)
 
 // Force immediate save (bypasses debouncing)
 // With dual-sector design, this is always safe - we erase the OTHER sector
+// Diagnostic: total committed flash writes since boot. A steadily climbing
+// count while idle means something is persisting settings in a hot path.
+volatile uint32_t g_flash_write_count = 0;
+uint32_t flash_get_write_count(void) { return g_flash_write_count; }
+
 void flash_save_now(const flash_t* settings)
 {
+    g_flash_write_count++;
     static flash_t write_settings;
     memcpy(&write_settings, settings, sizeof(flash_t));
     write_settings.magic = SETTINGS_MAGIC;
@@ -475,7 +486,7 @@ uint32_t custom_profile_apply_buttons(const custom_profile_t* profile, uint32_t 
         }
     }
 
-    // Pass through buttons beyond the profile map (A3, A4, L4, R4, F1, F2)
+    // Pass through buttons beyond the profile map (A3, A4, L4, R4, F1, F2, L5, R5)
     output |= buttons & ~((1u << CUSTOM_PROFILE_BUTTON_COUNT) - 1);
 
     return output;
@@ -523,7 +534,12 @@ uint8_t flash_get_active_profile_index(void)
 // Idempotent — skips the write if value + saved-flag already match.
 void flash_set_dpad_mode(uint8_t mode)
 {
-    if (mode > 2) return;
+    // Mode 3 (LSTICK<->RSTICK) was added alongside the 4-position d-pad slider
+    // hotkey; this guard still said 2 and silently dropped it, so the slider's
+    // rightmost position never survived a reboot. The bound is shared with
+    // flash_sanitize_record() — raising one without the other is what let the
+    // load side keep reverting what the write side had just fixed.
+    if (mode > FLASH_DPAD_MODE_MAX) return;
     if (!runtime_settings_loaded) {
         flash_t tmp;
         if (!flash_load(&tmp)) memset(&tmp, 0, sizeof(tmp));
@@ -557,6 +573,26 @@ void flash_set_shoulder_swap(uint8_t on)
     }
     runtime_settings.shoulder_swap = on;
     runtime_settings.router_saved = 1;
+    flash_save(&runtime_settings);
+}
+
+uint8_t flash_get_builtin_disabled_mask(void)
+{
+    if (!runtime_settings_loaded) return 0;
+    return runtime_settings.builtin_disabled_mask;
+}
+
+void flash_set_builtin_disabled_mask(uint8_t mask)
+{
+    if (!runtime_settings_loaded) {
+        flash_t tmp;
+        if (!flash_load(&tmp)) memset(&tmp, 0, sizeof(tmp));
+        tmp.builtin_disabled_mask = mask;
+        flash_save(&tmp);
+        return;
+    }
+    if (runtime_settings.builtin_disabled_mask == mask) return;
+    runtime_settings.builtin_disabled_mask = mask;
     flash_save(&runtime_settings);
 }
 
@@ -756,4 +792,3 @@ void flash_cycle_profile_prev(void)
     uint8_t prev = (current == 0) ? (total - 1) : (current - 1);
     flash_set_active_profile_index(prev);
 }
-

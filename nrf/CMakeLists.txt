@@ -1,6 +1,7 @@
 # Zephyr app CMakeLists for Joypad on nRF52840 boards
 #
-# Supported boards: xiao_ble (Seeed XIAO), adafruit_feather_nrf52840
+# Supported boards: xiao_ble (Seeed XIAO), adafruit_feather_nrf52840,
+#                   aprbrother_nrf52840, makerdiary_nrf52840 (MDK USB Dongle)
 # Supported apps:   bt2usb (default), usb2usb (with MAX3421E FeatherWing),
 #                   btusb2usb (MAX3421E + Bluetooth combined)
 #
@@ -15,8 +16,8 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 # APP_TYPE selects which app to build (default: bt2usb)
 # Zephyr sysbuild doesn't forward custom -D variables to the inner project,
 # so we detect app type from EXTRA_CONF_FILE (which IS forwarded via sysbuild cache).
-if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_controller_btusb")
-    set(APP_TYPE "controller_btusb")
+if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_universal")
+    set(APP_TYPE "universal")
 elseif(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_btusb2usb")
     set(APP_TYPE "btusb2usb")
 elseif(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_usb2usb")
@@ -42,8 +43,10 @@ set(SRCS
     # --- nRF-specific ---
     "src/main.c"
     "src/flash_nrf.c"
+    "src/ps4_auth_stubs.c"
     "src/ws2812_nrf.c"
     "src/button_nrf.c"
+    "src/platform_gpio_nrf.c"
     "${SHARED_SRC}/platform/nrf/platform_nrf.c"
 
     # --- Display (SSD1306 I2C on XIAO Expansion Board / FeatherWing OLED) ---
@@ -66,6 +69,7 @@ set(SRCS
     "${SHARED_SRC}/core/services/players/feedback.c"
     "${SHARED_SRC}/core/services/profiles/profile.c"
     "${SHARED_SRC}/core/services/profiles/profile_indicator.c"
+    "${SHARED_SRC}/core/services/profiles/runtime_profile.c"
 
     # --- USB Device ---
     "${SHARED_SRC}/usb/usbd/usbd.c"
@@ -77,6 +81,8 @@ set(SRCS
     "${SHARED_SRC}/usb/usbd/modes/psclassic_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/pcemini_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/ps4_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/dualsense_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/p5general_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xid_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xbone_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xac_mode.c"
@@ -136,6 +142,7 @@ if(APP_TYPE STREQUAL "usb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -151,7 +158,9 @@ if(APP_TYPE STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_pokken.c"
@@ -167,9 +176,12 @@ if(APP_TYPE STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
 
         # --- XInput host driver (tusb_xinput library) ---
         "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
@@ -213,6 +225,7 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -228,7 +241,9 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_pokken.c"
@@ -244,9 +259,12 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
 
         # --- XInput host driver (tusb_xinput library) ---
         "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
@@ -265,6 +283,7 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         "${SHARED_SRC}/bt/bthid/bthid.c"
         "${SHARED_SRC}/bt/bthid/bthid_registry.c"
         "${SHARED_SRC}/bt/bthid/devices/generic/bthid_gamepad.c"
+        "${SHARED_SRC}/bt/bthid/devices/generic/sinput_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds3_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds4_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds5_bt.c"
@@ -275,7 +294,10 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_2_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- BTstack host + transport ---
         "${SHARED_SRC}/bt/btstack/btstack_host.c"
@@ -364,26 +386,26 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         CFG_TUSB_CONFIG_FILE="tusb_config_nrf.h"
     )
 
-elseif(APP_TYPE STREQUAL "controller_btusb")
+elseif(APP_TYPE STREQUAL "universal")
     # -----------------------------------------------------------------------
-    # controller_btusb: Sensor inputs → BLE Peripheral + USB Device
+    # universal: Sensor inputs → BLE Peripheral + USB Device
     # BTstack BLE peripheral (HOGP), no USB host, no btstack_host/bthid
     # -----------------------------------------------------------------------
     list(APPEND SRCS
         # --- App ---
         "src/stubs_peripheral.c"
-        "${SHARED_SRC}/apps/controller_btusb/app.c"
+        "${SHARED_SRC}/apps/universal/app.c"
 
         # --- Pad input + config ---
         "${SHARED_SRC}/pad/pad_input.c"
         "${SHARED_SRC}/pad/pad_config_flash.c"
         "src/pad_config_storage_nrf.c"
-        "src/platform_gpio_nrf.c"
 
         # --- Sensor drivers ---
         "${SHARED_SRC}/drivers/seesaw/seesaw.c"
         "${SHARED_SRC}/drivers/joywing/joywing_input.c"
         "${SHARED_SRC}/platform/nrf/platform_i2c_nrf.c"
+        "src/imu_nrf.c"   # onboard IMU (XIAO Sense LSM6DS3TR-C); no-op if absent
 
         # --- BLE output (peripheral mode) ---
         "${SHARED_SRC}/bt/ble_output/ble_output.c"
@@ -403,6 +425,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
         "${SHARED_SRC}/bt/bthid/bthid.c"
         "${SHARED_SRC}/bt/bthid/bthid_registry.c"
         "${SHARED_SRC}/bt/bthid/devices/generic/bthid_gamepad.c"
+        "${SHARED_SRC}/bt/bthid/devices/generic/sinput_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds3_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds4_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds5_bt.c"
@@ -413,7 +436,10 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_2_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- nRF BTstack TLV ---
         "src/btstack_tlv_nrf.c"
@@ -478,7 +504,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
     )
 
     list(APPEND INCLUDE_DIRS
-        "${SHARED_SRC}/apps/controller_btusb"
+        "${SHARED_SRC}/apps/universal"
         "${SHARED_SRC}/pad"
         "${SHARED_SRC}/drivers"
         "${SHARED_SRC}/bt"
@@ -495,7 +521,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
     )
 
     target_compile_definitions(app PRIVATE
-        CONFIG_CONTROLLER_BTUSB=1
+        CONFIG_UNIVERSAL=1
         CONFIG_USB=1
         CONFIG_PAD_INPUT=1
         SENSOR_PAD=1
@@ -506,12 +532,51 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
         ENABLE_BTSTACK=1
         REQUIRE_BLE_OUTPUT=1
         REQUIRE_BT_INPUT=1
-        SENSOR_JOYWING=1
         PLATFORM_NRF=1
         DISABLE_DISPLAY_SPI=1
-        OLED_I2C_DISPLAY=1
         CFG_TUSB_CONFIG_FILE="tusb_config_nrf.h"
     )
+
+    # JoyWing (seesaw I2C sensor) is a Feather-class accessory and registers a
+    # separate top-level input interface. On the bare XIAO it's just clutter in
+    # the device-info input list (and there's no seesaw attached), so enable it
+    # only on the Feather. Pad (GPIO) input is always available via SENSOR_PAD.
+    if(BOARD MATCHES "adafruit_feather_nrf52840")
+        target_compile_definitions(app PRIVATE SENSOR_JOYWING=1)
+    endif()
+
+    # Bench/coexist option: keep BLE advertising and connections alive while a
+    # USB data host owns the device (disables the usb_dom force-disconnect in
+    # ble_output.c). Sysbuild strips custom -D vars, so like APP_TYPE this is
+    # detected from EXTRA_CONF_FILE: include nrf/prj_coexist_bench.conf.
+    if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "coexist_bench")
+        target_compile_definitions(app PRIVATE CONFIG_BLE_USB_COEXIST=1)
+        message(STATUS "BLE/USB coexist bench mode ENABLED")
+    endif()
+
+    if(DEFINED JP_RECOVERY_WIPE_ON_BOOT)
+        target_compile_definitions(app PRIVATE JP_RECOVERY_WIPE_ON_BOOT=1)
+    endif()
+
+    # OLED display is opt-in per board. The boot-time SSD1306 probe does a
+    # blocking I2C transfer; on a bare board with no display and no external
+    # pull-ups (e.g. plain XIAO header), that transfer can hang the TWIM and
+    # stall boot before USB enumerates → app drops back to the bootloader.
+    # Enable it only where an OLED + pull-ups are actually present (Feather
+    # FeatherWing). Bare XIAO boots reliably without the probe; i2c0 stays
+    # available for a JoyWing when one is configured.
+    if(BOARD MATCHES "adafruit_feather_nrf52840")
+        target_compile_definitions(app PRIVATE OLED_I2C_DISPLAY=1)
+    endif()
+
+    # The XIAO has no dedicated user button; button_nrf.c otherwise grabs
+    # D1/P0.03 as the "user button", which collides with a gamepad button on
+    # that pad and makes presses cycle the USB output mode (double-click).
+    # Disable it so every pad GPIO is free for controller input. The Feather
+    # has a real user switch (P1.02), so keep it there.
+    if(BOARD MATCHES "xiao_ble")
+        target_compile_definitions(app PRIVATE DISABLE_USER_BUTTON=1)
+    endif()
 
 else()
     # -----------------------------------------------------------------------
@@ -541,6 +606,7 @@ else()
         "${SHARED_SRC}/bt/bthid/bthid.c"
         "${SHARED_SRC}/bt/bthid/bthid_registry.c"
         "${SHARED_SRC}/bt/bthid/devices/generic/bthid_gamepad.c"
+        "${SHARED_SRC}/bt/bthid/devices/generic/sinput_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds3_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds4_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/sony/ds5_bt.c"
@@ -551,7 +617,10 @@ else()
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_2_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/valve/steam_controller_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- BTstack host + transport ---
         "${SHARED_SRC}/bt/btstack/btstack_host.c"
@@ -652,11 +721,19 @@ endif()
 target_sources(app PRIVATE ${SRCS})
 target_include_directories(app PRIVATE ${INCLUDE_DIRS})
 
+# BTHID host registry — derived from the source list rather than set by hand, so
+# it can never drift out of sync with whether bthid_registry.c is actually
+# compiled. bt_transport.c gates its bthid_registry_init() call on this instead
+# of relying on a weak stub that the linker could resolve to an empty function.
+if("${SRCS}" MATCHES "bthid_registry\\.c")
+    target_compile_definitions(app PRIVATE CONFIG_BT_HOST=1)
+endif()
+
 # ============================================================================
-# GATT header generation (peripheral mode — controller_btusb)
+# GATT header generation (peripheral mode — universal)
 # ============================================================================
 
-if(APP_TYPE STREQUAL "controller_btusb")
+if(APP_TYPE STREQUAL "universal")
     set(COMPILE_GATT "${BTSTACK_PATH}/tool/compile_gatt.py")
 
     add_custom_command(
@@ -711,13 +788,18 @@ else()
     set(JOYPAD_BCD_DEVICE 256)  # 0x0100 fallback
 endif()
 
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# Get git commit hash — see src/CMakeLists.txt for why the environment wins.
+if(DEFINED ENV{GIT_COMMIT} AND NOT "$ENV{GIT_COMMIT}" STREQUAL "")
+    set(GIT_COMMIT "$ENV{GIT_COMMIT}")
+else()
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT GIT_COMMIT)
     set(GIT_COMMIT "unknown")
 endif()
@@ -733,6 +815,11 @@ elseif(BOARD MATCHES "nrf52840dongle")
     # board + boards/aprbrother_nrf52840.overlay (see nrf/Makefile alias).
     set(BOARD_DEFINE "BOARD_APRBROTHER_NRF52840=1")
     set(BOARD_NAME_STR "aprbrother_nrf52840")
+elseif(BOARD MATCHES "nrf52840_mdk_usb_dongle")
+    # Makerdiary MDK USB Dongle is built as the upstream nrf52840_mdk_usb_dongle
+    # board + boards/makerdiary_nrf52840.overlay (see nrf/Makefile alias).
+    set(BOARD_DEFINE "BOARD_MAKERDIARY_NRF52840=1")
+    set(BOARD_NAME_STR "makerdiary_nrf52840")
 else()
     set(BOARD_NAME_STR "xiao_ble")
 endif()
@@ -751,6 +838,6 @@ target_compile_options(app PRIVATE -Wno-error)
 
 # Force-include btstack_config.h so all BTstack headers see ENABLE_BLE etc.
 # BTstack headers check #ifdef ENABLE_BLE but don't include btstack_config.h themselves.
-if(APP_TYPE STREQUAL "controller_btusb" OR APP_TYPE STREQUAL "bt2usb" OR APP_TYPE STREQUAL "btusb2usb")
+if(APP_TYPE STREQUAL "universal" OR APP_TYPE STREQUAL "bt2usb" OR APP_TYPE STREQUAL "btusb2usb")
     target_compile_options(app PRIVATE -include btstack_config.h)
 endif()

@@ -42,6 +42,7 @@ static const InputInterface** inputs = NULL;
 static uint8_t input_count = 0;
 const OutputInterface* active_output = NULL;
 const OutputInterface* native_output = NULL;
+const InputInterface* native_input = NULL;
 
 // Redirect stdout/stderr to UART1 on header TX/RX pins.
 // ESP-IDF console UART0 custom pin remapping doesn't work reliably on ESP32-S3
@@ -114,6 +115,12 @@ void app_main(void)
     storage_init();
     players_init();
     app_init();
+
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    // Start the animated eyes on the AMOLED (own task; inits the panel).
+    extern void eyes_start(void);
+    eyes_start();
+#endif
 
 #ifdef CONFIG_MAX3421
     // Initialize MAX3421E SPI host (must be before tusb_init/input init)

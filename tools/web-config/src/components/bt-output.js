@@ -23,10 +23,32 @@ export class BtOutputCard {
                     </div>
                     <p class="hint" style="margin-top: 8px;">Device will reboot to apply changes.</p>
                 </div>
+            </div>
+            <div class="card" id="wirelessPolicyCard" style="display:none;">
+                <h2>USB / BLE Priority</h2>
+                <div class="card-content">
+                    <div class="row">
+                        <span class="label">Active Outputs</span>
+                        <select id="wirelessPolicySelect">
+                            <option value="0">Both (USB + BLE)</option>
+                            <option value="1">USB dominant</option>
+                            <option value="2">BLE dominant</option>
+                        </select>
+                    </div>
+                    <p class="hint" style="margin-top: 8px;">
+                        Both: input goes to USB and BLE together.
+                        USB dominant: input goes only to USB while a USB host is
+                        connected (Bluetooth stays paired, just idle).
+                        BLE dominant: input goes only to BLE while a BLE host is
+                        connected (USB stays enumerated, config keeps working).
+                        Applies immediately, no reboot.
+                    </p>
+                </div>
             </div>`;
 
         this.el.querySelector('#bleModeSaveBtn').addEventListener('click', () => this.save());
-        this.dirty = new DirtyTracker(this.el, this.el.querySelector('#bleModeSaveBtn'));
+        this.el.querySelector('#wirelessPolicySelect').addEventListener('change', () => this.savePolicy());
+        this.dirty = new DirtyTracker(this.el.querySelector('#bleModeCard'), this.el.querySelector('#bleModeSaveBtn'));
     }
 
     async load() {
@@ -49,6 +71,29 @@ export class BtOutputCard {
             this.dirty?.snapshot();
         } catch (e) {
             card.style.display = 'none';
+        }
+        await this.loadPolicy();
+    }
+
+    async loadPolicy() {
+        const card = this.el.querySelector('#wirelessPolicyCard');
+        try {
+            const result = await this.protocol.getWirelessPolicy();
+            this.el.querySelector('#wirelessPolicySelect').value = String(result.policy);
+            card.style.display = '';
+        } catch (e) {
+            // Firmware without WIRELESS.POLICY support — hide the card.
+            card.style.display = 'none';
+        }
+    }
+
+    async savePolicy() {
+        const policy = parseInt(this.el.querySelector('#wirelessPolicySelect').value);
+        try {
+            const result = await this.protocol.setWirelessPolicy(policy);
+            this.log(`Wireless policy set to ${result.name}`, 'success');
+        } catch (e) {
+            this.log(`Failed to set wireless policy: ${e.message}`, 'error');
         }
     }
 

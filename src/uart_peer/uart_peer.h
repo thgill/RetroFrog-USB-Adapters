@@ -40,14 +40,48 @@
 #define UART_PEER_MSG_STATUS     0x02   // consumer -> producer: feedback/status
 #define UART_PEER_MSG_DEBUG      0x03   // producer -> consumer: liveness/host telemetry
 
+// P5General PS5-auth bridge (dual-chip). Carries the p5general_auth_data handoff
+// across the link so GP2040 P5General auth — normally single-chip shared RAM —
+// works split across the DEVICE side (A, presents to the PS5) and the HOST side
+// (B, owns the auth dongle). A distinct type per operation keeps every payload
+// <= 64 bytes (the frame_send cap), avoiding a subtype byte on the 64B buffers.
+// Handled by the weak p5general_link_on_frame() hook (src/uart_peer/p5general_link.c).
+#define UART_PEER_MSG_P5G_SIGN_REQ   0x04   // A->B: 64B report to sign
+#define UART_PEER_MSG_P5G_SIGN_RESP  0x05   // B->A: 64B signed report
+#define UART_PEER_MSG_P5G_F0         0x06   // A->B: 64B auth_buffer (PS5 F0 challenge)
+#define UART_PEER_MSG_P5G_POLL_F1    0x07   // A->B: 0B, PS5 is polling F1/F2
+#define UART_PEER_MSG_P5G_AUTH_DATA  0x08   // B->A: 64B auth_buffer (dongle F1/F2 response)
+#define UART_PEER_MSG_P5G_DONGLE     0x09   // B->A: 1B dongle_ready
+
+// Extended input state (touch + motion) — producer -> consumer. The 12-byte
+// EVENT only carries buttons + 6 analog axes; a DualSense/DS4/SC2 input also has
+// touchpad + gyro/accel that output modes (e.g. P5General DualSense) can emit.
+// The producer sends this frame immediately BEFORE the matching EVENT whenever
+// the source event has touch or motion; the consumer buffers it per-player and
+// merges it into that next EVENT before submitting to the router. Optional: an
+// input with neither touch nor motion sends no EXT (event stays touch/motion-free).
+#define UART_PEER_MSG_EXT            0x0A   // producer -> consumer: touch + motion
+
+// PS4/DS4 auth passthrough bridge (device A <-> host B). The console-facing PS4
+// mode lives on A; the real DS4 (auth source) is on B. A relays the console's
+// nonce to B, B drives the DS4 and streams the 19 signature pages back to A,
+// which serves them (with CRC) to the console. Mirrors the P5General bridge.
+#define UART_PEER_MSG_PS4_NONCE      0x0B   // A->B: one nonce page [nonce_id][page][56B]
+#define UART_PEER_MSG_PS4_SIG        0x0C   // B->A: one signature page [page][56B]
+#define UART_PEER_MSG_PS4_READY      0x0D   // B->A: [nonce_id] signature complete
+#define UART_PEER_MSG_PS4_RESET      0x0E   // A->B: reset the DS4 auth handshake
+#define UART_PEER_MSG_PS4_DIAG_BUZZ  0x0F   // A->B: diag — console read full 0xF1 sig, pulse DS4
+
 // Diagnostic heartbeat (producer/host MCU -> consumer): proves B is alive, its
 // loop is advancing (uptime_ms), and how many USB host devices it has mounted.
 typedef struct __attribute__((packed)) {
-    uint8_t  magic;            // 0xDB sentinel
+    uint8_t  magic;            // 0xDB = legacy B, 0xDC = B with BT-status field
     uint8_t  dev_count;        // mounted USB host devices
     uint16_t last_vid;         // VID of most-recently-mounted device
     uint16_t last_pid;         // PID of most-recently-mounted device
     uint32_t uptime_ms;        // B uptime (changing value => B loop running)
+    uint8_t  bt_status;        // BT state (magic 0xDC): bit0=ready bit1=powered
+                               // bit2=scanning bit3=has_btstack; bits4-7=conn_count
 } uart_peer_debug_t;
 
 // 12-byte wire event — byte-identical to i2c_peer_event_t so the two peer
@@ -60,6 +94,27 @@ typedef struct __attribute__((packed)) {
 } uart_peer_event_t;
 
 _Static_assert(sizeof(uart_peer_event_t) == 12, "uart_peer_event_t must be 12 bytes");
+
+// Extended input state (touch + motion) for MSG_EXT. Kept separate from the
+// 12-byte event so uart_peer_event_t stays byte-identical to i2c_peer_event_t.
+// Touch coords are the device-agnostic normalized 0..65535 (input_event_t.touch);
+// accel/gyro are raw int16 as the source driver produced them.
+typedef struct __attribute__((packed)) {
+    uint8_t  player_index;      // player/slot this extends (matches the EVENT)
+    uint8_t  flags;             // bit0 = has_touch, bit1 = has_motion
+    uint8_t  touch_active;      // bit0 = touch[0] active, bit1 = touch[1] active
+    uint16_t touch_x[2];        // normalized 0..65535
+    uint16_t touch_y[2];        // normalized 0..65535
+    int16_t  accel[3];          // raw accelerometer X,Y,Z
+    int16_t  gyro[3];           // raw gyroscope X,Y,Z
+    uint16_t gyro_range;        // dps full-scale (for output-side scaling)
+    uint16_t accel_range;       // milli-g full-scale
+} uart_peer_ext_t;
+
+#define UART_PEER_EXT_FLAG_TOUCH   (1 << 0)
+#define UART_PEER_EXT_FLAG_MOTION  (1 << 1)
+
+_Static_assert(sizeof(uart_peer_ext_t) == 27, "uart_peer_ext_t must be 27 bytes");
 
 // Feedback status (consumer -> producer) — same shape as i2c_peer_status_t.
 typedef struct __attribute__((packed)) {
@@ -97,6 +152,9 @@ bool uart_peer_is_connected(void);
 // Link RX diagnostics: total raw bytes seen on the wire / valid frames decoded.
 uint32_t uart_peer_get_rx_raw_count(void);
 uint32_t uart_peer_get_rx_frame_count(void);
+// Send a raw framed message of the given type. plen must be <= 64. Used by the
+// P5General auth bridge to carry the p5general_auth_data handoff across the link.
+void uart_peer_send_frame(uint8_t type, const void* payload, uint16_t plen);
 
 // ----- producer side (USB host MCU) -----
 // Router tap: serialize input_event_t -> EVENT frame. Install via router_set_tap().

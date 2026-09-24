@@ -52,6 +52,7 @@ static bool __no_inline_not_in_flash_func(read_bootsel_button)(void) {
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/timer.h"
+#include "hardware/irq.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -290,8 +291,16 @@ static void c1351_init_alarms(void) {
     if (c1351_alarm_x >= 0) return;  // already initialized
     c1351_alarm_x = hardware_alarm_claim_unused(false);
     c1351_alarm_y = hardware_alarm_claim_unused(false);
-    if (c1351_alarm_x >= 0) hardware_alarm_set_callback(c1351_alarm_x, c1351_alarm_x_irq);
-    if (c1351_alarm_y >= 0) hardware_alarm_set_callback(c1351_alarm_y, c1351_alarm_y_irq);
+    if (c1351_alarm_x >= 0) {
+        hardware_alarm_set_callback(c1351_alarm_x, c1351_alarm_x_irq);
+        // Raise alarm IRQ to highest priority — reduces callback latency variation
+        // which causes C1351 cursor jitter, especially on C128 with narrower SID window
+        irq_set_priority(TIMER0_IRQ_0 + c1351_alarm_x, PICO_HIGHEST_IRQ_PRIORITY);
+    }
+    if (c1351_alarm_y >= 0) {
+        hardware_alarm_set_callback(c1351_alarm_y, c1351_alarm_y_irq);
+        irq_set_priority(TIMER0_IRQ_0 + c1351_alarm_y, PICO_HIGHEST_IRQ_PRIORITY);
+    }
 }
 
 static void c1351_free_alarms(void) {
@@ -393,7 +402,13 @@ static void __not_in_flash_func(amiga_gpio_irq)(uint gpio, uint32_t events) {
         if (events & GPIO_IRQ_EDGE_FALL) {
             // Record pulse for Amiga vs ST auto-detection
             if (current_platform == AMIGA_PLATFORM_C64 && mouse_active) {
-                // C1351 proportional mouse: SID is starting a POT measurement
+                // C1351 proportional mouse: SID is starting a POT measurement.
+                // Capture timestamp immediately at ISR entry — before any computation —
+                // so alarm targets are anchored to the actual JOYMODE edge, not to
+                // whenever the position arithmetic finishes. Variable arithmetic time
+                // was the source of stationary cursor jitter.
+                uint64_t edge_time = time_us_64();
+
                 if (c1351_alarm_x < 0) c1351_init_alarms();  // lazy init
                 c1351_busy = true;
                 c1351_x_done = false;
@@ -420,14 +435,11 @@ static void __not_in_flash_func(amiga_gpio_irq)(uint gpio, uint32_t events) {
                 gpio_put(AMIGA_PIN_JOYMODE, 0); gpio_set_dir(AMIGA_PIN_JOYMODE, GPIO_OUT);
                 gpio_put(AMIGA_PIN_DATA,    0); gpio_set_dir(AMIGA_PIN_DATA,    GPIO_OUT);
 
-                // Schedule pin releases: each pin released at its own delay
-                // JOYMODE = POTY (pos_y), DATA = POTX (pos_x)
+                // Schedule pin releases anchored to edge_time, not to now
                 uint32_t delay_poty = C1351_OFFSET + (uint32_t)c1351_pos_y;
                 uint32_t delay_potx = C1351_OFFSET + (uint32_t)c1351_pos_x;
-                uint64_t now = time_us_64();
-                // alarm_x fires at smaller delay, alarm_y at larger (clears busy)
-                if (c1351_alarm_x >= 0) hardware_alarm_set_target(c1351_alarm_x, now + delay_poty);
-                if (c1351_alarm_y >= 0) hardware_alarm_set_target(c1351_alarm_y, now + delay_potx);
+                if (c1351_alarm_x >= 0) hardware_alarm_set_target(c1351_alarm_x, edge_time + delay_poty);
+                if (c1351_alarm_y >= 0) hardware_alarm_set_target(c1351_alarm_y, edge_time + delay_potx);
 
             } else if (amiga_state.mode == AMIGA_MODE_JOYSTICK &&
                 current_platform == AMIGA_PLATFORM_AMIGA &&

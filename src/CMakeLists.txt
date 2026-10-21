@@ -3606,3 +3606,7 @@ foreach(_t IN LISTS _joypad_usb_fast_clock_targets)
         target_compile_definitions(${_t} PRIVATE JOYPAD_USB_FAST_CLOCK=1)
     endif()
 endforeach()
+
+# Retro Frog board-specific settings live in retrofrog.cmake so upstream
+# CMakeLists updates merge cleanly. Must stay at the end (targets must exist).
+include(${CMAKE_CURRENT_LIST_DIR}/retrofrog.cmake OPTIONAL)

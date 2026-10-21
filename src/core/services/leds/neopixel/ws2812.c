@@ -440,10 +440,23 @@ void neopixel_indicate_profile(uint8_t profile_index)
     }
 }
 
+// Cancel any active profile indicator blink sequence immediately
+void neopixel_cancel_indicator(void)
+{
+    neopixel_state = NEOPIXEL_IDLE;
+    blinks_remaining = 0;
+}
+
 // Check if NeoPixel profile indicator is currently active
 bool neopixel_is_indicating(void)
 {
     return neopixel_state != NEOPIXEL_IDLE;
+}
+
+// Clear override color and return to normal pattern
+void neopixel_clear_override(void)
+{
+    has_override_color = false;
 }
 
 void neopixel_task(int pat)

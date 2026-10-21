@@ -6,14 +6,15 @@
 
 #include "app.h"
 #include "profiles.h"
+#include "neogeo_nav.h"
 #include "core/router/router.h"
 #include "core/services/players/manager.h"
 #include "core/services/profiles/profile.h"
-#include "core/services/profiles/runtime_profile.h"
 #include "core/input_interface.h"
 #include "core/output_interface.h"
 #include "native/device/gpio/gpio_device.h"
 #include "usb/usbh/usbh.h"
+#include "hardware/gpio.h"
 #include <stdio.h>
 
 static gpio_device_config_t gpio_gpio_config[GPIO_MAX_PLAYERS] = {
@@ -24,16 +25,17 @@ static gpio_device_config_t gpio_gpio_config[GPIO_MAX_PLAYERS] = {
         .pin_dr = P1_NEOGEO_DR_PIN,
 
         // Action Buttons
-        .pin_b1 = P1_NEOGEO_B4_PIN,
-        .pin_b2 = P1_NEOGEO_B5_PIN,
-        .pin_b3 = P1_NEOGEO_B1_PIN,
-        .pin_b4 = P1_NEOGEO_B2_PIN,
+        .pin_b1 = P1_NEOGEO_B4_PIN,  // joypad B1 slot → Neo Geo D
+        .pin_b2 = P1_NEOGEO_B5_PIN,  // joypad B2 slot → Neo Geo P5
+        .pin_b3 = P1_NEOGEO_B1_PIN,  // joypad B3 slot → Neo Geo A
+        .pin_b4 = P1_NEOGEO_B2_PIN,  // joypad B4 slot → Neo Geo B
         .pin_l1 = GPIO_DISABLED,
-        .pin_r1 = P1_NEOGEO_B3_PIN,
+        .pin_r1 = P1_NEOGEO_B3_PIN,  // joypad R1 slot → Neo Geo C
         .pin_l2 = GPIO_DISABLED,
-        .pin_r2 = P1_NEOGEO_B6_PIN,
+        .pin_r2 = P1_NEOGEO_B6_PIN,  // joypad R2 slot → Neo Geo P6
 
         // Meta Buttons
+
         .pin_s1 = P1_NEOGEO_S1_PIN,
         .pin_s2 = P1_NEOGEO_S2_PIN,
         .pin_a1 = GPIO_DISABLED,
@@ -57,12 +59,6 @@ static const profile_config_t app_profile_config = {
         [OUTPUT_TARGET_GPIO] = &neogeo_profile_set,
     },
     .shared_profiles = NULL,
-};
-
-static const runtime_profile_config_t app_runtime_profile_config = {
-    .output_configs = {
-        [OUTPUT_TARGET_GPIO] = &neogeo_runtime_output_config,
-    },
 };
 
 // ============================================================================
@@ -101,10 +97,30 @@ const OutputInterface** app_get_output_interfaces(uint8_t* count)
 
 void app_init(void)
 {
-    printf("[app:usb2neogeo] Initializing USB2NEOGEO v%s\n", JOYPAD_VERSION);
+    printf("[app:usb2neogeo] Initializing USB2NEOGEO v%s\n", APP_VERSION);
 
     // Initialize GPIO PINS, with active_high = false
     gpio_device_init_pins(gpio_gpio_config, false);
+
+#ifdef PICO_RETROFROG_BUILD
+    // Enable internal pull-ups on all Neo Geo signal pins so they sit HIGH
+    // (inactive) before a controller is connected. Without this, pins float
+    // on boot causing the console to see all buttons as pressed on startup.
+    // The RP2354A's 5V tolerant GPIO connects directly to the DB15 — no
+    // level shifters needed.
+    gpio_pull_up(P1_NEOGEO_DU_PIN);
+    gpio_pull_up(P1_NEOGEO_DD_PIN);
+    gpio_pull_up(P1_NEOGEO_DL_PIN);
+    gpio_pull_up(P1_NEOGEO_DR_PIN);
+    gpio_pull_up(P1_NEOGEO_B1_PIN);
+    gpio_pull_up(P1_NEOGEO_B2_PIN);
+    gpio_pull_up(P1_NEOGEO_B3_PIN);
+    gpio_pull_up(P1_NEOGEO_B4_PIN);
+    gpio_pull_up(P1_NEOGEO_B5_PIN);
+    gpio_pull_up(P1_NEOGEO_B6_PIN);
+    gpio_pull_up(P1_NEOGEO_S1_PIN);
+    gpio_pull_up(P1_NEOGEO_S2_PIN);
+#endif
 
     // Configure router for USB2NEOGEO
     router_config_t router_cfg = {
@@ -137,20 +153,30 @@ void app_init(void)
     const char* active_name = profile_get_name(OUTPUT_TARGET_GPIO,
                                                 profile_get_active_index(OUTPUT_TARGET_GPIO));
 
-    // Initialize runtime assignment service
-    runtime_profile_init(&app_runtime_profile_config);
-
     printf("[app:usb2neogeo] Initialization complete\n");
     printf("[app:usb2neogeo]   Routing: %s\n", "SIMPLE (USB → NEOGEO+ adapter 1:1)");
     printf("[app:usb2neogeo]   Player slots: %d (SHIFT mode - players shift on disconnect)\n", MAX_PLAYER_SLOTS);
     printf("[app:usb2neogeo]   Profiles: %d (active: %s)\n", profile_count, active_name ? active_name : "none");
+
+    // Note: neogeo_nav_init() is called from app_task() on first loop iteration
+    // to avoid interfering with USB host enumeration timing
 }
 
 // ============================================================================
 // APP TASK (called in main loop)
 // ============================================================================
 
+#ifdef PICO_RETROFROG_BUILD
+static bool nav_initialized = false;
+#endif
+
 void app_task(void)
 {
-    // No app-specific task work needed for usb2neogeo
+#ifdef PICO_RETROFROG_BUILD
+    if (!nav_initialized) {
+        nav_initialized = true;
+        neogeo_nav_init();
+    }
+    neogeo_nav_task();
+#endif
 }

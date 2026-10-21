@@ -68,6 +68,12 @@ void neopixel_task(int pat);
 // profile_index: 0-3 (blinks profile_index + 1 times)
 void neopixel_indicate_profile(uint8_t profile_index);
 
+// Cancel any active profile indicator blink sequence immediately
+void neopixel_cancel_indicator(void);
+
+// Clear override color and return to normal pattern
+void neopixel_clear_override(void);
+
 // Check if profile indicator is currently active
 bool neopixel_is_indicating(void);
 

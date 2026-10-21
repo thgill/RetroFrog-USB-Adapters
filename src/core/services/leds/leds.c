@@ -173,3 +173,13 @@ bool leds_is_indicating(void)
 #endif
     return neopixel_is_indicating();
 }
+
+void leds_cancel_indicator(void)
+{
+    neopixel_cancel_indicator();
+}
+
+void leds_clear_override(void)
+{
+    neopixel_clear_override();
+}

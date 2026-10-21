@@ -19,6 +19,10 @@
 #include "core/services/profiles/runtime_profile.h"
 #include "core/services/codes/codes.h"
 
+#ifdef PICO_RETROFROG_BUILD
+#include "apps/usb2neogeo/neogeo_nav.h"
+#endif
+
 // ============================================================================
 // INTERNAL STATE
 // ============================================================================
@@ -41,6 +45,11 @@ static bool     tap_has_update   = false;
 
 // Profile output buffer shared between tap callback and task loop.
 static profile_output_t gpio_mapped[GPIO_MAX_PLAYERS];
+
+#ifdef PICO_RETROFROG_BUILD
+static uint32_t last_gpio_buttons = 0;
+static const gpio_device_port_t* last_gpio_port = NULL;
+#endif
 
 // ============================================================================
 // PROFILE SYSTEM (Delegates to core profile service)
@@ -137,13 +146,19 @@ void gpioport_init(gpio_device_port_t* port, gpio_device_config_t* config, bool 
 // ============================================================================
 
 // Select the active profile (runtime override → normal fallback), apply it,
-// and write GPIO for one player. Suppressed during mapping mode.
+// and write GPIO for one player. Suppressed during mapping mode and (Retro Frog)
+// nav suppression.
 static void gpio_apply_output(uint8_t player_index,
                                   uint32_t buttons,
                                   uint8_t lx, uint8_t ly,
                                   uint8_t rx, uint8_t ry,
                                   uint8_t l2, uint8_t r2, uint8_t rz)
 {
+#ifdef PICO_RETROFROG_BUILD
+  // Nav suppression takes priority — bail before touching GPIO
+  if (neogeo_nav_is_suppressed()) return;
+#endif
+
   if (runtime_profile_is_active()) return;
   const profile_t* profile = runtime_profile_get_active(OUTPUT_TARGET_GPIO);
   if (!profile) profile = profile_get_active(OUTPUT_TARGET_GPIO);
@@ -176,12 +191,30 @@ static void gpio_apply_output(uint8_t player_index,
   gpio_buttons |= (mapped->left_x > 192) ? port->mask_dr : 0;
   gpio_buttons |= (mapped->left_y < 64)  ? port->mask_du : 0;
   gpio_buttons |= (mapped->left_y > 192) ? port->mask_dd : 0;
+
+#ifdef PICO_RETROFROG_BUILD
+  // Store raw state for turbo tracking
+  last_gpio_buttons = gpio_buttons;
+  last_gpio_port = port;
+
+  // Exclude turboed GPIO pins from this drive — hardware timer owns them
+  uint32_t turbo_pin_mask = neogeo_nav_get_turbo_pin_mask();
+  uint32_t effective_gpio_mask = port->gpio_mask & ~turbo_pin_mask;
+
+  if (port->active_high) {
+    gpio_put_masked(effective_gpio_mask, gpio_buttons);
+  } else {
+    sio_hw->gpio_oe_set = gpio_buttons & ~turbo_pin_mask;
+    sio_hw->gpio_oe_clr = effective_gpio_mask & (~gpio_buttons);
+  }
+#else
   if (port->active_high) {
     gpio_put_masked(port->gpio_mask, gpio_buttons);
   } else {
     sio_hw->gpio_oe_set = gpio_buttons;
     sio_hw->gpio_oe_clr = port->gpio_mask & (~gpio_buttons);
   }
+#endif
 }
 
 // Tap callback — fires immediately from router_submit_input().
@@ -194,6 +227,19 @@ static void __not_in_flash_func(gpio_tap_callback)(output_target_t output,
 
   if (playersCount == 0 || player_index >= GPIO_MAX_PLAYERS) return;
 
+#ifdef PICO_RETROFROG_BUILD
+  // Route mouse events directly to nav mouse handler
+  if (event->type == INPUT_TYPE_MOUSE) {
+      neogeo_nav_set_mouse_connected(true);
+      neogeo_nav_handle_mouse(event);
+      return; // mouse handles GPIO directly, skip normal controller path
+  }
+  // Non-mouse device connected — clear mouse state if needed
+  if (neogeo_nav_mouse_connected()) {
+      neogeo_nav_set_mouse_connected(false);
+  }
+#endif
+
   // Store raw input for combo detection in task loop and autofire re-apply
   tap_last_buttons = event->buttons;
   tap_last_lx      = event->analog[ANALOG_LX];
@@ -205,12 +251,23 @@ static void __not_in_flash_func(gpio_tap_callback)(output_target_t output,
   tap_last_rz      = event->analog[ANALOG_RZ];
   tap_has_update   = true;
 
+#ifdef PICO_RETROFROG_BUILD
+  // Filter buttons through nav system (navigation mode, turbo, Select suppression)
+  uint32_t filtered_buttons = neogeo_nav_filter_buttons(event->buttons);
+  gpio_apply_output(player_index,
+                    filtered_buttons,
+                    event->analog[ANALOG_LX], event->analog[ANALOG_LY],
+                    event->analog[ANALOG_RX], event->analog[ANALOG_RY],
+                    event->analog[ANALOG_L2], event->analog[ANALOG_R2],
+                    event->analog[ANALOG_RZ]);
+#else
   gpio_apply_output(player_index,
                     event->buttons,
                     event->analog[ANALOG_LX], event->analog[ANALOG_LY],
                     event->analog[ANALOG_RX], event->analog[ANALOG_RY],
-                    event->analog[ANALOG_L2], event->analog[ANALOG_R2], 
+                    event->analog[ANALOG_L2], event->analog[ANALOG_R2],
                     event->analog[ANALOG_RZ]);
+#endif
 }
 
 // init for GPIO communication
@@ -267,6 +324,9 @@ void gpio_device_task()
   }
 
   if (playersCount > 0) {
+#ifdef PICO_RETROFROG_BUILD
+    (void)last_buttons; // Nav system handles combo detection
+#else
     runtime_profile_check_combo(last_buttons, last_l2, last_r2);
 
     // Periodic re-apply: profile_apply reads platform_time_ms() so autofire
@@ -279,6 +339,7 @@ void gpio_device_task()
                         last_rx, last_ry,
                         last_l2, last_r2, last_rz);
     }
+#endif
   }
 
   // Run cheat code detection when we had new input

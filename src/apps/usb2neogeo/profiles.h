@@ -18,7 +18,6 @@
 #define USB2NEOGEO_PROFILES_H
 
 #include "core/services/profiles/profile.h"
-#include "core/services/profiles/runtime_profile.h"
 #include "native/device/gpio/neogeo_buttons.h"
 
 // ============================================================================
@@ -297,61 +296,25 @@ static const profile_t neogeo_profile_padb = {
 };
 
 // ============================================================================
-// PROFILE SET
+// PROFILE: Blank (no mappings — used for custom controls mode)
 // ============================================================================
 
-static const profile_t neogeo_profiles[] = {
-    neogeo_profile_default,
-    neogeo_profile_typea,
-    neogeo_profile_typeb,
-    neogeo_profile_typec,
-    neogeo_profile_typed,
-    neogeo_profile_pada,
-    neogeo_profile_padb,
+static const button_map_entry_t neogeo_blank_map[] = {
+    MAP_DISABLED(JP_BUTTON_B1),
+    MAP_DISABLED(JP_BUTTON_B2),
+    MAP_DISABLED(JP_BUTTON_B3),
+    MAP_DISABLED(JP_BUTTON_B4),
+    MAP_DISABLED(JP_BUTTON_L1),
+    MAP_DISABLED(JP_BUTTON_R1),
+    MAP_DISABLED(JP_BUTTON_L2),
+    MAP_DISABLED(JP_BUTTON_R2),
 };
 
-static const profile_set_t neogeo_profile_set = {
-    .profiles = neogeo_profiles,
-    .profile_count = sizeof(neogeo_profiles) / sizeof(neogeo_profiles[0]),
-    .default_index = 0,
-};
-
-// ============================================================================
-// RUNTIME PROFILE
-// ============================================================================
-
-static const uint32_t neogeo_runtime_outputs[] = {
-    NEOGEO_BUTTON_B1,
-    NEOGEO_BUTTON_B2,
-    NEOGEO_BUTTON_B3,
-    NEOGEO_BUTTON_B4,
-    NEOGEO_BUTTON_B5,
-    NEOGEO_BUTTON_B6,
-};
-
-static const char* const neogeo_runtime_output_names[] = {
-    "NEOGEO_BUTTON_B1",
-    "NEOGEO_BUTTON_B2",
-    "NEOGEO_BUTTON_B3",
-    "NEOGEO_BUTTON_B4",
-    "NEOGEO_BUTTON_B5",
-    "NEOGEO_BUTTON_B6",
-};
-
-// Face and shoulder buttons only.
-// D-pad, A1 and S1/S2 are excluded (S1/S2 are trigger/cancel).
-#define NEOGEO_RUNTIME_INPUT_MASK \
-    (JP_BUTTON_B1 | JP_BUTTON_B2 | JP_BUTTON_B3 | JP_BUTTON_B4 | \
-     JP_BUTTON_L1 | JP_BUTTON_R1 | JP_BUTTON_L2 | JP_BUTTON_R2 | \
-     JP_BUTTON_L3 | JP_BUTTON_R3 | JP_BUTTON_L4 | JP_BUTTON_R4)
-
-// Runtime profile: built interactively during assignment.
-// button_map is set to the service's internal buffer by runtime_profile_init().
-static profile_t neogeo_runtime_profile = {
-    .name = "runtime",
-    .description = "Runtime profile mapping",
-    .button_map = NULL,
-    .button_map_count = 0,
+static const profile_t neogeo_profile_blank = {
+    .name = "blank",
+    .description = "Blank profile for custom controls mode",
+    .button_map = neogeo_blank_map,
+    .button_map_count = sizeof(neogeo_blank_map) / sizeof(neogeo_blank_map[0]),
     .l2_behavior = TRIGGER_PASSTHROUGH,
     .r2_behavior = TRIGGER_PASSTHROUGH,
     .l2_threshold = 128,
@@ -364,13 +327,25 @@ static profile_t neogeo_runtime_profile = {
     .socd_mode = SOCD_UP_PRIORITY,
 };
 
-static const runtime_profile_output_config_t neogeo_runtime_output_config = {
-    .output_buttons       = neogeo_runtime_outputs,
-    .output_button_count  = sizeof(neogeo_runtime_outputs) / sizeof(neogeo_runtime_outputs[0]),
-    .input_mask           = NEOGEO_RUNTIME_INPUT_MASK,
-    .hold_ms              = 2000,
-    .output_button_names  = neogeo_runtime_output_names,
-    .profile              = &neogeo_runtime_profile,
+// ============================================================================
+// PROFILE SET
+// ============================================================================
+
+static const profile_t neogeo_profiles[] = {
+    neogeo_profile_default,   // 0
+    neogeo_profile_typea,     // 1
+    neogeo_profile_typeb,     // 2
+    neogeo_profile_typec,     // 3
+    neogeo_profile_typed,     // 4
+    neogeo_profile_pada,      // 5 - NAV_PAD_START
+    neogeo_profile_padb,      // 6
+    neogeo_profile_blank,     // 7 - NAV_BLANK_INDEX
+};
+
+static const profile_set_t neogeo_profile_set = {
+    .profiles = neogeo_profiles,
+    .profile_count = sizeof(neogeo_profiles) / sizeof(neogeo_profiles[0]),
+    .default_index = 0,
 };
 
 #endif // USB2NEOGEO_PROFILES_H

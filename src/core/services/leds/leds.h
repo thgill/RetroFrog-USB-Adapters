@@ -23,11 +23,11 @@ void leds_set_connected_devices(int count);
 // connected device always takes priority over this.
 void leds_set_pairing(bool active);
 
-// Set override LED color (for USB output mode indication)
 // Advertising/scanning as a wireless device or host: blink rather than go solid,
 // even with input controllers attached. Solid means "connected to a host/console".
 void leds_set_searching(bool searching);
 
+// Set override LED color (for USB output mode indication)
 void leds_set_color(uint8_t r, uint8_t g, uint8_t b);
 
 // Trigger profile indicator pattern
@@ -35,5 +35,10 @@ void leds_indicate_profile(uint8_t profile_index);
 
 // Check if profile indicator is currently active
 bool leds_is_indicating(void);
+
+// Cancel any active profile indicator blink sequence immediately
+void leds_cancel_indicator(void);
+
+void leds_clear_override(void);
 
 #endif // LEDS_H

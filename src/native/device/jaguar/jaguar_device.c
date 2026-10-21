@@ -121,15 +121,18 @@ volatile uint32_t jag_strobe_table[16];
 
 // Exposed shared state (used by header declarations)
 volatile uint8_t          jag_row_data[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-volatile uint8_t          jag_phase_idx   = 0;  // X axis (J10/J11) phase index
-volatile uint8_t          jag_phase_y_idx = 0;  // Y axis (J8/J9) phase index
+volatile uint8_t          jag_phase_idx   = 0;  // spinner phase index (J10/J11)
 volatile jag_input_mode_t jag_input_mode  = JAG_MODE_GAMEPAD;
 
-// Pending phase steps: Core 0 accumulates signed steps from mouse deltas.
+// Spinner pending phase steps: Core 0 accumulates signed steps from mouse deltas.
 // Core 1 drains one step at a time at a timer-controlled rate.
 // Positive = CW, negative = CCW.
-volatile int16_t          jag_phase_pending   = 0;  // X axis
-volatile int16_t          jag_phase_y_pending = 0;  // Y axis
+volatile int16_t          jag_phase_pending   = 0;
+
+// Mouse mode positions (see jaguar_device.h). Target = Core 0, pos = Core 1.
+volatile uint32_t         jag_mouse_x_target = 0, jag_mouse_y_target = 0;
+volatile uint32_t         jag_mouse_x_pos    = 0, jag_mouse_y_pos    = 0;
+volatile uint32_t         jag_mouse_poll_us  = JAG_MOUSE_FALLBACK_US;
 
 // Step interval in microseconds — controls spinner speed.
 // Core 0 writes this; Core 1 reads it each drain cycle.
@@ -187,6 +190,17 @@ static inline __attribute__((always_inline)) uint32_t kb_mask_hi(uint8_t k) {
     return m;
 }
 
+// Mouse quadrature: GPIO SET mask for one axis at step position pos.
+// Standard 4-state Gray code, (A,B) = 00 → 01 → 11 → 10 as pos increases,
+// which the Amiga/ST-style decoder (JagCheck) reads as +1 per step.
+static inline __attribute__((always_inline)) uint32_t mouse_quad_set(
+    uint32_t pos, uint32_t mask_a, uint32_t mask_b)
+{
+    uint32_t p = pos & 3u;
+    uint32_t g = p ^ (p >> 1);               // 0,1,3,2
+    return ((g & 2u) ? mask_a : 0) | ((g & 1u) ? mask_b : 0);
+}
+
 // HID usage → US ASCII for usages 0x1E-0x38 (digits, punctuation).
 // { unshifted, shifted }. Letters (0x04-0x1D) are handled arithmetically.
 static const uint8_t kb_ascii_us[0x38 - 0x1E + 1][2] = {
@@ -206,7 +220,6 @@ static uint8_t  spinner_divisor      = JAG_SPINNER_DIVISOR_DEFAULT;
 static bool     spinner_invert       = false;
 static bool     invert_led_flash     = false;
 static int16_t  phase_accum          = 0;
-static int16_t  phase_y_accum        = 0;
 static bool     mouse_mode           = false;
 static bool     device_connected     = false;
 static bool     dpi_adjust_mode      = false;
@@ -516,6 +529,65 @@ static void kb_reset_state(void) {
 }
 
 // ============================================================================
+// MOUSE MODE (Core 0) — queue movement as a target position for Core 1
+// ============================================================================
+
+// Make the targets equal to what is on the pins (drops queued movement).
+// Called before entering mouse mode and on disconnect.
+// Make the targets equal to what is on the pins (drops queued movement).
+// Called before entering mouse mode and on disconnect.
+static void mouse_sync_targets(void) {
+    jag_mouse_x_target = jag_mouse_x_pos;
+    jag_mouse_y_target = jag_mouse_y_pos;
+    __dmb();
+}
+
+// Backlog cap in steps: ~JAG_MOUSE_BACKLOG_US worth at the measured poll
+// rate, so the cursor stops promptly when the mouse stops.
+static int32_t mouse_backlog_cap(void) {
+    uint32_t poll = jag_mouse_poll_us;
+    int32_t cap = poll ? (int32_t)(JAG_MOUSE_BACKLOG_US / poll) : JAG_MOUSE_BACKLOG_MIN;
+    if (cap < JAG_MOUSE_BACKLOG_MIN) cap = JAG_MOUSE_BACKLOG_MIN;
+    if (cap > JAG_MOUSE_BACKLOG_MAX) cap = JAG_MOUSE_BACKLOG_MAX;
+    return cap;
+}
+
+static inline int32_t iabs32(int32_t v) { return v < 0 ? -v : v; }
+
+// Add one mouse report to the queued movement as a VECTOR, in 1/16-step
+// units (JAG_MOUSE_FRAC).
+// The Jaguar can only take one step per axis per poll, so the queue often
+// saturates. Capping X and Y separately would distort direction (a small
+// vertical drift keeps up while large horizontal movement is clipped, so
+// "left" turns into "left and down"). Instead the whole vector is scaled
+// down together, keeping its direction; Core 1 then walks it in a straight
+// line with sub-step precision, so shallow angles survive too.
+// Reversing direction on an axis drops that axis's backlog.
+static void mouse_queue_xy(int16_t dx, int16_t dy) {
+    if (dx == 0 && dy == 0) return;
+    uint32_t px = jag_mouse_x_pos;
+    uint32_t py = jag_mouse_y_pos;
+    int32_t  qx = (int32_t)(jag_mouse_x_target - px);
+    int32_t  qy = (int32_t)(jag_mouse_y_target - py);
+
+    if ((dx > 0 && qx < 0) || (dx < 0 && qx > 0)) qx = 0;
+    if ((dy > 0 && qy < 0) || (dy < 0 && qy > 0)) qy = 0;
+    qx += (int32_t)dx * JAG_MOUSE_FRAC;
+    qy += (int32_t)dy * JAG_MOUSE_FRAC;
+
+    int32_t lim = mouse_backlog_cap() * JAG_MOUSE_FRAC;
+    int32_t m   = iabs32(qx) > iabs32(qy) ? iabs32(qx) : iabs32(qy);
+    if (m > lim) {                                  // scale, keep direction
+        qx = (int32_t)(((int64_t)qx * lim + (qx < 0 ? -m / 2 : m / 2)) / m);
+        qy = (int32_t)(((int64_t)qy * lim + (qy < 0 ? -m / 2 : m / 2)) / m);
+    }
+
+    jag_mouse_x_target = px + (uint32_t)qx;
+    jag_mouse_y_target = py + (uint32_t)qy;
+    __dmb();
+}
+
+// ============================================================================
 // INPUT EVENT TAP (Core 0)
 // ============================================================================
 
@@ -537,12 +609,10 @@ static void __not_in_flash_func(jaguar_tap_callback)(
         jag_row_gpio[2]   = GPIO_MASK_ALL_OUT;
         jag_row_gpio[3]   = GPIO_MASK_ALL_OUT;
         jag_phase_idx       = 0;
-        jag_phase_y_idx     = 0;
         jag_phase_pending   = 0;
-        jag_phase_y_pending = 0;
         jag_step_interval_us = 0;
         phase_accum   = 0;
-        phase_y_accum = 0;
+        mouse_sync_targets();
         kb_reset_state();
         leds_set_color(0, 0, 0);
         return;
@@ -575,9 +645,9 @@ static void __not_in_flash_func(jaguar_tap_callback)(
 
         if (!device_connected || jag_input_mode != target_mode) {
             device_connected = true;
+            mouse_sync_targets();            // no stale movement on entry
             jag_input_mode   = target_mode;
             phase_accum      = 0;
-            phase_y_accum    = 0;
             build_strobe_table(); __dmb();
             update_led();
             printf("[jaguar] %s mode — divisor=%d\n",
@@ -624,49 +694,20 @@ static void __not_in_flash_func(jaguar_tap_callback)(
 
         if (mouse_mode) {
             // ---- ST/Amiga mouse mode ----
-            // X axis: quadrature on J10/J11 (same as spinner)
-            // Y axis: quadrature on J8/J9
-            // Buttons: Left=B0 (JP_BUTTON_S1), Right=B1 (JP_BUTTON_B1)
-            // No divisor — direct delta to quadrature steps
+            // Full delta queued as a target position; Core 1 walks the pins
+            // toward it one quadrature step per Jaguar poll (see header).
+            // X on J8/J9, Y on J10/J11 — the layout JagCheck reads.
+            // HID: +X = right, +Y = down; the decoder uses the same signs.
+            mouse_queue_xy(event->delta_x, event->delta_y);
 
-            // X axis
-            int16_t dx = spinner_invert ? -event->delta_x : event->delta_x;
-            if (dx != 0) {
-                int16_t steps = 0;
-                phase_accum += dx;
-                if (phase_accum >= 1) { steps = 1;  phase_accum = 0; }
-                else if (phase_accum <= -1) { steps = -1; phase_accum = 0; }
-                if (steps != 0) {
-                    if ((steps > 0 && jag_phase_pending < 0) ||
-                        (steps < 0 && jag_phase_pending > 0))
-                        jag_phase_pending = 0;
-                    jag_phase_pending += steps;
-                    jag_step_interval_us = 1000u;  // fast for mouse
-                    __dmb();
-                }
-            }
-
-            // Y axis
-            int16_t dy = event->delta_y;
-            if (dy != 0) {
-                int16_t steps = 0;
-                phase_y_accum += dy;
-                if (phase_y_accum >= 1) { steps = 1;  phase_y_accum = 0; }
-                else if (phase_y_accum <= -1) { steps = -1; phase_y_accum = 0; }
-                if (steps != 0) {
-                    if ((steps > 0 && jag_phase_y_pending < 0) ||
-                        (steps < 0 && jag_phase_y_pending > 0))
-                        jag_phase_y_pending = 0;
-                    jag_phase_y_pending += steps;
-                    __dmb();
-                }
-            }
-
-            // Mouse buttons: Left=B0(Pause pin), Right=B1(FireA pin)
+            // Buttons. JagCheck reads only the B1 line (row 0), so the
+            // primary (left) button goes there.
+            //   Left  → B1 (row 0: Fire A line)
+            //   Right → B0 (row 0: Pause line)
             uint32_t btns = 0;
             if (!dpi_adjust_mode) {
-                if (event->buttons & JP_BUTTON_B1) btns |= JP_BUTTON_S1;   // Left  → B0
-                if (event->buttons & JP_BUTTON_B2) btns |= JP_BUTTON_B1;   // Right → B1
+                if (event->buttons & JP_BUTTON_B1) btns |= JP_BUTTON_B1;   // Left  → B1
+                if (event->buttons & JP_BUTTON_B2) btns |= JP_BUTTON_S1;   // Right → B0
             }
             build_spinner_rows(btns);
 
@@ -767,9 +808,7 @@ static void __not_in_flash_func(jaguar_tap_callback)(
 
 void __not_in_flash_func(jaguar_core1_task)(void) {
     uint32_t last_step   = timer_hw->timerawl;
-    uint32_t last_step_y = timer_hw->timerawl;
     uint8_t  seq_idx     = 0;
-    uint8_t  seq_y_idx   = 0;
 
     while (true) {
         jag_input_mode_t mode = jag_input_mode;
@@ -829,63 +868,93 @@ void __not_in_flash_func(jaguar_core1_task)(void) {
 
         } else if (mode == JAG_MODE_MOUSE) {
             // ---- MOUSE HOT LOOP ----
+            // Quadrature on J8/J9 (X) and J10/J11 (Y), always driven.
+            // One step per Jaguar poll: a poll is a burst of row-code changes;
+            // step once the code has been stable for JAG_MOUSE_QUIET_US.
+            // B0/B1 still answer the strobed row (mouse buttons on row 0).
+            const uint32_t pm = GPIO_MASK_J8 | GPIO_MASK_J9 | GPIO_MASK_J10 | GPIO_MASK_J11;
+            uint32_t x_pos       = jag_mouse_x_pos;
+            uint32_t y_pos       = jag_mouse_y_pos;
+            uint32_t t0          = timer_hw->timerawl;
+            uint32_t in0         = sio_hw->gpio_in;
+            uint32_t prev_code   = JAG_STROBE_CODE(in0);
+            uint32_t last_change = t0;
+            uint32_t m_last_step = t0;
+            bool     burst       = false;
+
             while (jag_input_mode == JAG_MODE_MOUSE) {
-                uint32_t now      = timer_hw->timerawl;
-                uint32_t interval = jag_step_interval_us;
-                uint32_t pm       = jag_phase_pin_mask;
+                uint32_t now  = timer_hw->timerawl;
+                uint32_t in   = sio_hw->gpio_in;
+                uint32_t code = JAG_STROBE_CODE(in);
 
-                // X axis
-                int16_t px = jag_phase_pending;
-                if (px != 0 && interval > 0 && (now - last_step) >= interval) {
-                    if (px > 0) {
-                        seq_idx = (seq_idx + PHASE_SEQ_LEN - 1) % PHASE_SEQ_LEN;
-                        jag_phase_pending = px - 1;
-                    } else {
-                        seq_idx = (seq_idx + 1) % PHASE_SEQ_LEN;
-                        jag_phase_pending = px + 1;
-                    }
-                    jag_phase_idx = seq_idx;
-                    last_step = now;
+                if (code != prev_code) {          // Jaguar is polling
+                    prev_code   = code;
+                    last_change = now;
+                    burst       = true;
                 }
 
-                // Y axis
-                int16_t py = jag_phase_y_pending;
-                if (py != 0 && interval > 0 && (now - last_step_y) >= interval) {
-                    if (py > 0) {
-                        seq_y_idx = (seq_y_idx + PHASE_SEQ_LEN - 1) % PHASE_SEQ_LEN;
-                        jag_phase_y_pending = py - 1;
-                    } else {
-                        seq_y_idx = (seq_y_idx + 1) % PHASE_SEQ_LEN;
-                        jag_phase_y_pending = py + 1;
+                // Two kinds of reader:
+                //  - Idle between reads (lines back to 1111, e.g. JagCheck):
+                //    every read is visible as a burst of row changes, so
+                //    step once after each burst — exactly one step per read.
+                //  - Row left selected (e.g. Impulse X, which reads row 0
+                //    from a ~1.2 kHz timer interrupt and never idles): reads
+                //    can't be seen, so step on a timer slower than ~1 kHz.
+                bool step  = false;
+                bool quiet = (now - last_change) >= JAG_MOUSE_QUIET_US;
+                if (quiet && code != 0xF) {
+                    burst = false;                // row held selected
+                    if ((now - m_last_step) >= JAG_MOUSE_HELD_US) {
+                        step = true;
+                        jag_mouse_poll_us = JAG_MOUSE_HELD_US;
                     }
-                    jag_phase_y_idx = seq_y_idx;
-                    last_step_y = now;
+                } else if (burst) {
+                    if (quiet) {
+                        burst = false;            // poll finished — next read sees one step
+                        step  = true;
+                        jag_mouse_poll_us = now - m_last_step;
+                    }
+                } else if ((now - last_change) >= JAG_MOUSE_NOPOLL_US &&
+                           (now - m_last_step) >= JAG_MOUSE_FALLBACK_US) {
+                    step = true;                  // idle and never polled — timed fallback
+                    jag_mouse_poll_us = JAG_MOUSE_FALLBACK_US;
                 }
 
-                // Drive X (J10/J11)
-                uint32_t x_set = phase_gpio_set[seq_idx];
-                uint32_t x_clr = (GPIO_MASK_J10 | GPIO_MASK_J11) & ~x_set;
-                if (x_set) sio_hw->gpio_set = x_set;
-                if (x_clr) sio_hw->gpio_clr = x_clr;
+                if (step) {
+                    // Move at most one whole step along the queued vector:
+                    // the leading axis advances up to 1 step, the other in
+                    // proportion (1/16-step precision), so the cursor follows
+                    // the mouse's direction. Pins show the whole-step part,
+                    // so each axis line pair changes at most once per poll.
+                    m_last_step = now;
+                    int32_t dx = (int32_t)(jag_mouse_x_target - x_pos);
+                    int32_t dy = (int32_t)(jag_mouse_y_target - y_pos);
+                    int32_t ax = dx < 0 ? -dx : dx;
+                    int32_t ay = dy < 0 ? -dy : dy;
+                    int32_t m  = ax > ay ? ax : ay;
+                    if (m > 0) {
+                        int32_t s  = m < JAG_MOUSE_FRAC ? m : JAG_MOUSE_FRAC;
+                        // Rounded so small minor-axis motion isn't truncated away
+                        int32_t mx = (ax == m) ? s : (ax * s + m / 2) / m;   // hardware SDIV
+                        int32_t my = (ay == m) ? s : (ay * s + m / 2) / m;
+                        x_pos += (uint32_t)(dx < 0 ? -mx : mx);
+                        y_pos += (uint32_t)(dy < 0 ? -my : my);
+                    }
+                    jag_mouse_x_pos = x_pos;
+                    jag_mouse_y_pos = y_pos;
+                }
 
-                // Drive Y (J8/J9)
-                uint32_t y_raw = phase_gpio_set[seq_y_idx];
-                uint32_t y_set = (y_raw & GPIO_MASK_J10) ? GPIO_MASK_J8 : 0;
-                if (y_raw & GPIO_MASK_J11) y_set |= GPIO_MASK_J9;
-                uint32_t y_clr = (GPIO_MASK_J8 | GPIO_MASK_J9) & ~y_set;
-                if (y_set) sio_hw->gpio_set = y_set;
-                if (y_clr) sio_hw->gpio_clr = y_clr;
-
-                // Strobe response
-                uint32_t gpio_in = sio_hw->gpio_in;
+                // Buttons from the strobed row, quadrature on the axis pins
                 uint32_t set;
-                if      (!(gpio_in & GPIO_MASK_J0)) set = jag_row_gpio[0];
-                else if (!(gpio_in & GPIO_MASK_J1)) set = jag_row_gpio[1];
-                else if (!(gpio_in & GPIO_MASK_J2)) set = jag_row_gpio[2];
-                else if (!(gpio_in & GPIO_MASK_J3)) set = jag_row_gpio[3];
-                else                                 set = GPIO_MASK_ALL_OUT & ~pm;
-                set &= ~pm;
-                uint32_t clr = GPIO_MASK_ALL_OUT & ~set & ~pm;
+                if      (!(in & GPIO_MASK_J0)) set = jag_row_gpio[0];
+                else if (!(in & GPIO_MASK_J1)) set = jag_row_gpio[1];
+                else if (!(in & GPIO_MASK_J2)) set = jag_row_gpio[2];
+                else if (!(in & GPIO_MASK_J3)) set = jag_row_gpio[3];
+                else                           set = GPIO_MASK_ALL_OUT;
+                set = (set & ~pm)
+                    | mouse_quad_set(x_pos >> JAG_MOUSE_FRAC_BITS, GPIO_MASK_J8,  GPIO_MASK_J9)
+                    | mouse_quad_set(y_pos >> JAG_MOUSE_FRAC_BITS, GPIO_MASK_J10, GPIO_MASK_J11);
+                uint32_t clr = GPIO_MASK_ALL_OUT & ~set;
                 sio_hw->gpio_set = set;
                 if (clr) sio_hw->gpio_clr = clr;
             }
@@ -1029,11 +1098,10 @@ void jaguar_device_task(void) {
         (now - lr_hold_start_ms) >= 2000) {
         lr_toggled_state = true;
         mouse_mode       = !mouse_mode;
+        mouse_sync_targets();
         jag_input_mode   = mouse_mode ? JAG_MODE_MOUSE : JAG_MODE_SPINNER;
         phase_accum      = 0;
-        phase_y_accum    = 0;
         jag_phase_pending   = 0;
-        jag_phase_y_pending = 0;
         build_strobe_table(); __dmb();
         save_settings();
         update_led();

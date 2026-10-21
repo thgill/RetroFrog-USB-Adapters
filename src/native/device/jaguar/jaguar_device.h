@@ -155,17 +155,57 @@ extern volatile uint32_t jag_strobe_table[16];
 // Legacy byte array kept for compatibility — not used by Core 1 hot path
 extern volatile uint8_t jag_row_data[4];
 
-// Phase sequence index (0-2, into 3-state safe sequence)
-extern volatile uint8_t jag_phase_idx;    // X axis (J10/J11)
-extern volatile uint8_t jag_phase_y_idx;  // Y axis (J8/J9) — mouse mode only
+// Spinner phase sequence index (0-2, into 3-state safe sequence, J10/J11)
+extern volatile uint8_t jag_phase_idx;
 
-// Pending phase steps: Core 0 accumulates, Core 1 drains one per interval
+// Spinner pending phase steps: Core 0 accumulates, Core 1 drains one per interval
 // Positive = CW, negative = CCW
-extern volatile int16_t jag_phase_pending;    // X axis
-extern volatile int16_t jag_phase_y_pending;  // Y axis — mouse mode only
+extern volatile int16_t jag_phase_pending;
 
-// Step interval in microseconds — derived from spinner_divisor by Core 0
+// Spinner step interval in microseconds — derived from spinner_divisor by Core 0
 extern volatile uint32_t jag_step_interval_us;
+
+// ============================================================================
+// MOUSE MODE (ST/Amiga-style quadrature, as read by JagCheck)
+//
+// Port-1 pins (port 2 mirrors them on J12-J15):
+//   X: A = J8 (pin 14), B = J9 (pin 13)
+//   Y: A = J10 (pin 12), B = J11 (pin 11)
+// Standard 4-state Gray code, (A,B) = 00 → 01 → 11 → 10 for +X (right) / +Y (down).
+//
+// The Jaguar reader sees at most one step per sample (2 steps read as 0,
+// 3 as -1), so Core 1 must not step faster than the software reads:
+//  - Software that idles the row lines (1111) between reads: every read is a
+//    visible burst of row changes; step once in the quiet gap after each burst.
+//  - Software that leaves a row selected and reads continuously (e.g. Impulse X
+//    from a ~1.2 kHz timer interrupt): reads are invisible; step on a timer
+//    (JAG_MOUSE_HELD_US).
+//  - Idle and never polled: slow timed fallback (JAG_MOUSE_FALLBACK_US).
+//
+// Positions are free-running counters in 1/16-step units (wrap-safe,
+// compare via int32 diff); the pins show pos >> JAG_MOUSE_FRAC_BITS.
+//   jag_mouse_*_target — written by Core 0 only (where the mouse wants to be)
+//   jag_mouse_*_pos    — written by Core 1 only (what is on the pins)
+// Movement is queued and walked as a vector so the cursor keeps the mouse's
+// direction even when the one-step-per-poll limit is reached.
+// ============================================================================
+
+#define JAG_MOUSE_QUIET_US        300     // no row-code change this long = poll burst over
+#define JAG_MOUSE_NOPOLL_US     100000    // no row-code change this long = software not strobing
+#define JAG_MOUSE_FALLBACK_US    20000    // timed step rate when not strobing (safe for 50 Hz)
+#define JAG_MOUSE_HELD_US         1250    // timed step rate when a row is left selected
+                                          // (software polling without strobing; Impulse X
+                                          //  reads at ~1.2 kHz, so one step per 1.25 ms
+                                          //  never puts two steps between its reads)
+#define JAG_MOUSE_BACKLOG_US     40000    // cap queued movement to ~40 ms of steps (less overshoot)
+#define JAG_MOUSE_BACKLOG_MIN        3
+#define JAG_MOUSE_BACKLOG_MAX       64
+#define JAG_MOUSE_FRAC_BITS          4
+#define JAG_MOUSE_FRAC              (1 << JAG_MOUSE_FRAC_BITS)   // sub-steps per step
+
+extern volatile uint32_t jag_mouse_x_target, jag_mouse_y_target;
+extern volatile uint32_t jag_mouse_x_pos,    jag_mouse_y_pos;
+extern volatile uint32_t jag_mouse_poll_us;   // Core 1: measured time between polls
 
 // Bitmask of GPIO pins owned by the phase driver (excludes from strobe response)
 extern volatile uint32_t jag_phase_pin_mask;

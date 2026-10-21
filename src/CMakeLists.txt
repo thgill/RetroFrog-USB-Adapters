@@ -866,11 +866,15 @@ joypad_add_btstack(joypad_neogeo_rp2040zero)
 add_executable(joypad_neogeo_retrofrog)
 target_compile_definitions(joypad_neogeo_retrofrog PRIVATE
     CONFIG_NEOGEO=1
-    PICO_RP2040_ZERO_BUILD=1
+    PICO_RETROFROG_BUILD=1
+    WS2812_PIN=12
+    USE_BOOTSEL_BUTTON=1
 )
 target_sources(joypad_neogeo_retrofrog PUBLIC ${COMMON_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/gpio/gpio_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2neogeo/app.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2neogeo/neogeo_nav.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2neogeo/bootsel.c
 )
 target_include_directories(joypad_neogeo_retrofrog PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2neogeo
@@ -879,6 +883,7 @@ target_include_directories(joypad_neogeo_retrofrog PUBLIC
 target_link_libraries(joypad_neogeo_retrofrog PRIVATE ${COMMON_LIBRARIES})
 joypad_target_common(joypad_neogeo_retrofrog)
 joypad_add_btstack(joypad_neogeo_retrofrog)
+
 
 # --- NEOGEO TE ---
 # Stripped-down build: single default profile, consecutive remap only,

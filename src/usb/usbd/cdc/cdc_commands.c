@@ -40,6 +40,9 @@
 // Optional BLE output support
 #if REQUIRE_BLE_OUTPUT
 #include "bt/ble_output/ble_output.h"
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+#include "bt/switch2_ble/switch2_ble.h"
+#endif
 #endif
 
 // PS4 auth flash storage (always compiled with USB device sources)
@@ -68,6 +71,22 @@
 #  define BT_HOST_CONFIGURABLE 0
 #endif
 #define BT_INPUT_ALWAYS_ON (BT_HOST_PRESENT && !BT_HOST_CONFIGURABLE)
+
+// Same split for the BLE *device* (peripheral) output. Present when the
+// peripheral is compiled in; configurable only for apps that honour the runtime
+// ble_output flag (universal, which #defines BLE_OUTPUT_CONFIGURABLE). A
+// peripheral-only build such as usb2ble is present-but-not-configurable, so its
+// toggle is read-only always-on and must report ble_output:true on a fresh flash.
+#if REQUIRE_BLE_OUTPUT
+#  define BLE_DEV_PRESENT 1
+#else
+#  define BLE_DEV_PRESENT 0
+#endif
+#if defined(BLE_OUTPUT_CONFIGURABLE) && BLE_OUTPUT_CONFIGURABLE
+#  define BLE_DEV_CONFIGURABLE 1
+#else
+#  define BLE_DEV_CONFIGURABLE 0
+#endif
 
 // ============================================================================
 // STATE
@@ -720,6 +739,10 @@ static void cmd_flash_b(const char* json)
 static void cmd_ota(const char* json)
 {
     (void)json;
+    if (!platform_has_ota()) {
+        send_error("no OTA path on this board");
+        return;
+    }
     send_ok();
     pending_reboot = PENDING_OTA;
     pending_reboot_time = platform_time_ms();
@@ -873,6 +896,37 @@ static void cmd_ble_pair(const char* json)
     send_ok();
 }
 
+// BT.SCAN — start the BLE central scan. This dongle has no user button, so the
+// button-press path that normally starts scanning is unreachable; needed to walk a
+// real Switch 2 pad's GATT table from here (see sw2_dump_gatt in btstack_host.c).
+static void cmd_bt_scan(const char* json)
+{
+    (void)json;
+#ifdef ENABLE_BTSTACK
+    extern void btstack_host_suppress_scan(bool suppress);
+    extern void btstack_host_start_scan(void);
+    extern void btstack_host_start_timed_scan(uint32_t timeout_ms);
+    extern uint8_t btstack_classic_get_connection_count(void);
+    btstack_host_suppress_scan(false);
+    // Mirror the dongle button. Scanning stops once something is connected
+    // (the radio belongs to the link), so this is the "add another device"
+    // request: time-box it when a controller is already attached, and scan
+    // open-endedly only when there is nothing to protect.
+    int scan_ms = 0;
+    if (btstack_classic_get_connection_count() > 0) {
+        scan_ms = 60000;
+        btstack_host_start_timed_scan((uint32_t)scan_ms);
+    } else {
+        btstack_host_start_scan();
+    }
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"timed_ms\":%d}", scan_ms);
+    send_json(response_buf);
+#else
+    send_json("{\"ok\":false,\"error\":\"no bt host in build\"}");
+#endif
+}
+
 // BT.TRACE — dump the live diagnostic mark ring (nRF: noinit ring in main.c;
 // weak no-op elsewhere). Read-only bench tool.
 __attribute__((weak)) void bt_diag_dump(void) { }
@@ -881,6 +935,124 @@ static void cmd_bt_trace(const char* json)
     (void)json;
     bt_diag_dump();
     send_ok();
+}
+
+// SWITCH2.SYNC — re-enter Switch 2 pairing mode (forget the bonded console and
+// advertise the pairing persona). Same as the user-button click, over serial:
+// the dongle's button is awkward to reach, and pairing usually needs a config
+// host connected anyway.
+static void cmd_switch2_sync(const char* json)
+{
+    (void)json;
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    if (ble_output_get_mode() != BLE_MODE_SWITCH2) {
+        send_json("{\"ok\":false,\"error\":\"not in Switch 2 mode\"}");
+        return;
+    }
+    switch2_ble_request_sync();
+    send_ok();
+#else
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
+}
+
+// SWITCH2.SCAN — how many scan requests our advertisement has drawn, and the
+// address prefix of the most recent scanner. Tells us whether a host is even
+// looking at us, without the per-packet marks that flood the diagnostic ring.
+static void cmd_switch2_scan(const char* json)
+{
+    (void)json;
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    extern volatile uint32_t joypad_scan_req_count;
+    extern volatile uint32_t joypad_scan_req_last;
+    extern volatile uint32_t joypad_conn_req_count;
+    extern volatile uint32_t joypad_conn_req_last;
+    extern volatile uint32_t joypad_conn_req_why;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"scan_reqs\":%lu,\"last\":\"%02lx:%02lx:%02lx\","
+             "\"conn_reqs\":%lu,\"conn_last\":\"%02lx:%02lx:%02lx\",\"conn_why\":%lu}",
+             (unsigned long)joypad_scan_req_count,
+             (unsigned long)((joypad_scan_req_last >> 16) & 0xff),
+             (unsigned long)((joypad_scan_req_last >> 8) & 0xff),
+             (unsigned long)(joypad_scan_req_last & 0xff),
+             (unsigned long)joypad_conn_req_count,
+             (unsigned long)((joypad_conn_req_last >> 16) & 0xff),
+             (unsigned long)((joypad_conn_req_last >> 8) & 0xff),
+             (unsigned long)(joypad_conn_req_last & 0xff),
+             (unsigned long)joypad_conn_req_why);
+    // Append what is actually being advertised, so the identity and payload can
+    // be checked without a sniffer.
+    {
+        // A weak extern *variable* resolves to address 0 when undefined, so reading
+        // it on a backend that has no CYW43 transport (nRF, ESP) is a null
+        // dereference, not a benign zero. Take the address and test it instead.
+        extern uint8_t bt_cyw43_addr_claim_status __attribute__((weak));
+        const uint8_t claim_st = (&bt_cyw43_addr_claim_status != NULL)
+                                 ? bt_cyw43_addr_claim_status : 0xFF;
+        uint8_t a[6], mode, adv[31], cl[6];
+        uint8_t n = switch2_ble_get_adv_debug(a, &mode, adv, sizeof(adv));
+        switch2_ble_get_claimed_addr(cl);
+        size_t pos = strlen(response_buf);
+        if (pos > 0 && response_buf[pos - 1] == '}') pos--;   // reopen the object
+        int w = snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                         ",\"addr\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"addr_mode\":%u,"
+                         "\"claimed\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"claim_st\":%u,\"adv\":\"",
+                         a[0], a[1], a[2], a[3], a[4], a[5], mode,
+                         cl[0], cl[1], cl[2], cl[3], cl[4], cl[5],
+                         (unsigned)claim_st);
+        if (w > 0) pos += (size_t)w;
+        for (uint8_t i = 0; i < n && pos + 3 < sizeof(response_buf); i++) {
+            pos += (size_t)snprintf(response_buf + pos, sizeof(response_buf) - pos, "%02x", adv[i]);
+        }
+        uint16_t cc, itvl, dc; uint8_t st, role, dr;
+        switch2_ble_get_link_debug(&cc, &st, &role, &itvl, &dc, &dr);
+        snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                 "\",\"cc\":%u,\"cc_status\":%u,\"cc_role\":%u,\"cc_itvl\":%u,"
+                 "\"disc\":%u,\"disc_reason\":%u}",
+                 cc, st, role, itvl, dc, dr);
+        uint16_t ar, aw, alr, alw; uint8_t pstage, enc;
+        switch2_ble_get_att_debug(&ar, &aw, &alr, &alw, &pstage, &enc);
+        size_t p2 = strlen(response_buf);
+        if (p2 > 0 && response_buf[p2 - 1] == '}') p2--;
+        snprintf(response_buf + p2, sizeof(response_buf) - p2,
+                 ",\"att_r\":%u,\"att_w\":%u,\"att_txn\":%u,\"last_r\":\"0x%04x\",\"last_w\":\"0x%04x\","
+                 "\"pair_stage\":%u,\"enc\":%u}",
+                 ar, aw, switch2_ble_get_att_txn_count(), alr, alw, pstage, enc);
+        uint16_t aev, amtu, dtx; uint8_t ptx, prx;
+        switch2_ble_get_att_events(&aev, &amtu);
+        switch2_ble_get_link_phy(&ptx, &prx, &dtx);
+        size_t p3 = strlen(response_buf);
+        if (p3 > 0 && response_buf[p3 - 1] == '}') p3--;
+        snprintf(response_buf + p3, sizeof(response_buf) - p3,
+                 ",\"att_ev\":%u,\"att_mtu\":%u,\"stall_drops\":%u,"
+                 "\"phy_tx\":%u,\"phy_rx\":%u,\"dle_tx\":%u}",
+                 aev, amtu, switch2_ble_get_stall_drops(), ptx, prx, dtx);
+    }
+    send_json(response_buf);
+#else
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
+}
+
+// SWITCH2.PID.SET — advertise a different controller product id and hold it
+// there (0x2069 Pro Controller 2, 0x2066/0x2067 Joy-Con 2 R/L, 0x2073 NSO GC).
+// Steady, unlike the rotating sweep this replaces: a console needs the same
+// advertisement on air for many seconds before it acts on it.
+static void cmd_switch2_pid_set(const char* json)
+{
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    int pid;
+    if (!json_get_int(json, "pid", &pid) || pid < 0 || pid > 0xffff) {
+        send_error("missing or out-of-range pid");
+        return;
+    }
+    switch2_ble_set_pid((uint16_t)pid);
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"pid\":%d}", pid);
+    send_json(response_buf);
+#else
+    (void)json;
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
 }
 
 static void cmd_ble_mode_get(const char* json)
@@ -2607,6 +2779,7 @@ static void cmd_router_get(const char* json)
     // debounced). router_init() has already restored them from flash on boot.
     dm = router_get_dpad_mode();
     uint8_t ss = router_get_shoulder_swap() ? 1 : 0;
+    uint8_t bleo = BLE_DEV_PRESENT;   // default on when present, matching the app
     const flash_t* s = settings_for_read(&scratch);
     if (s && s->router_saved) {
         if (s->routing_mode <= 2) rm = s->routing_mode;
@@ -2614,12 +2787,16 @@ static void cmd_router_get(const char* json)
 #if !BT_INPUT_ALWAYS_ON
         bti = s->bt_input_enabled;   // always-on bridges ignore the persisted flag
 #endif
+#if BLE_DEV_CONFIGURABLE
+        bleo = (s->ble_output_disabled == 0);   // always-on builds ignore the flag
+#endif
     }
     snprintf(response_buf, sizeof(response_buf),
              "{\"ok\":true,\"routing_mode\":%d,\"merge_mode\":%d,\"dpad_mode\":%d,"
-             "\"shoulder_swap\":%s,\"bt_input\":%s,"
+             "\"shoulder_swap\":%s,\"bt_input\":%s,\"ble_output\":%s,"
              "\"default_routing_mode\":%d,\"default_merge_mode\":%d}",
              rm, mm, dm, ss ? "true" : "false", bti ? "true" : "false",
+             bleo ? "true" : "false",
              (int)ROUTING_MODE, (int)MERGE_MODE);
     send_json(response_buf);
 }
@@ -2827,13 +3004,17 @@ static void cmd_caps_get(const char* json)
     // bridges are present-but-not-configurable → read-only always-on page.
     const char* bt_present      = BT_HOST_PRESENT      ? "true" : "false";
     const char* bt_configurable = BT_HOST_CONFIGURABLE ? "true" : "false";
+    const char* bd_present      = BLE_DEV_PRESENT      ? "true" : "false";
+    const char* bd_configurable = BLE_DEV_CONFIGURABLE ? "true" : "false";
     n = snprintf(out, rem,
                  "],\"usb_host\":{\"present\":%s,\"configurable\":%s,\"dp\":%d}"
                  ",\"bt_host\":{\"present\":%s,\"configurable\":%s}"
+                 ",\"bt_device\":{\"present\":%s,\"configurable\":%s}"
                  ",\"native\":{\"in\":%s%s%s,\"in_source_name\":\"%s\""
                  ",\"out\":%s%s%s,\"out_target_name\":\"%s\",\"out_players\":%d}}",
                  uh_present, uh_configurable, uh_dp,
                  bt_present, bt_configurable,
+                 bd_present, bd_configurable,
                  nin  ? "\"" : "null", nin  ? nin  : "", nin  ? "\"" : "", nin_src,
                  nout ? "\"" : "null", nout ? nout : "", nout ? "\"" : "", nout_tgt, nout_players);
     if (n < 0 || n >= rem) goto overflow;
@@ -2862,6 +3043,10 @@ static void cmd_router_set(const char* json)
     if (json_get_int(json, "dpad_mode", &ival)) settings->dpad_mode = (uint8_t)ival;
     bool bval;
     if (json_get_bool(json, "bt_input", &bval)) settings->bt_input_enabled = bval ? 1 : 0;
+#if BLE_DEV_CONFIGURABLE
+    // Stored inverted (0 = enabled) so old flashes keep advertising; see flash.h.
+    if (json_get_bool(json, "ble_output", &bval)) settings->ble_output_disabled = bval ? 0 : 1;
+#endif
     settings->router_saved = 1;
 
     flash_save_force(settings);
@@ -2973,7 +3158,52 @@ static void cmd_ble_drop(const char* json)
     json_get_int(json, "ms", &ms);
     if (ms < 1000) ms = 1000;
     btstack_host_ble_drop_all((uint32_t)ms);
+    // btstack_host only tracks central-role links; an emulated controller's own
+    // peripheral link is deliberately ignored by it, so "drop all" used to leave
+    // the console connected and the adapter off air.
+    extern void switch2_ble_drop_link(void) __attribute__((weak));
+    if (switch2_ble_drop_link) switch2_ble_drop_link();
     send_ok();
+}
+
+
+// BT.CTRL — Bluetooth controller identity. HCI/LMP version 8 = BT 4.2, 9 = BT 5.0
+// (where LE 2M PHY was introduced), 10 = 5.1, 11 = 5.2.
+static void cmd_bt_ctrl(const char* json)
+{
+    (void)json;
+    extern uint8_t bt_cyw43_hci_version __attribute__((weak));
+    extern uint8_t bt_cyw43_lmp_version __attribute__((weak));
+    extern uint16_t bt_cyw43_manufacturer __attribute__((weak));
+    unsigned hci_v = (&bt_cyw43_hci_version != NULL) ? bt_cyw43_hci_version : 0;
+    unsigned lmp_v = (&bt_cyw43_lmp_version != NULL) ? bt_cyw43_lmp_version : 0;
+    unsigned manuf = (&bt_cyw43_manufacturer != NULL) ? bt_cyw43_manufacturer : 0;
+    // The address we actually advertise from, which is what a host keys its GATT
+    // cache on. gap_local_bd_addr() is the controller's public address and is NOT
+    // it when we advertise from a random-static one, so ask for the address in use.
+    // macOS hides BD_ADDRs behind per-device UUIDs, so this is the only way to read
+    // it back and confirm per-mode identities are distinct and stable.
+#ifdef ENABLE_BTSTACK
+    extern void gap_le_get_own_address(uint8_t * addr_type, uint8_t * addr);
+#endif
+    extern int  bt_nrf_ident_mode  __attribute__((weak));
+    extern bool bt_nrf_ident_permode __attribute__((weak));
+    const int  ident_mode    = (&bt_nrf_ident_mode != NULL) ? bt_nrf_ident_mode : -2;
+    const bool ident_permode = (&bt_nrf_ident_permode != NULL) ? bt_nrf_ident_permode : false;
+    uint8_t own_type = 0xFF;
+    bd_addr_t own;
+    memset(own, 0, sizeof(own));
+#ifdef ENABLE_BTSTACK
+    gap_le_get_own_address(&own_type, own);
+#endif
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"hci_ver\":%u,\"lmp_ver\":%u,\"manuf\":%u,"
+             "\"own_addr\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"own_type\":%u,"
+             "\"ident_mode\":%d,\"ident_permode\":%s}",
+             hci_v, lmp_v, manuf,
+             own[0], own[1], own[2], own[3], own[4], own[5], own_type,
+             ident_mode, ident_permode ? "true" : "false");
+    send_json(response_buf);
 }
 
 static void cmd_bt_status(const char* json)
@@ -3007,10 +3237,13 @@ static void cmd_bt_status(const char* json)
     btstack_host_get_crash_info(&crash_pc, &crash_lr);
 #endif
     int pos = snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
+             "{\"enabled\":%s,\"scanning\":%s,\"supp\":%s,\"hsupp\":%s,\"supp_src\":\"%s\",\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
              "\"up_s\":%lu,\"crash_pc\":\"%08lx\",\"crash_lr\":\"%08lx\",\"devices\":[",
              btstack_host_is_initialized() ? "true" : "false",
              btstack_host_is_scanning() ? "true" : "false",
+             btstack_host_scan_suppressed() ? "true" : "false",
+             btstack_host_scan_hard_suppressed() ? "true" : "false",
+             btstack_host_scan_supp_src(),
              btstack_classic_get_connection_count(),
              nus_state, gattfree, transport,
              (unsigned long)(platform_time_ms() / 1000),
@@ -4333,6 +4566,7 @@ static const cmd_entry_t commands[] = {
     {"VOICE.STATE", cmd_voice_state},
 #endif
     {"BT.STATUS", cmd_bt_status},
+    {"BT.CTRL", cmd_bt_ctrl},
     {"BLE.DROP", cmd_ble_drop},
     {"BT.BONDS.CLEAR", cmd_bt_bonds_clear},
     {"BT.FORGET", cmd_bt_forget},
@@ -4341,10 +4575,14 @@ static const cmd_entry_t commands[] = {
 #endif
 #if REQUIRE_BLE_OUTPUT
     {"BLE.MODE.GET", cmd_ble_mode_get},
+    {"SWITCH2.SYNC", cmd_switch2_sync},
+    {"SWITCH2.SCAN", cmd_switch2_scan},
+    {"SWITCH2.PID.SET", cmd_switch2_pid_set},
     {"BLE.MODE.SET", cmd_ble_mode_set},
     {"BLE.MODE.LIST", cmd_ble_mode_list},
     {"BLE.PAIR", cmd_ble_pair},
     {"BT.TRACE", cmd_bt_trace},
+    {"BT.SCAN", cmd_bt_scan},
     {"WIRELESS.POLICY.GET", cmd_wireless_policy_get},
     {"WIRELESS.POLICY.SET", cmd_wireless_policy_set},
 #endif

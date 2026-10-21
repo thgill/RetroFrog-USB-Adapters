@@ -171,6 +171,46 @@ static void blue_led_set(bool on)
     }
 }
 
+#elif defined(BOARD_RAYTAC_MDBT50Q_CX40)
+
+// ============================================================================
+// Raytac MDBT50Q-CX-40 dongle: TWO LEDs, D1 = P0.06 (blue) and D2 = P0.08
+// (red), active LOW. Three colour channels over two pins, so two channels
+// necessarily share one -- see set_rgb, which ORs channels that land on the
+// same pin.
+//
+// D1 is also the "something is on" indicator (LED_PIN_ANY): it lights for any
+// non-black colour, not just its own channels. Without that, a red-only mode
+// colour -- USB output mode Switch is the only one, 64/0/0 -- would depend
+// entirely on D2 and the dongle just looks dead. Augmental's mouthpad-usb runs
+// this same board and routes every channel through D1 for the same reason
+// ("Map primary LED (D1/blue) to all channels"), never relying on D2. Red still
+// drives D2 as well, so red-vs-not stays distinguishable if D2 is populated.
+//
+// Note the stock board definition labels D1 as led0-green; it is physically
+// blue, per mouthpad-usb's overlay for this dongle. Only the colour NAME is
+// wrong -- the pin is right -- so this mapping keeps the pins and ignores the
+// labels.
+// ============================================================================
+
+#define LED_RED_PIN    8  // P0.08 (D2, red)
+#define LED_GREEN_PIN  6  // P0.06 (D1, blue)
+#define LED_BLUE_PIN   6  // P0.06 (D1), shared with green
+#define LED_PIN_ANY    6  // P0.06 (D1) also lights for ANY channel
+#define LED_PORT_LABEL DT_NODELABEL(gpio0)
+
+#elif defined(BOARD_RAYTAC_MDBT50Q_RX)
+
+// ============================================================================
+// Raytac MDBT50Q-RX dongle: ONE LED (P1.13), active LOW. There is no RGB and no
+// WS2812 here, so colour cannot be shown -- the indicator is on whenever any
+// channel is non-zero (see set_rgb below), which keeps the blink/solid status
+// behaviour while losing only the mode colour.
+// ============================================================================
+
+#define LED_SINGLE_PIN 13  // P1.13
+#define LED_PORT_LABEL DT_NODELABEL(gpio1)
+
 #elif defined(BOARD_MAKERDIARY_NRF52840)
 
 // ============================================================================
@@ -235,9 +275,37 @@ static uint32_t state_change_ms = 0;
 static void set_rgb(bool r, bool g, bool b)
 {
     if (!led_port) return;
-    gpio_pin_set(led_port, LED_RED_PIN, r ? 0 : 1);
-    gpio_pin_set(led_port, LED_GREEN_PIN, g ? 0 : 1);
-    gpio_pin_set(led_port, LED_BLUE_PIN, b ? 0 : 1);
+#ifdef LED_SINGLE_PIN
+    // One LED for every channel (Raytac RX): OR them.
+    gpio_pin_set(led_port, LED_SINGLE_PIN, (r || g || b) ? 0 : 1);
+#else
+    // Boards with fewer than three LEDs map two channels onto one pin (Raytac
+    // CX-40: green and blue both on D1). Writing each channel in turn would let
+    // the LAST one win, so e.g. green-only would be switched on by green and
+    // straight back off by blue. OR the channels that share a pin, then write
+    // each pin once.
+    const uint8_t pin[3] = { LED_RED_PIN, LED_GREEN_PIN, LED_BLUE_PIN };
+    bool on[3] = { r, g, b };
+    for (int i = 0; i < 3; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (pin[j] == pin[i]) {
+                bool any = on[i] || on[j];
+                on[i] = any;
+                on[j] = any;
+            }
+        }
+    }
+#ifdef LED_PIN_ANY
+    // This board's primary LED stands in for every channel, so a colour that
+    // uses none of its own channels still shows up.
+    for (int i = 0; i < 3; i++) {
+        if (pin[i] == LED_PIN_ANY && (r || g || b)) on[i] = true;
+    }
+#endif
+    for (int i = 0; i < 3; i++) {
+        gpio_pin_set(led_port, pin[i], on[i] ? 0 : 1);
+    }
+#endif
 }
 
 static void set_color(uint8_t r, uint8_t g, uint8_t b)
@@ -324,18 +392,27 @@ void neopixel_init(void)
 
     blue_led_set(true);
 #else
-    led_port = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+    // Use the board's declared port, not a hardcoded gpio0: the Raytac RX's one
+    // LED is on P1.13, so grabbing gpio0 here drove pin 13 of the WRONG port and
+    // the LED never lit. LED_PORT_LABEL is set per board above.
+    led_port = DEVICE_DT_GET(LED_PORT_LABEL);
     if (!device_is_ready(led_port)) {
         printf("[led_nrf] GPIO port not ready\n");
         led_port = NULL;
         return;
     }
 
+#ifdef LED_SINGLE_PIN
+    // HIGH = off (active low). Only one LED on this board.
+    gpio_pin_configure(led_port, LED_SINGLE_PIN, GPIO_OUTPUT_HIGH);
+    printf("[led_nrf] single LED initialized (P1.%d, active low)\n", LED_SINGLE_PIN);
+#else
     gpio_pin_configure(led_port, LED_RED_PIN, GPIO_OUTPUT_HIGH);
     gpio_pin_configure(led_port, LED_GREEN_PIN, GPIO_OUTPUT_HIGH);
     gpio_pin_configure(led_port, LED_BLUE_PIN, GPIO_OUTPUT_HIGH);
     printf("[led_nrf] RGB LEDs initialized (R=P0.%d G=P0.%d B=P0.%d, active low)\n",
            LED_RED_PIN, LED_GREEN_PIN, LED_BLUE_PIN);
+#endif
 #endif
 }
 

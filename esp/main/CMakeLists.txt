@@ -53,6 +53,9 @@ if(CONFIG_APP STREQUAL "universal")
         "${SHARED_SRC}/bt/ble_output/ble_output_xbox.c"
         "${SHARED_SRC}/bt/ble_output/ble_nus.c"
         "${SHARED_SRC}/bt/ble_output/ble_xbox_gatt_db.c"
+        # Switch 2 Pro Controller over BLE (CONFIG_SWITCH2_BLE_OUTPUT below)
+        "${SHARED_SRC}/bt/switch2_ble/switch2_proto.c"
+        "${SHARED_SRC}/bt/switch2_ble/switch2_ble.c"
         # BT transport (peripheral mode — no btstack_host, no bthid)
         "${SHARED_SRC}/bt/transport/bt_transport.c"
         "${SHARED_SRC}/bt/transport/bt_transport_esp32.c"
@@ -409,6 +412,10 @@ if(APP_NEEDS_BTSTACK)
             "${BTSTACK_PATH}/src/ble/gatt-service/nordic_spp_service_server.c"
             # BTstack HID parser (needed by hids_device.c)
             "${BTSTACK_PATH}/src/btstack_hid_parser.c"
+            # GATT *client* in a peripheral build: switch2_ble.c starts the ATT
+            # MTU exchange against our own link, because an ATT server never
+            # initiates it and the Switch 2 console will not pair at MTU 23.
+            "${BTSTACK_PATH}/src/ble/gatt_client.c"
             # BTstack Classic link key DB (needed by btstack_port_esp32.c)
             "${BTSTACK_PATH}/src/classic/btstack_link_key_db_tlv.c"
             # Stub btstack_host_nus_send: cdc_commands.c's FACE.* NUS relay
@@ -578,6 +585,9 @@ if(CONFIG_APP STREQUAL "universal")
         USBD_DEFAULT_MODE=1
         OLED_I2C_DISPLAY=1
         DISABLE_DISPLAY_SPI=1
+        # Switch 2 BLE output. The console's 5 ms connection interval needs
+        # ESP-IDF >= 6.1 (CONFIG_BT_CTRL_BLE_MIN_CONN_INTERVAL_ENABLE).
+        CONFIG_SWITCH2_BLE_OUTPUT=1
     )
 elseif(CONFIG_APP STREQUAL "usb2usb")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC

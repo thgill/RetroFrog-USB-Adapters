@@ -2251,6 +2251,14 @@ if (PICO_BOARD STREQUAL "pico_w" OR
         # BLE-only and must NOT define this, so those modes are hidden + rejected
         # by the mode-list/select plumbing (see ble_output_mode_available()).
         CONFIG_BT_CLASSIC_OUTPUT=1
+        # Native Switch 2 Pro Controller over BLE. Needs the radio to hold the
+        # console's 5 ms connection interval — unverified on CYW43, see
+        # .dev/docs/switch2-ble-output-plan.md.
+        CONFIG_SWITCH2_BLE_OUTPUT=1
+        # Each BLE output mode advertises from its own permanent address, so hosts
+        # treat the modes as separate peers instead of reusing a cached GATT
+        # database across a mode switch (the "forget this device" headache).
+        CONFIG_BLE_PER_MODE_IDENTITY=1
         SENSOR_PAD=1
         SENSOR_JOYWING=1
         PICO_DEFAULT_PIO_USB_DP_PIN=16
@@ -2288,6 +2296,9 @@ if (PICO_BOARD STREQUAL "pico_w" OR
         ${CMAKE_CURRENT_SOURCE_DIR}/bt/switch_bt/switch_proto.c
         ${CMAKE_CURRENT_SOURCE_DIR}/bt/switch_bt/switch_spi.c
         ${CMAKE_CURRENT_SOURCE_DIR}/bt/switch_bt/switch_bt.c
+        # Switch 2 Pro Controller over BLE (build-gated by CONFIG_SWITCH2_BLE_OUTPUT).
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/switch2_ble/switch2_proto.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/bt/switch2_ble/switch2_ble.c
         ${BTHID_DEVICE_SOURCES}
         ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/generic/hid_parser.c
         ${CMAKE_CURRENT_SOURCE_DIR}/bt/btstack/btstack_host.c
@@ -2296,6 +2307,13 @@ if (PICO_BOARD STREQUAL "pico_w" OR
         ${CMAKE_CURRENT_SOURCE_DIR}/bt/transport/bt_transport_cyw43.c
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/universal/app.c
     )
+    # Opt-in raw ATT/ACL tracer for Switch 2 BLE bring-up. Logs every ATT packet in
+    # both directions, which is the only way to tell "the console sent nothing" apart
+    # from "BTstack rejected what the console sent below our handlers":
+    #   SWITCH2_ACL_TRACE=1 make universal_pico_w
+    if(DEFINED ENV{SWITCH2_ACL_TRACE})
+        target_compile_definitions(joypad_universal PRIVATE CONFIG_SWITCH2_ACL_TRACE=1)
+    endif()
     target_include_directories(joypad_universal PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/universal
         ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbd

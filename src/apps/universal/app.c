@@ -39,6 +39,9 @@
 #ifdef CONFIG_BT_CLASSIC_OUTPUT
 #include "bt/switch_bt/switch_bt.h"   // switch_bt_request_sync() / switch_bt_is_connected()
 #endif
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+#include "bt/switch2_ble/switch2_ble.h"   // switch2_ble_request_sync()
+#endif
 #include "bt/transport/bt_transport.h"
 
 #ifdef BTSTACK_USE_CYW43
@@ -231,7 +234,35 @@ static const char* oled_transport_str(input_transport_t t) {
 // BUTTON EVENT HANDLER
 // ============================================================================
 
+#if REQUIRE_BLE_OUTPUT
+// BLE device (peripheral) output. Default on: only an explicit ROUTER.SET
+// {"ble_output":false} turns it off, and the flash flag is stored inverted so
+// old flashes keep advertising. Lets a receiver-only board avoid being a BLE
+// peripheral and a central at the same time.
+//
+// Loaded lazily because app_get_output_interfaces() runs before app_init(), so
+// the flag is needed before the app's main flash read happens.
+static bool ble_output_enabled = true;
+static bool ble_output_flag_loaded = false;
+
+static bool ble_output_is_enabled(void)
+{
+    if (!ble_output_flag_loaded) {
+        flash_t f;
+        if (flash_load(&f) && f.router_saved) {
+            ble_output_enabled = (f.ble_output_disabled == 0);
+        }
+        ble_output_flag_loaded = true;
+    }
+    return ble_output_enabled;
+}
+#endif
 #if REQUIRE_BT_INPUT
+// NOTE: on a fresh flash (router_saved == 0) this stays false while ROUTER.GET
+// reports "bt_input": true for a REQUIRE_BT_INPUT build -- the device claims the
+// BT host is enabled and never scans until some router setting is saved. Real
+// inconsistency, but fixing it changes boot behaviour on every universal board,
+// so it is deliberately left alone here rather than ridden in on a board port.
 static bool bt_input_enabled = false;
 #endif
 
@@ -257,6 +288,17 @@ static void on_button_event(button_event_t event)
                 } else {
                     printf("[app:universal] Switch-BT already connected\n");
                 }
+                break;
+            }
+#endif
+#if REQUIRE_BLE_OUTPUT && defined(CONFIG_SWITCH2_BLE_OUTPUT)
+            // Switch 2 output: a click is the controller's sync button — forget the
+            // paired console and advertise for pairing (Change Grip/Order finds us).
+            // A button press on the pad itself wakes / reconnects a bonded console.
+            if (ble_output_get_mode() == BLE_MODE_SWITCH2) {
+                printf("[app:universal] Switch 2 SYNC — pairing mode; open Change Grip/Order\n");
+                switch2_ble_request_sync();
+                neopixel_indicate_profile(2);  // visual ack
                 break;
             }
 #endif
@@ -331,6 +373,9 @@ static void on_button_event(button_event_t event)
             for (int i = 0; i < le_device_db_max_count(); i++) {
                 le_device_db_remove(i);
             }
+#if REQUIRE_BLE_OUTPUT && defined(CONFIG_SWITCH2_BLE_OUTPUT)
+            if (ble_output_get_mode() == BLE_MODE_SWITCH2) switch2_ble_request_sync();
+#endif
 #if REQUIRE_BLE_OUTPUT
             printf("[app:universal] Bonds cleared, restarting advertising\n");
             gap_advertisements_enable(1);
@@ -353,14 +398,30 @@ static bool sinput_rgb_override = false;
 static void bt_central_post_init(void)
 {
 #if REQUIRE_BLE_OUTPUT
-    ble_output_late_init();
+    if (ble_output_is_enabled()) ble_output_late_init();
 #endif
     // Always init HID handlers so bond management (forget, status) works
     // even when BT scanning is disabled. Only start scanning if enabled.
     btstack_host_init_hid_handlers();
     if (bt_input_enabled) {
-        btstack_host_start_timed_scan(60000);
-        printf("[app:universal] BT Central enabled, scanning...\n");
+#if REQUIRE_BLE_OUTPUT
+        // Concurrent scanning starves our own advertising on the nRF controller, so
+        // in dual mode the scan stays time-boxed and discovery is a user action
+        // (BT.SCAN / the button). With the peripheral disabled there is nothing to
+        // starve, and a time-boxed scan is actively wrong: after it expires the
+        // central only direct-dials the already-bonded address, so a controller put
+        // into pairing mode later is never discovered at all.
+        if (!ble_output_is_enabled()) {
+            btstack_host_start_scan();
+            printf("[app:universal] BT Central enabled, scanning (receiver mode)\n");
+        } else {
+            btstack_host_start_timed_scan(60000);
+            printf("[app:universal] BT Central enabled, scanning...\n");
+        }
+#else
+        btstack_host_start_scan();
+        printf("[app:universal] BT Central enabled, scanning (receiver mode)\n");
+#endif
     } else {
         // Suppress the central's auto-scan. scan_suppressed defaults to
         // false, so the host's state machine would otherwise keep BLE
@@ -400,16 +461,18 @@ const InputInterface** app_get_input_interfaces(uint8_t* count)
 // APP OUTPUT INTERFACES
 // ============================================================================
 
-static const OutputInterface* output_interfaces[] = {
-#if REQUIRE_BLE_OUTPUT
-    &ble_output_interface,
-#endif
-    &usbd_output_interface,
-};
+// Built at runtime: the BLE peripheral is omitted entirely when disabled, so its
+// init/task never run and the router has no BLE output target to feed.
+static const OutputInterface* output_interfaces[2];
 
 const OutputInterface** app_get_output_interfaces(uint8_t* count)
 {
-    *count = sizeof(output_interfaces) / sizeof(output_interfaces[0]);
+    uint8_t n = 0;
+#if REQUIRE_BLE_OUTPUT
+    if (ble_output_is_enabled()) output_interfaces[n++] = &ble_output_interface;
+#endif
+    output_interfaces[n++] = &usbd_output_interface;
+    *count = n;
     return output_interfaces;
 }
 
@@ -635,6 +698,7 @@ void app_init(void)
 #if REQUIRE_BT_INPUT
             bt_input_enabled = flash_data.bt_input_enabled != 0;
 #endif
+
         }
     }
 
@@ -656,7 +720,7 @@ void app_init(void)
 
 #if REQUIRE_BLE_OUTPUT
     // Route: GPIO (sensors) → BLE Peripheral
-    router_add_route(INPUT_SOURCE_GPIO, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
+    if (ble_output_is_enabled()) router_add_route(INPUT_SOURCE_GPIO, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
 #endif
 
     // Route: GPIO (sensors) → USB Device (CDC config + wired gamepad)
@@ -666,7 +730,7 @@ void app_init(void)
     // Route: USB Host controllers → USB Device
     router_add_route(INPUT_SOURCE_USB_HOST, OUTPUT_TARGET_USB_DEVICE, 0);
 #if REQUIRE_BLE_OUTPUT
-    router_add_route(INPUT_SOURCE_USB_HOST, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
+    if (ble_output_is_enabled()) router_add_route(INPUT_SOURCE_USB_HOST, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
 #endif
 #endif
 
@@ -674,7 +738,7 @@ void app_init(void)
     // Route: BLE Central (scanned controllers) → USB Device
     router_add_route(INPUT_SOURCE_BLE_CENTRAL, OUTPUT_TARGET_USB_DEVICE, 0);
 #if REQUIRE_BLE_OUTPUT
-    router_add_route(INPUT_SOURCE_BLE_CENTRAL, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
+    if (ble_output_is_enabled()) router_add_route(INPUT_SOURCE_BLE_CENTRAL, OUTPUT_TARGET_BLE_PERIPHERAL, 0);
 #endif
 #endif
 
@@ -689,8 +753,20 @@ void app_init(void)
 #if REQUIRE_BLE_OUTPUT || REQUIRE_BT_INPUT
     // Initialize BLE transport with post-init callback.
     // Post-init runs in BTstack task context after HCI is ready.
+    // Bring the radio up only if a role wants it. With the central disabled
+    // (bt_input) and the peripheral disabled (ble_output), skip BTstack
+    // entirely so a receiver-only board does not run a BLE stack at all.
+    bool want_radio = false;
+#if REQUIRE_BT_INPUT
+    if (bt_input_enabled) want_radio = true;
+#endif
 #if REQUIRE_BLE_OUTPUT
-    ble_output_init();  // Load BLE mode from flash before BTstack starts
+    if (ble_output_is_enabled()) {
+        ble_output_init();  // Load BLE mode from flash before BTstack starts
+        want_radio = true;
+    } else {
+        printf("[app:universal] BLE device output disabled\n");
+    }
 #endif
 
     // Select post-init callback
@@ -700,16 +776,20 @@ void app_init(void)
     #define BT_POST_INIT ble_output_late_init
 #endif
 
+    if (want_radio) {
 #ifdef BTSTACK_USE_CYW43
-    bt_cyw43_set_post_init(BT_POST_INIT);
-    bt_init(&bt_transport_cyw43);
+        bt_cyw43_set_post_init(BT_POST_INIT);
+        bt_init(&bt_transport_cyw43);
 #elif defined(BTSTACK_USE_ESP32)
-    bt_esp32_set_post_init(BT_POST_INIT);
-    bt_init(&bt_transport_esp32);
+        bt_esp32_set_post_init(BT_POST_INIT);
+        bt_init(&bt_transport_esp32);
 #elif defined(BTSTACK_USE_NRF)
-    bt_nrf_set_post_init(BT_POST_INIT);
-    bt_init(&bt_transport_nrf);
+        bt_nrf_set_post_init(BT_POST_INIT);
+        bt_init(&bt_transport_nrf);
 #endif
+    } else {
+        printf("[app:universal] no wireless role enabled — BT stack not started\n");
+    }
 #endif
 
 #ifdef OLED_I2C_INST
@@ -912,14 +992,44 @@ void app_task(void)
     // Process BLE transport
     bt_task();
 
-    // NeoPixel: show connection state and active output mode color.
-    // A USB *data host* is dominant (BT is dropped/suppressed while it's
-    // connected), so treat its presence as "connected" — a steady USB color,
-    // not the BT-searching flash. Use the same VBUS+mounted test as the
-    // dominance logic (not usb_gamepad_active(), which is false in CDC mode).
-    bool ble_conn = ble_output_is_connected();
-    bool usb_host = platform_usb_powered() && tud_mounted();
-    leds_set_connected_devices((ble_conn || usb_host) ? 1 : 0);
+    // LED policy. Two independent things to show, and this device can be several
+    // roles at once (BLE device to a console, BT host to controllers, USB gamepad):
+    //
+    //   COLOUR = what we are OUTPUTTING as. A wireless device role dominates: when
+    //            we present ourselves to a console/host over BLE or BT Classic, that
+    //            mode's colour wins over the USB output colour, because that link is
+    //            the interesting one. With no device role, show the USB output mode.
+    //   BLINK  = searching. Advertising and waiting to be paired to as a device, or
+    //            scanning as a host. Either one blinks; solid means connected.
+    //
+    // Note this is about the HOST/console link, not about input controllers -- hence
+    // leds_set_searching(), which blinks even with controllers attached.
+    bool ble_conn    = ble_output_is_connected();
+    bool usb_host    = platform_usb_powered() && tud_mounted();
+    bool ble_dev     = ble_output_role_is_device();
+    bool host_scan   = false;
+    int  host_conns  = 0;
+#if REQUIRE_BT_INPUT
+    host_scan  = btstack_host_is_scanning();
+    // Combined central count despite the name -- it includes BLE links.
+    host_conns = btstack_classic_get_connection_count();
+#endif
+    bool searching;
+    int  connected_n;
+    if (ble_dev) {
+        // Advertising-and-unconnected as a device, or scanning as a host.
+        searching   = !ble_conn || host_scan;
+        connected_n = (ble_conn || usb_host) ? 1 : 0;
+    } else {
+        // Receiver (no wireless device role): the interesting link is the controller
+        // side, so the LED tracks the CENTRAL -- solid once a controller is linked,
+        // blinking while hunting for one. Keying "connected" off usb_host here was
+        // wrong: being plugged in is not the same as having a controller.
+        searching   = host_scan && host_conns == 0;
+        connected_n = host_conns;
+    }
+    leds_set_searching(searching);
+    leds_set_connected_devices(connected_n);
 
     // Track state changes for LED color updates
     static bool last_ble_conn = false;
@@ -930,15 +1040,20 @@ void app_task(void)
     ble_output_mode_t ble_mode = ble_output_get_mode();
     usb_output_mode_t usb_mode = usbd_get_mode();
 
+    static bool last_ble_dev = false;
     if (ble_conn != last_ble_conn || usb_host != last_usb_host ||
+        ble_dev != last_ble_dev ||
         ble_mode != last_ble_mode || usb_mode != last_usb_mode) {
+        last_ble_dev = ble_dev;
         last_ble_conn = ble_conn;
         last_usb_host = usb_host;
         last_ble_mode = ble_mode;
         last_usb_mode = usb_mode;
 
         uint8_t r, g, b;
-        if (ble_conn) {
+        if (ble_dev) {
+            // Wireless device role dominates the colour, connected or not; the
+            // blink above carries the connection state.
             ble_output_get_mode_color(ble_mode, &r, &g, &b);
         } else if (usb_host) {
             usbd_get_mode_color(usb_mode, &r, &g, &b);

@@ -15,6 +15,9 @@
 #ifdef CONFIG_BT_CLASSIC_OUTPUT
 #include "switch_bt/switch_bt.h"
 #endif
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+#include "switch2_ble/switch2_ble.h"
+#endif
 #include "ble_nus.h"
 #include "ble_gamepad.h"  // Generated from ble_gamepad.gatt by compile_gatt.py
 
@@ -56,94 +59,121 @@ extern void feedback_set_rumble(uint8_t player_index, uint8_t left, uint8_t righ
 // HID REPORT DESCRIPTOR — Standard Composite: Keyboard + Mouse + Gamepad
 // ============================================================================
 
+// The keyboard (report ID 1) and mouse (report ID 2) collections are shared: the
+// composite Standard map is these two plus a gamepad, and the dedicated
+// keyboard+mouse mode is these two alone. Kept as one macro so the two maps
+// cannot drift apart -- a mismatch between them would be invisible until a host
+// mis-parsed a report.
+// One source of truth for each collection, so the four maps that use them cannot
+// drift apart: keyboard-only, mouse-only, keyboard+mouse, and the composite
+// Standard map (these two plus a gamepad). Block comments, not //: a // comment
+// followed by a line-continuation swallows the next line.
+#define HID_KBD_COLLECTION \
+      /* ---- Keyboard (Report ID 1) ---- */ \
+    0x05, 0x01,  /* Usage Page (Generic Desktop) */ \
+    0x09, 0x06,  /* Usage (Keyboard) */ \
+    0xA1, 0x01,  /* Collection (Application) */ \
+    0x85, 0x01,  /* Report ID (1) */ \
+ \
+      /* Modifier keys (8 bits) */ \
+    0x05, 0x07,  /* Usage Page (Key Codes) */ \
+    0x19, 0xE0,  /* Usage Minimum (224 - Left Control) */ \
+    0x29, 0xE7,  /* Usage Maximum (231 - Right GUI) */ \
+    0x15, 0x00,  /* Logical Minimum (0) */ \
+    0x25, 0x01,  /* Logical Maximum (1) */ \
+    0x75, 0x01,  /* Report Size (1) */ \
+    0x95, 0x08,  /* Report Count (8) */ \
+    0x81, 0x02,  /* Input (Data, Variable, Absolute) */ \
+ \
+      /* Reserved byte */ \
+    0x95, 0x01,  /* Report Count (1) */ \
+    0x75, 0x08,  /* Report Size (8) */ \
+    0x81, 0x01,  /* Input (Constant) */ \
+ \
+      /* LED output report (Caps/Num/Scroll Lock) */ \
+    0x95, 0x05,  /* Report Count (5) */ \
+    0x75, 0x01,  /* Report Size (1) */ \
+    0x05, 0x08,  /* Usage Page (LEDs) */ \
+    0x19, 0x01,  /* Usage Minimum (1 - Num Lock) */ \
+    0x29, 0x05,  /* Usage Maximum (5 - Kana) */ \
+    0x91, 0x02,  /* Output (Data, Variable, Absolute) */ \
+    0x95, 0x01,  /* Report Count (1) */ \
+    0x75, 0x03,  /* Report Size (3) */ \
+    0x91, 0x01,  /* Output (Constant) - padding */ \
+ \
+      /* Keycodes (6 keys) */ \
+    0x95, 0x06,  /* Report Count (6) */ \
+    0x75, 0x08,  /* Report Size (8) */ \
+    0x15, 0x00,  /* Logical Minimum (0) */ \
+    0x25, 0x65,  /* Logical Maximum (101) */ \
+    0x05, 0x07,  /* Usage Page (Key Codes) */ \
+    0x19, 0x00,  /* Usage Minimum (0) */ \
+    0x29, 0x65,  /* Usage Maximum (101) */ \
+    0x81, 0x00,  /* Input (Data, Array) */ \
+ \
+    0xC0,  /* End Collection */
+
+#define HID_MOUSE_COLLECTION \
+      /* ---- Mouse (Report ID 2) ---- */ \
+    0x05, 0x01,  /* Usage Page (Generic Desktop) */ \
+    0x09, 0x02,  /* Usage (Mouse) */ \
+    0xA1, 0x01,  /* Collection (Application) */ \
+    0x85, 0x02,  /* Report ID (2) */ \
+    0x09, 0x01,  /* Usage (Pointer) */ \
+    0xA1, 0x00,  /* Collection (Physical) */ \
+ \
+      /* 5 Buttons */ \
+    0x05, 0x09,  /* Usage Page (Button) */ \
+    0x19, 0x01,  /* Usage Minimum (1) */ \
+    0x29, 0x05,  /* Usage Maximum (5) */ \
+    0x15, 0x00,  /* Logical Minimum (0) */ \
+    0x25, 0x01,  /* Logical Maximum (1) */ \
+    0x95, 0x05,  /* Report Count (5) */ \
+    0x75, 0x01,  /* Report Size (1) */ \
+    0x81, 0x02,  /* Input (Data, Variable, Absolute) */ \
+ \
+      /* 3 bits padding */ \
+    0x95, 0x01,  /* Report Count (1) */ \
+    0x75, 0x03,  /* Report Size (3) */ \
+    0x81, 0x01,  /* Input (Constant) */ \
+ \
+      /* X, Y movement (-127 to 127) */ \
+    0x05, 0x01,  /* Usage Page (Generic Desktop) */ \
+    0x09, 0x30,  /* Usage (X) */ \
+    0x09, 0x31,  /* Usage (Y) */ \
+    0x15, 0x81,  /* Logical Minimum (-127) */ \
+    0x25, 0x7F,  /* Logical Maximum (127) */ \
+    0x75, 0x08,  /* Report Size (8) */ \
+    0x95, 0x02,  /* Report Count (2) */ \
+    0x81, 0x06,  /* Input (Data, Variable, Relative) */ \
+ \
+      /* Vertical wheel (-127 to 127) */ \
+    0x09, 0x38,  /* Usage (Wheel) */ \
+    0x15, 0x81,  /* Logical Minimum (-127) */ \
+    0x25, 0x7F,  /* Logical Maximum (127) */ \
+    0x75, 0x08,  /* Report Size (8) */ \
+    0x95, 0x01,  /* Report Count (1) */ \
+    0x81, 0x06,  /* Input (Data, Variable, Relative) */ \
+ \
+    0xC0,  /* End Collection (Physical) */ \
+    0xC0,  /* End Collection (Mouse) */
+
+#define HID_KBD_MOUSE_COLLECTIONS HID_KBD_COLLECTION HID_MOUSE_COLLECTION
+
+// Dedicated keyboard only: a host enumerates this purely as a keyboard.
+static const uint8_t kbd_hid_descriptor[] = { HID_KBD_COLLECTION };
+
+// Dedicated mouse only: a host enumerates this purely as a pointer.
+static const uint8_t mouse_hid_descriptor[] = { HID_MOUSE_COLLECTION };
+
+// Dedicated keyboard + mouse: no gamepad collection at all, so a host enumerates
+// this as a keyboard/pointer rather than claiming it as a controller.
+static const uint8_t kbm_hid_descriptor[] = {
+    HID_KBD_MOUSE_COLLECTIONS
+};
+
 static const uint8_t standard_hid_descriptor[] = {
-    // ---- Keyboard (Report ID 1) ----
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x06,        // Usage (Keyboard)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x01,        //   Report ID (1)
-
-    // Modifier keys (8 bits)
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0xE0,        //   Usage Minimum (224 - Left Control)
-    0x29, 0xE7,        //   Usage Maximum (231 - Right GUI)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x75, 0x01,        //   Report Size (1)
-    0x95, 0x08,        //   Report Count (8)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-
-    // Reserved byte
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x01,        //   Input (Constant)
-
-    // LED output report (Caps/Num/Scroll Lock)
-    0x95, 0x05,        //   Report Count (5)
-    0x75, 0x01,        //   Report Size (1)
-    0x05, 0x08,        //   Usage Page (LEDs)
-    0x19, 0x01,        //   Usage Minimum (1 - Num Lock)
-    0x29, 0x05,        //   Usage Maximum (5 - Kana)
-    0x91, 0x02,        //   Output (Data, Variable, Absolute)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x03,        //   Report Size (3)
-    0x91, 0x01,        //   Output (Constant) - padding
-
-    // Keycodes (6 keys)
-    0x95, 0x06,        //   Report Count (6)
-    0x75, 0x08,        //   Report Size (8)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x65,        //   Logical Maximum (101)
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0x00,        //   Usage Minimum (0)
-    0x29, 0x65,        //   Usage Maximum (101)
-    0x81, 0x00,        //   Input (Data, Array)
-
-    0xC0,              // End Collection
-
-    // ---- Mouse (Report ID 2) ----
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x02,        // Usage (Mouse)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x02,        //   Report ID (2)
-    0x09, 0x01,        //   Usage (Pointer)
-    0xA1, 0x00,        //   Collection (Physical)
-
-    // 5 Buttons
-    0x05, 0x09,        //     Usage Page (Button)
-    0x19, 0x01,        //     Usage Minimum (1)
-    0x29, 0x05,        //     Usage Maximum (5)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x01,        //     Logical Maximum (1)
-    0x95, 0x05,        //     Report Count (5)
-    0x75, 0x01,        //     Report Size (1)
-    0x81, 0x02,        //     Input (Data, Variable, Absolute)
-
-    // 3 bits padding
-    0x95, 0x01,        //     Report Count (1)
-    0x75, 0x03,        //     Report Size (3)
-    0x81, 0x01,        //     Input (Constant)
-
-    // X, Y movement (-127 to 127)
-    0x05, 0x01,        //     Usage Page (Generic Desktop)
-    0x09, 0x30,        //     Usage (X)
-    0x09, 0x31,        //     Usage (Y)
-    0x15, 0x81,        //     Logical Minimum (-127)
-    0x25, 0x7F,        //     Logical Maximum (127)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x02,        //     Report Count (2)
-    0x81, 0x06,        //     Input (Data, Variable, Relative)
-
-    // Vertical wheel (-127 to 127)
-    0x09, 0x38,        //     Usage (Wheel)
-    0x15, 0x81,        //     Logical Minimum (-127)
-    0x25, 0x7F,        //     Logical Maximum (127)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x81, 0x06,        //     Input (Data, Variable, Relative)
-
-    0xC0,              //   End Collection (Physical)
-    0xC0,              // End Collection (Mouse)
+    HID_KBD_MOUSE_COLLECTIONS
 
     // ---- Gamepad (Report ID 3) ----
     0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
@@ -352,6 +382,9 @@ static void set_adv(bool on)
 
 bool ble_output_is_connected(void)
 {
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    if (ble_output_get_mode() == BLE_MODE_SWITCH2) return switch2_ble_is_connected();
+#endif
     return ble_connected;
 }
 
@@ -432,6 +465,10 @@ static const uint8_t sinput_kbd_mouse_tail[] = {
 
 // Mode (loaded from flash on init)
 static ble_output_mode_t current_mode = BLE_MODE_STANDARD;
+// True once the BLE/BT *device* role is actually up (advertising or connectable).
+// The LED uses this to decide whether a wireless device colour should dominate the
+// USB output colour; before late_init there is no such role to show.
+static bool device_role_up = false;
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static btstack_packet_callback_registration_t sm_event_callback_registration;
@@ -619,14 +656,55 @@ static void request_send_on_btstack_thread(void *context)
     }
 }
 
+// When the last send request was made, for the stall watchdog in
+// ble_output_send_stall_task(). Nothing acknowledges a can-send-now request, so
+// a lost one is silent and permanent.
+static volatile uint32_t send_req_ms;
+
 static void ble_request_can_send_now(uint16_t handle)
 {
     send_req_handle = handle;
+    send_req_ms = btstack_run_loop_get_time_ms();
     if (send_req_queued) return;  // marshal already in flight; it sends latest
     send_req_queued = true;
     send_req_marshal.callback = &request_send_on_btstack_thread;
     send_req_marshal.context = NULL;
     btstack_run_loop_execute_on_main_thread(&send_req_marshal);
+}
+
+// Recover a wedged send path. Two ways it can stick, both observed on hardware
+// as "connected and subscribed, zero reports, forever":
+//
+//  * send_req_queued never clears. It coalesces requests, so if the marshalled
+//    callback is ever lost, every later request returns early and no report is
+//    ever queued again.
+//  * pending_type stays PENDING_SINPUT_FEATURE. The SInput task deliberately
+//    stashes input behind an in-flight feature response, so a feature that never
+//    goes out holds every subsequent input hostage.
+//
+// Neither is self-correcting, and the controller looks dead while the link is
+// perfectly healthy. If something has been queued for a while with no
+// CAN_SEND_NOW serviced, re-arm: clear the coalescing flag, drop a feature that
+// is going nowhere, and ask again.
+#define BLE_SEND_STALL_MS 400
+static void ble_output_send_stall_task(void)
+{
+    if (!ble_connected || con_handle == HCI_CON_HANDLE_INVALID) return;
+    if (pending_type == PENDING_NONE) return;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if ((uint32_t)(now - send_req_ms) < BLE_SEND_STALL_MS) return;
+
+    bt_diag_mark(0xC10000FFu);   // send path re-armed
+    if (pending_type == PENDING_SINPUT_FEATURE) {
+        // The feature response is not getting out; stop letting it block input.
+        pending_type = sinput_input_after_feature ? PENDING_SINPUT : PENDING_NONE;
+        sinput_input_after_feature = false;
+    }
+    send_req_queued = false;
+    send_req_ms = now;
+    if (pending_type != PENDING_NONE) {
+        ble_request_can_send_now(con_handle);
+    }
 }
 
 static btstack_context_callback_registration_t hid2_req_marshal;
@@ -652,14 +730,40 @@ static void hid2_request_can_send_now(uint16_t handle)
 }
 #else
 // Single-threaded ports (Pico W): direct call, same context as BTstack.
+static volatile uint32_t send_req_ms;
+
 static void ble_request_can_send_now(uint16_t handle)
 {
+    send_req_ms = btstack_run_loop_get_time_ms();
     hids_device_request_can_send_now_event(handle);
 }
 
 static void hid2_request_can_send_now(uint16_t handle)
 {
     hid2_request_send(handle);
+}
+
+// Same stall recovery as the marshalled ports, minus the coalescing flag they
+// have to clear. There is still one way to wedge here: the SInput task parks
+// input behind an in-flight feature response, so a feature that never goes out
+// holds every later input hostage and the pad looks dead on a healthy link.
+#define BLE_SEND_STALL_MS 400
+static void ble_output_send_stall_task(void)
+{
+    if (!ble_connected || con_handle == HCI_CON_HANDLE_INVALID) return;
+    if (pending_type == PENDING_NONE) return;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if ((uint32_t)(now - send_req_ms) < BLE_SEND_STALL_MS) return;
+
+    bt_diag_mark(0xC10000FFu);   // send path re-armed
+    if (pending_type == PENDING_SINPUT_FEATURE) {
+        pending_type = sinput_input_after_feature ? PENDING_SINPUT : PENDING_NONE;
+        sinput_input_after_feature = false;
+    }
+    send_req_ms = now;
+    if (pending_type != PENDING_NONE) {
+        ble_request_can_send_now(con_handle);
+    }
 }
 #endif
 
@@ -712,6 +816,81 @@ static const uint8_t scan_resp_standard[] = {
     0x14, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
     'J', 'o', 'y', 'p', 'a', 'd', 'O', 'S', ' ',
     'C', 'o', 'n', 't', 'r', 'o', 'l', 'l', 'e', 'r',
+};
+
+// Per-mode GAP name. One source of truth: the advertising arrays below embed it,
+// gap_set_local_name() publishes it, and the GAP Device Name characteristic is
+// served from here so a host reads the same name after connecting that it saw
+// while scanning. Keep each name's length in step with its adv array -- the
+// legacy advertising payload is capped at 31 bytes.
+#define BLE_SINPUT_NAME "JoypadOS (SInput)"
+
+static const char *mode_gap_name(ble_output_mode_t mode)
+{
+    switch (mode) {
+        case BLE_MODE_XBOX:   return "Joypad Xinput";
+        case BLE_MODE_KBM:    return "Joypad KB+Mouse";
+        case BLE_MODE_KBD:    return "Joypad Keyboard";
+        case BLE_MODE_MOUSE:  return "Joypad Mouse";
+        case BLE_MODE_SINPUT: return BLE_SINPUT_NAME;
+        default:              return "JoypadOS Controller";
+    }
+}
+
+// SInput's name lives in the scan response, like standard mode's. It cannot go
+// in the primary packet: flags(3) + HID UUID(4) + appearance(4) = 11 leaves 20,
+// and the 128-bit NUS UUID alone is 18 of those. Evicting NUS to make room was
+// tried and reverted -- NUS has to be in the PRIMARY packet because that is what
+// companion-app discovery filters on (a NUS-filtered scan stopped finding the
+// device entirely), and the name buys nothing in exchange: our own central
+// defers one advertisement for the scan response and then connects as generic
+// regardless, so it never needed the name inline.
+static const uint8_t scan_resp_sinput[] = {
+    0x12, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'J', 'o', 'y', 'p', 'a', 'd', 'O', 'S', ' ',
+    '(', 'S', 'I', 'n', 'p', 'u', 't', ')',
+};
+
+static const uint8_t adv_data_kbd[] = {
+    0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
+    // Complete local name: "Joypad Keyboard"
+    0x10, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'J', 'o', 'y', 'p', 'a', 'd', ' ',
+    'K', 'e', 'y', 'b', 'o', 'a', 'r', 'd',
+    0x03, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE & 0xFF,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE >> 8,
+    // Appearance: Keyboard (0x03C1)
+    0x03, BLUETOOTH_DATA_TYPE_APPEARANCE, 0xC1, 0x03,
+};
+
+static const uint8_t adv_data_mouse[] = {
+    0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
+    // Complete local name: "Joypad Mouse"
+    0x0D, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'J', 'o', 'y', 'p', 'a', 'd', ' ',
+    'M', 'o', 'u', 's', 'e',
+    0x03, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE & 0xFF,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE >> 8,
+    // Appearance: Mouse (0x03C2)
+    0x03, BLUETOOTH_DATA_TYPE_APPEARANCE, 0xC2, 0x03,
+};
+
+static const uint8_t adv_data_kbm[] = {
+    // Flags: general discoverable, BR/EDR not supported
+    0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
+    // Complete local name: "Joypad KB+Mouse"
+    0x10, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'J', 'o', 'y', 'p', 'a', 'd', ' ',
+    'K', 'B', '+', 'M', 'o', 'u', 's', 'e',
+    // 16-bit Service UUIDs: HID Service
+    0x03, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE & 0xFF,
+    ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE >> 8,
+    // Appearance: Keyboard (0x03C1) — a gamepad appearance here makes hosts claim
+    // the device as a controller and stop dispatching keystrokes.
+    0x03, BLUETOOTH_DATA_TYPE_APPEARANCE, 0xC1, 0x03,
 };
 
 static const uint8_t adv_data_xbox[] = {
@@ -1009,6 +1188,17 @@ void ble_output_init(void)
     }
 #endif
 
+#ifdef CONFIG_BLE_DEFAULT_MODE
+    // A build that pins its own default mode, for a board where the mode can't
+    // be chosen at runtime: a bare dongle has no buttons, and macOS does not
+    // always attach a tty to the CDC interface, which leaves BLE.MODE.SET out
+    // of reach. An explicit user selection still wins.
+    if (!(settings && settings->ble_mode_saved) &&
+        ble_output_mode_available((ble_output_mode_t)CONFIG_BLE_DEFAULT_MODE)) {
+        current_mode = (ble_output_mode_t)CONFIG_BLE_DEFAULT_MODE;
+    }
+#endif
+
     printf("[ble_output] Initializing BLE output (mode: %s)\n",
            ble_output_get_mode_name(current_mode));
 
@@ -1034,6 +1224,28 @@ void ble_output_init(void)
 #ifdef CONFIG_BT_CLASSIC_OUTPUT
     if (current_mode == BLE_MODE_SWITCH_BT) switch_bt_init();
 #endif
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    if (current_mode == BLE_MODE_SWITCH2) switch2_ble_init();
+#endif
+}
+
+// ATT read callback. The composite GATT declares GAP Device Name DYNAMIC so the
+// name a host reads after connecting is the same one it saw advertised -- it used
+// to be a single baked-in "JoypadOS Controller" shared by every non-Xbox mode,
+// so a keyboard or an SInput pad reported a name it never advertised. Returning
+// 0 for anything else leaves the static database and hids_device's own service
+// handler untouched.
+static uint16_t att_read_callback(hci_con_handle_t con_handle, uint16_t attribute_handle,
+                                  uint16_t offset, uint8_t *buffer, uint16_t buffer_size)
+{
+    (void)con_handle;
+    if (current_mode != BLE_MODE_XBOX &&
+        attribute_handle == ATT_CHARACTERISTIC_GAP_DEVICE_NAME_01_VALUE_HANDLE) {
+        const char *name = mode_gap_name(current_mode);
+        return att_read_callback_handle_blob((const uint8_t *)name, (uint16_t)strlen(name),
+                                             offset, buffer, buffer_size);
+    }
+    return 0;
 }
 
 // ATT write callback — debug logging for all GATT writes
@@ -1091,7 +1303,11 @@ static void usb_dom_timer_handler(btstack_timer_source_t *ts)
 void ble_output_late_init(void)
 {
 #ifdef CONFIG_BT_CLASSIC_OUTPUT
-    if (current_mode == BLE_MODE_SWITCH_BT) { switch_bt_late_init(); return; }
+    if (current_mode == BLE_MODE_SWITCH_BT) { switch_bt_late_init(); device_role_up = true; return; }
+#endif
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    // Own GATT table, advertising and pairing — none of the HOGP setup below applies.
+    if (current_mode == BLE_MODE_SWITCH2) { switch2_ble_late_init(); device_role_up = true; return; }
 #endif
     printf("[ble_output] Setting up BLE GATT services (mode: %s)\n",
            ble_output_get_mode_name(current_mode));
@@ -1105,7 +1321,7 @@ void ble_output_late_init(void)
         ? ble_xbox_profile_data : profile_data;
     printf("[ble_output] Using %s GATT database (ptr=%p)\n",
            (current_mode == BLE_MODE_XBOX) ? "Xbox" : "Standard", gatt_db);
-    att_server_init(gatt_db, NULL, att_write_callback);
+    att_server_init(gatt_db, att_read_callback, att_write_callback);
 
 #ifdef SINPUT_BLE_COMPOSITE
     // HID service instance #2 (keyboard + mouse), SInput mode only. hids_device
@@ -1152,6 +1368,18 @@ void ble_output_late_init(void)
         // 0x0B13, product version 0x0509 — the identity verified to make
         // Windows load its own Xbox driver against this report map.
         device_information_service_server_set_pnp_id(0x02, 0x045E, 0x0B13, 0x0509);
+    } else if (current_mode == BLE_MODE_KBM || current_mode == BLE_MODE_KBD ||
+               current_mode == BLE_MODE_MOUSE) {
+        device_information_service_server_set_manufacturer_name("Joypad");
+        device_information_service_server_set_model_number(
+            current_mode == BLE_MODE_KBD   ? "Joypad Keyboard" :
+            current_mode == BLE_MODE_MOUSE ? "Joypad Mouse"    : "Joypad KB+Mouse");
+        device_information_service_server_set_software_revision("1.0.0");
+        // PnP ID: Bluetooth SIG (0x01), a distinct PID per mode so hosts do not
+        // confuse these with the composite gamepad identity or each other.
+        device_information_service_server_set_pnp_id(0x01, 0xe502,
+            current_mode == BLE_MODE_KBD ? 0xbbad :
+            current_mode == BLE_MODE_MOUSE ? 0xbbae : 0xbbac, 0x0100);
     } else if (current_mode == BLE_MODE_SINPUT) {
         device_information_service_server_set_manufacturer_name(SINPUT_MANUFACTURER);
         device_information_service_server_set_model_number(SINPUT_PRODUCT);
@@ -1172,6 +1400,17 @@ void ble_output_late_init(void)
     if (current_mode == BLE_MODE_XBOX) {
         hid_desc = ble_xbox_get_descriptor();
         hid_desc_size = ble_xbox_get_descriptor_size();
+    } else if (current_mode == BLE_MODE_KBM) {
+        // Keyboard (ID 1) + mouse (ID 2) only, no gamepad collection. Same report
+        // IDs as the composite, so the existing send path needs no special casing.
+        hid_desc = kbm_hid_descriptor;
+        hid_desc_size = sizeof(kbm_hid_descriptor);
+    } else if (current_mode == BLE_MODE_KBD) {
+        hid_desc = kbd_hid_descriptor;
+        hid_desc_size = sizeof(kbd_hid_descriptor);
+    } else if (current_mode == BLE_MODE_MOUSE) {
+        hid_desc = mouse_hid_descriptor;
+        hid_desc_size = sizeof(mouse_hid_descriptor);
     } else if (current_mode == BLE_MODE_SINPUT) {
         // Pure SInput gamepad map on HID service #1. The composite's keyboard
         // and mouse live on HID service #2 (sinput_kbd_mouse_tail) — see the
@@ -1217,20 +1456,45 @@ void ble_output_late_init(void)
     }
 #endif
 
+#ifdef CONFIG_BLE_PER_MODE_IDENTITY
+#ifndef BTSTACK_USE_NRF
+    // Give each mode its own permanent address so hosts never reuse a cached GATT
+    // database across a mode switch. On nRF this is applied by the transport inside
+    // the HCI init sequence instead -- post-init runs before power-on there, so
+    // anything set here would be overwritten (see nrf_apply_local_addr).
+    {
+        bd_addr_t mode_addr;
+        if (ble_output_get_mode_addr(current_mode, mode_addr)) {
+            gap_random_address_set(mode_addr);
+            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+            printf("[ble_output] per-mode static random addr %s (mode %d)\n",
+                   bd_addr_to_str(mode_addr), (int)current_mode);
+        }
+    }
+#endif
+#endif
+
     // Mode-dependent GAP name and advertising
     const char *gap_name;
     const uint8_t *adv_data;
     uint16_t adv_data_len;
+    gap_name = mode_gap_name(current_mode);
     if (current_mode == BLE_MODE_XBOX) {
-        gap_name = "Joypad Xinput";
         adv_data = adv_data_xbox;
         adv_data_len = sizeof(adv_data_xbox);
+    } else if (current_mode == BLE_MODE_KBM) {
+        adv_data = adv_data_kbm;
+        adv_data_len = sizeof(adv_data_kbm);
+    } else if (current_mode == BLE_MODE_KBD) {
+        adv_data = adv_data_kbd;
+        adv_data_len = sizeof(adv_data_kbd);
+    } else if (current_mode == BLE_MODE_MOUSE) {
+        adv_data = adv_data_mouse;
+        adv_data_len = sizeof(adv_data_mouse);
     } else if (current_mode == BLE_MODE_SINPUT) {
-        gap_name = "Joypad SInput";
-        adv_data = adv_data_standard;  // generic HID adv (appearance = gamepad)
+        adv_data = adv_data_standard;  // generic HID adv (appearance = gamepad) + NUS
         adv_data_len = sizeof(adv_data_standard);
     } else {
-        gap_name = "JoypadOS Controller";
         adv_data = adv_data_standard;
         adv_data_len = sizeof(adv_data_standard);
     }
@@ -1242,12 +1506,22 @@ void ble_output_late_init(void)
     memset(null_addr, 0, 6);
     gap_advertisements_set_params(adv_int_min, adv_int_max, 0, 0, null_addr, 0x07, 0x00);
     gap_advertisements_set_data(adv_data_len, (uint8_t *)adv_data);
-    // Standard mode keeps the complete name in the scan response (the primary
-    // adv packet has no room — see adv_data_standard note). Xbox mode's name
-    // fits in its adv packet, so no scan response needed there.
-    if (current_mode != BLE_MODE_XBOX) {
+    // Scan response per mode. Standard is the only one with no room for its name
+    // in the primary packet, so it alone puts the name here. The modes that do
+    // carry their name inline (SInput, KBM, keyboard, mouse) advertise the NUS
+    // UUID here instead -- they used to get scan_resp_standard too, which meant a
+    // keyboard advertised "Joypad Keyboard" in one packet and "JoypadOS
+    // Controller" in the other and hosts could show either. Xbox mode sets no
+    // scan response at all (its GATT has no NUS, and its name is inline).
+    if (current_mode == BLE_MODE_STANDARD) {
         gap_scan_response_set_data(sizeof(scan_resp_standard), (uint8_t *)scan_resp_standard);
+    } else if (current_mode == BLE_MODE_SINPUT) {
+        gap_scan_response_set_data(sizeof(scan_resp_sinput), (uint8_t *)scan_resp_sinput);
     }
+    // KBM/keyboard/mouse carry their name in the primary packet already, and Xbox
+    // mode sets no scan response at all. They used to be handed
+    // scan_resp_standard, so a keyboard advertised "Joypad Keyboard" in one
+    // packet and "JoypadOS Controller" in the other and a host could show either.
     // Always advertise: wireless policy only routes input, never turns BT off.
     set_adv(true);
 
@@ -1264,11 +1538,14 @@ void ble_output_late_init(void)
     // SInput modes share the composite GATT (which includes NUS); Xbox mode uses
     // a different GATT profile without NUS. SDL matches SInput by VID/PID + HID,
     // so the extra NUS service is inert to it.
-    if (current_mode == BLE_MODE_STANDARD || current_mode == BLE_MODE_SINPUT) {
+    if (current_mode == BLE_MODE_STANDARD || current_mode == BLE_MODE_SINPUT ||
+        current_mode == BLE_MODE_KBM || current_mode == BLE_MODE_KBD ||
+        current_mode == BLE_MODE_MOUSE) {
         ble_nus_init();
     }
 
     printf("[ble_output] BLE advertising as '%s'\n", gap_name);
+    device_role_up = true;
 }
 
 // ============================================================================
@@ -1293,6 +1570,8 @@ static void ble_output_task_standard(void)
         // against what will actually go out — the queued report when one is
         // still waiting for CAN_SEND_NOW — and overwrite it, never drop.
         case INPUT_TYPE_KEYBOARD: {
+            // Mouse-only map has no keyboard collection.
+            if (current_mode == BLE_MODE_MOUSE) return;
             ble_keyboard_report_t report;
             ble_keyboard_report_from_event(event, &report);
             const ble_keyboard_report_t *ref = (pending_type == PENDING_KEYBOARD)
@@ -1305,6 +1584,8 @@ static void ble_output_task_standard(void)
         }
 
         case INPUT_TYPE_MOUSE: {
+            // Keyboard-only map has no mouse collection.
+            if (current_mode == BLE_MODE_KBD) return;
             ble_mouse_report_t report;
             ble_mouse_report_from_event(event, &report);
             const ble_mouse_report_t *ref = (pending_type == PENDING_MOUSE)
@@ -1317,6 +1598,11 @@ static void ble_output_task_standard(void)
         }
 
         default: {
+            // None of the dedicated maps carry a gamepad collection, so a gamepad
+            // event has no report to go out on -- sending one would be a report ID
+            // the host never agreed to.
+            if (current_mode == BLE_MODE_KBM || current_mode == BLE_MODE_KBD ||
+                current_mode == BLE_MODE_MOUSE) return;
             #define SCALE_8_TO_16(v) ((int16_t)((uint32_t)(v) * 32767 / 255))
             ble_gamepad_report_t report;
             uint16_t buttons = convert_buttons(event->buttons);
@@ -1490,7 +1776,13 @@ void ble_output_task(void)
 #ifdef CONFIG_BT_CLASSIC_OUTPUT
     if (current_mode == BLE_MODE_SWITCH_BT) { switch_bt_task(); return; }
 #endif
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    if (current_mode == BLE_MODE_SWITCH2) { switch2_ble_task(); return; }
+#endif
     if (!ble_connected || con_handle == HCI_CON_HANDLE_INVALID) return;
+
+    // Before building anything new, make sure the send path is not wedged.
+    ble_output_send_stall_task();
 
     if (current_mode == BLE_MODE_XBOX) {
         ble_output_task_xbox();
@@ -1504,6 +1796,11 @@ void ble_output_task(void)
 // ============================================================================
 // MODE SELECTION
 // ============================================================================
+
+bool ble_output_role_is_device(void)
+{
+    return device_role_up;
+}
 
 ble_output_mode_t ble_output_get_mode(void)
 {
@@ -1554,6 +1851,10 @@ const char* ble_output_get_mode_name(ble_output_mode_t mode)
         case BLE_MODE_XBOX:      return "Xbox BLE";
         case BLE_MODE_SINPUT:    return "SInput BLE";
         case BLE_MODE_SWITCH_BT: return "Switch (BT)";
+        case BLE_MODE_SWITCH2:   return "Switch 2 (BLE)";
+        case BLE_MODE_KBM:       return "Keyboard+Mouse BLE";
+        case BLE_MODE_KBD:       return "Keyboard BLE";
+        case BLE_MODE_MOUSE:     return "Mouse BLE";
         default:                 return "Unknown";
     }
 }
@@ -1561,12 +1862,68 @@ const char* ble_output_get_mode_name(ble_output_mode_t mode)
 void ble_output_get_mode_color(ble_output_mode_t mode, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     switch (mode) {
+        // Boards like the Makerdiary MDK drive three discrete GPIOs, so set_color()
+        // reduces every colour to (r>0, g>0, b>0) -- only the 7 non-black on/off
+        // combinations are distinguishable, and these use all 7. Keep them aligned
+        // with usbd_get_mode_color() so a function means the same colour on either
+        // transport (SInput white, keyboard+mouse yellow, Xbox green, Switch red).
         case BLE_MODE_STANDARD:  *r = 0; *g = 0; *b = 64; break;   // Blue
         case BLE_MODE_XBOX:      *r = 0; *g = 64; *b = 0; break;   // Green
-        case BLE_MODE_SINPUT:    *r = 0; *g = 32; *b = 64; break;  // Cyan
+        case BLE_MODE_KBD:       *r = 0; *g = 64; *b = 64; break;  // Cyan
+        case BLE_MODE_MOUSE:     *r = 64; *g = 0; *b = 64; break;  // Magenta
+        case BLE_MODE_KBM:       *r = 64; *g = 64; *b = 0; break;  // Yellow
+        // White, matching USB_OUTPUT_MODE_SINPUT. Per-channel kept low because
+        // white stacks all three, so the total brightness matches the
+        // single-channel colours instead of swamping them.
+        case BLE_MODE_SINPUT:    *r = 10; *g = 10; *b = 10; break; // White
         case BLE_MODE_SWITCH_BT: *r = 64; *g = 0; *b = 0; break;   // Red (Switch/Classic)
+        // Switch 2: RED, same family as Switch. Was (64,0,24) to be a distinct
+        // magenta-red on a true NeoPixel, but boards like the Makerdiary MDK drive
+        // three discrete GPIOs where set_color() reduces to (r>0, g>0, b>0) -- so
+        // any non-zero blue became FULL blue and the LED showed purple. Keep every
+        // mode colour on channels that survive that reduction.
+        case BLE_MODE_SWITCH2:   *r = 64; *g = 0; *b = 0; break;   // Red (Switch 2)
         default:                 *r = 64; *g = 64; *b = 64; break;  // White
     }
+}
+
+// ============================================================================
+// PER-MODE BLE IDENTITY (see ble_output.h for why)
+// ============================================================================
+
+bool ble_output_get_mode_addr(ble_output_mode_t mode, bd_addr_t out)
+{
+    uint8_t nonce;
+    switch (mode) {
+        case BLE_MODE_STANDARD: nonce = BLE_IDENT_STANDARD; break;
+        case BLE_MODE_XBOX:     nonce = BLE_IDENT_XBOX;     break;
+        case BLE_MODE_SINPUT:   nonce = BLE_IDENT_SINPUT;   break;
+        case BLE_MODE_KBM:      nonce = BLE_IDENT_KBM;      break;
+        case BLE_MODE_KBD:      nonce = BLE_IDENT_KBD;      break;
+        case BLE_MODE_MOUSE:    nonce = BLE_IDENT_MOUSE;    break;
+        default:
+            // Switch 2 (public Nintendo address) and Switch-BT (Classic) own their
+            // identity; the caller must not override it.
+            return false;
+    }
+
+    uint8_t id[8] = {0};
+    platform_get_unique_id(id, sizeof(id));
+
+    // Spread the nonce over several bytes so two modes can never collide on a
+    // board whose id bytes happen to be sparse, and force the two top bits of the
+    // most significant byte to 0b11, which is what makes it a random STATIC
+    // address rather than a private one.
+    out[0] = (uint8_t)(0xC0 | ((id[0] ^ nonce) & 0x3F));
+    out[1] = (uint8_t)(id[1] ^ (uint8_t)(nonce * 0x55u));
+    out[2] = id[2];
+    out[3] = id[3];
+    out[4] = (uint8_t)(id[4] ^ (uint8_t)(nonce << 3));
+    out[5] = (uint8_t)(id[5] ^ nonce);
+
+    // An all-zero or all-ones static address is not valid.
+    if ((out[1] | out[2] | out[3] | out[4] | out[5]) == 0x00) out[5] = 0x5A;
+    return true;
 }
 
 // ============================================================================

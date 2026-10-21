@@ -27,6 +27,14 @@
 #ifdef CONFIG_UNIVERSAL
 #include "imu_nrf.h"
 #include "bt/ble_output/ble_output.h"
+
+#ifdef CONFIG_MAX3421
+// The USB Host FeatherWing is optional on this board: the host stack is always
+// compiled in, and usbh_init() probes for the chip before bringing it up. These
+// gate the host-side paths main() owns so a bare board runs cleanly.
+extern bool max3421_is_detected(void);
+extern void max3421_host_enable_int(void);
+#endif
 #endif
 
 // App layer
@@ -86,6 +94,19 @@ __noinit static uint32_t bt_trace_magic;
 __noinit static uint32_t bt_trace_ring[BT_TRACE_N];
 __noinit static uint32_t bt_trace_idx;
 
+/* Link-layer CPR interval minimum, in 1.25 ms units, read by the patched
+ * controller (ull_internal.h / ull_conn.c / ull_peripheral.c).
+ *
+ * 6 = the 7.5 ms Bluetooth floor, which is what every mode should run. Switch 2
+ * output lowers it to 4 (5 ms) because the console drives the link that fast;
+ * see switch2_ble_late_init. It MUST stay at the floor otherwise: lowering it
+ * for the whole binary also loosened the central path, and the link layer then
+ * asserted (reason 0xB7, which force-resets the dongle) while connecting to an
+ * ordinary BLE controller. Switch 2 output and the BLE central are never active
+ * together, so the two needs do not collide.
+ */
+unsigned char joypad_le_interval_min = 6;
+
 void bt_diag_mark(uint32_t code)
 {
     if (bt_trace_magic != BT_TRACE_MAGIC) {
@@ -99,7 +120,13 @@ void bt_diag_mark(uint32_t code)
     // (0xE03E: connection complete, param/PHY updates). Per-packet marks
     // (other HCI events, ACL 0xACC0) stay ring-only — printf in the
     // cooperative BTstack thread is a polled-UART stall.
-    if ((code >> 28) == 0xC || (code >> 16) == 0xE03E) {
+    // Subevent 0x02 is LE Advertising Report — one per advertisement seen, so it
+    // is emphatically NOT low-rate while scanning. Printing it floods the CDC log
+    // (burying every useful host/HID line) and, per the note above, stalls the
+    // cooperative BTstack thread on a polled UART for each report — during exactly
+    // the window where connection setup is timing-sensitive. Ring-only.
+    if ((code >> 28) == 0xC ||
+        ((code >> 16) == 0xE03E && (code & 0xFFFF) != 0x0002)) {
         printf("[btdiag] mark %08x\n", (unsigned)code);
     }
 }
@@ -452,10 +479,13 @@ int main(void)
     usb_power_init();
 
 #ifdef CONFIG_MAX3421
-    // Enable MAX3421E interrupt now that TinyUSB host is initialized
+    // Enable MAX3421E interrupt now that TinyUSB host is initialized.
+    // Skipped when the chip is absent: the host stack is compiled in whether or
+    // not the FeatherWing is fitted, and usbh_init() already runs the full
+    // probe-then-init-then-arm sequence when it is. Arming here regardless
+    // would point an IRQ at a host that was never initialized.
     {
-        extern void max3421_host_enable_int(void);
-        max3421_host_enable_int();
+        if (max3421_is_detected()) max3421_host_enable_int();
     }
 #endif
 
@@ -477,8 +507,11 @@ int main(void)
         tud_task_ext(0, false);
 
 #ifdef CONFIG_MAX3421
-        // Process TinyUSB host events (MAX3421E ISR handles SPI directly)
-        tuh_task_ext(0, false);
+        // Process TinyUSB host events (MAX3421E ISR handles SPI directly).
+        // No chip means no host was ever initialized, so there is nothing to
+        // pump -- and on this board that is a supported configuration, not a
+        // fault (the USB Host FeatherWing is optional).
+        if (max3421_is_detected()) tuh_task_ext(0, false);
 
         // Periodic diagnostic (every 5s for first 60s)
         {

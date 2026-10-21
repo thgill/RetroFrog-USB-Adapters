@@ -75,6 +75,9 @@ __attribute__((weak)) bool btstack_classic_send_report(uint8_t idx, uint8_t id, 
 #include "btstack_tlv.h"
 #include "btstack_tlv_none.h"
 #include "btstack_chipset_zephyr.h"
+#if defined(CONFIG_SWITCH2_BLE_OUTPUT) || defined(CONFIG_BLE_PER_MODE_IDENTITY)
+#include "bt/ble_output/ble_output.h"
+#endif
 #include "bluetooth_company_id.h"
 #include "hci.h"
 #include "hci_dump.h"
@@ -274,9 +277,126 @@ static void nrf_get_static_random_addr(bd_addr_t addr)
 #endif
 }
 
+
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+// ---------------------------------------------------------------------------
+// Switch 2 output: a PUBLIC address, programmed during HCI init.
+//
+// The console stores the controller's address during the 0x15 exchange and
+// matches it on reconnect, and a real Pro Controller 2 is public — the nRF has
+// no factory public address, and the static random one we install for every
+// other mode is what the console appears to ignore.
+//
+// Zephyr's open link layer (which this mode needs anyway for the 5 ms interval)
+// implements the standard vendor command to write one. It has to happen HERE,
+// through BTstack's chipset hook, rather than later from the app: changing the
+// address after the stack has configured advertising leaves the radio silently
+// not transmitting, with every advertising command still reporting success.
+// ---------------------------------------------------------------------------
+#define HCI_OPCODE_VS_WRITE_BD_ADDR 0xFC06
+
+static void switch2_set_bd_addr_command(bd_addr_t addr, uint8_t *hci_cmd_buffer)
+{
+    little_endian_store_16(hci_cmd_buffer, 0, HCI_OPCODE_VS_WRITE_BD_ADDR);
+    hci_cmd_buffer[2] = 6;
+    reverse_bd_addr(addr, &hci_cmd_buffer[3]);
+}
+
+// No init script: the stock zephyr chipset's static-address read is exactly
+// what we are avoiding in this mode.
+static const btstack_chipset_t switch2_chipset = {
+    "zephyr-switch2",
+    NULL,
+    NULL,
+    NULL,
+    switch2_set_bd_addr_command,
+};
+
+// OUI 98:E2:55 — the real Pro Controller 2's, from the capture where it reports
+// its own address in the 0x15/0x01 exchange (tests/switch2_proto pairing_r3:
+// ... 88 16 c2 55 e2 98 -> 98:E2:55:C2:16:88). The console does NOT filter on
+// the prefix (espp pairs from an Espressif MAC); this just matches a real pad.
+// What does matter: the address must be PUBLIC and stable across boots, since
+// the console bonds to it. Suffix from FICR, so it is also unique per dongle.
+static void nrf_get_nintendo_public_addr(bd_addr_t addr)
+{
+    bd_addr_t uniq;
+    nrf_get_static_random_addr(uniq);
+    // OUI 94:8E:6D — taken off the air from the user's own Pro Controller 2
+    // (94:8e:6d:2d:f2:29), which pairs with their console. A sniffer capture put
+    // our advertisement and that pad's side by side: identical payload, identical
+    // ADV_IND header (0x2520, ChSel #2, TxAdd Public), identical length. The
+    // address was the ONLY difference in the whole packet, so match its OUI too.
+    // (98:E2:55 is also a registered Nintendo OUI and came from ndeadly's capture
+    // of a different pad, but it is not the one this console is known to accept.)
+#ifdef CONFIG_SWITCH2_ADDR_OUI
+    // Bring-up experiment: override the OUI to settle whether the console actually
+    // requires a Nintendo prefix. This is the one variable we cannot change on a
+    // Pico W (CYW43 acks vendor 0xFC01 with status 0x00 and keeps its OTP address),
+    // so the question has to be answered on hardware that can. Build with e.g.
+    //   CONFIG_SWITCH2_ADDR_OUI=0x28CDC1   (Raspberry Pi, same as a Pico W)
+    addr[0] = (uint8_t)((CONFIG_SWITCH2_ADDR_OUI >> 16) & 0xFF);
+    addr[1] = (uint8_t)((CONFIG_SWITCH2_ADDR_OUI >> 8) & 0xFF);
+    addr[2] = (uint8_t)(CONFIG_SWITCH2_ADDR_OUI & 0xFF);
+#else
+    addr[0] = 0x94; addr[1] = 0x8E; addr[2] = 0x6D;
+#endif
+    addr[3] = uniq[3]; addr[4] = uniq[4]; addr[5] = uniq[5];
+#ifdef CONFIG_SWITCH2_ADDR_SALT
+    // Bring-up only: present a different controller identity. A console that
+    // connected once and failed to pair will not re-attempt the same address,
+    // so a fresh one is the only way to get another connection attempt out of
+    // it without clearing its side. Bump the salt for each new identity.
+    addr[5] ^= (uint8_t)CONFIG_SWITCH2_ADDR_SALT;
+    addr[4] ^= (uint8_t)(CONFIG_SWITCH2_ADDR_SALT >> 8);
+#endif
+}
+#endif  // CONFIG_SWITCH2_BLE_OUTPUT
+
 // ============================================================================
 // BTSTACK EVENT HANDLER (address + chipset detection)
 // ============================================================================
+
+// Install our advertising identity. This MUST happen here, inside the HCI init
+// sequence: post_init_callback() (and therefore ble_output_late_init) runs BEFORE
+// hci_power_control(HCI_POWER_ON), so anything the app sets is overwritten by this
+// handler. That is exactly why an earlier per-mode address attempt was dead code --
+// the advertised address never changed no matter what the app did.
+// What the identity decision actually was, readable later over CDC. The decision
+// happens during HCI init, long before a CDC client can attach and arm logging, so
+// the boot log cannot be used to tell the per-mode path from the FICR fallback.
+int  bt_nrf_ident_mode = -1;
+bool bt_nrf_ident_permode = false;
+// Set once we have installed an advertising identity of our own -- either a
+// per-mode static random address or the Switch 2 public Nintendo address. The
+// controller's own static address must not replace it afterwards.
+static bool bt_nrf_addr_claimed = false;
+
+static void nrf_apply_local_addr(bd_addr_t local_addr)
+{
+#ifdef CONFIG_BLE_PER_MODE_IDENTITY
+    // Must stay inside this guard: ble_output_get_mode() only exists in builds
+    // that compile the BLE peripheral. Central-only apps (bt2usb) do not, and an
+    // unguarded call here broke their link.
+    bt_nrf_ident_mode = (int)ble_output_get_mode();
+    // Each output mode advertises from its own permanent address so hosts treat the
+    // modes as separate peers and never reuse a cached GATT database across a mode
+    // switch. Deterministic, so a mode's bond survives reboots and reflashes.
+    if (ble_output_get_mode_addr(ble_output_get_mode(), local_addr)) {
+        gap_random_address_set(local_addr);
+        gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+        bt_nrf_ident_permode = true;
+        bt_nrf_addr_claimed = true;
+        printf("[BT_NRF] per-mode static random addr %s (mode %d)\n",
+               bd_addr_to_str(local_addr), (int)ble_output_get_mode());
+        return;
+    }
+#endif
+    nrf_get_static_random_addr(local_addr);
+    gap_random_address_set(local_addr);
+    gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
+    printf("[BT_NRF] FICR static random addr %s\n", bd_addr_to_str(local_addr));
+}
 
 static void btstack_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
@@ -291,6 +411,20 @@ static void btstack_event_handler(uint8_t packet_type, uint16_t channel, uint8_t
                     switch (manufacturer) {
                         case BLUETOOTH_COMPANY_ID_NORDIC_SEMICONDUCTOR_ASA:
                         case BLUETOOTH_COMPANY_ID_THE_LINUX_FOUNDATION:
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+                            if (ble_output_get_mode() == BLE_MODE_SWITCH2) {
+                                bd_addr_t pub;
+                                nrf_get_nintendo_public_addr(pub);
+                                hci_set_chipset(&switch2_chipset);
+                                hci_set_bd_addr(pub);   // sent during init
+                                // Leave random addressing OFF so advertising
+                                // uses the public address we just claimed.
+                                bt_nrf_addr_claimed = true;
+                                printf("[BT_NRF] Switch 2 mode: public addr %s\n",
+                                       bd_addr_to_str(pub));
+                                break;
+                            }
+#endif
                             hci_set_chipset(btstack_chipset_zephyr_instance());
                             // The zephyr chipset's static-address read returns
                             // 00:00:00:00:00:00 here, so advertising would go
@@ -298,18 +432,10 @@ static void btstack_event_handler(uint8_t packet_type, uint16_t channel, uint8_t
                             // discoverable. Use the FICR factory static-random
                             // address directly and enable random static
                             // addressing so the BLE peripheral is on air.
-                            nrf_get_static_random_addr(local_addr);
-                            gap_random_address_set(local_addr);
-                            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
-                            printf("[BT_NRF] FICR static random addr %s\n",
-                                   bd_addr_to_str(local_addr));
+                            nrf_apply_local_addr(local_addr);
                             break;
                         default:
-                            nrf_get_static_random_addr(local_addr);
-                            gap_random_address_set(local_addr);
-                            gap_random_address_set_mode(GAP_RANDOM_ADDRESS_TYPE_STATIC);
-                            printf("[BT_NRF] FICR static random addr %s\n",
-                                   bd_addr_to_str(local_addr));
+                            nrf_apply_local_addr(local_addr);
                             break;
                     }
                     break;
@@ -321,12 +447,28 @@ static void btstack_event_handler(uint8_t packet_type, uint16_t channel, uint8_t
                     break;
                 }
                 case HCI_OPCODE_HCI_ZEPHYR_READ_STATIC_ADDRESS: {
+                    // This arrives AFTER READ_LOCAL_VERSION_INFORMATION, so it is the
+                    // last writer and wins. When we have installed a per-mode identity
+                    // we must not let the controller's own static address replace it --
+                    // that silently undid the whole per-mode scheme: the decision ran
+                    // with the right mode, then this handler overwrote the result.
+                    //
+                    // It also broke Switch 2: that path claims a PUBLIC Nintendo
+                    // address and deliberately leaves random addressing off, but it
+                    // returns before nrf_apply_local_addr(), so the per-mode flag was
+                    // clear and this handler then switched the radio to a random
+                    // static address. The console ignores that, so it never
+                    // connected at all. Gate on "we installed an identity", not on
+                    // which kind.
+                    if (bt_nrf_addr_claimed) break;
+
                     const uint8_t *params = hci_event_command_complete_get_return_parameters(packet);
                     if (params[0] == 0 && size >= 13) {
                         bd_addr_t a;
                         reverse_48(&params[2], a);
-                        // Only apply a non-zero static address; the controller
-                        // returns all-zeros here, which would clobber FICR.
+                        // Only apply a non-zero static address; the controller is
+                        // documented here as returning all-zeros, which would clobber
+                        // FICR -- but it does return a real address on some builds.
                         static const uint8_t zero[6] = {0};
                         if (memcmp(a, zero, 6) != 0) {
                             memcpy(local_addr, a, 6);
